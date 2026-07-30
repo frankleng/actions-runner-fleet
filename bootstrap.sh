@@ -12,7 +12,7 @@ GITHUB_SCOPE=""
 RUNNER_ARCHIVE_VERSION="2.336.0"
 RUNNER_ARCHIVE_SHA256="8e8839c49b7060b6b2154f4931f815df330c27f167d53ef2239ee3dfce28b079"
 RUNNER_ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${SCRIPT_DIR}/actions-runner-osx-arm64-${RUNNER_ARCHIVE_VERSION}.tar.gz}"
-RUNNER_DIRECTORY_PREFIX="${RUNNER_DIRECTORY_PREFIX:-${SCRIPT_DIR}}"
+RUNNER_DIRECTORY_PREFIX="${RUNNER_DIRECTORY_PREFIX:-}"
 START_RUNNERS=1
 CHECK_ONLY=0
 DRY_RUN=0
@@ -45,6 +45,7 @@ Supported target URLs:
 The script defaults to organization scope, then securely prompts for a GitHub
 runner registration token when a new runner must be registered. Choose
 repository or enterprise explicitly when organization scope is not appropriate.
+New runner installations default to .runners/<runner-name> inside this kit.
 For unattended setup, provide the short-lived token in
 RUNNER_REGISTRATION_TOKEN.
 EOF
@@ -149,7 +150,13 @@ runner_dir_for_name() {
 
 default_runner_dir() {
   local runner_name="$1"
-  printf '%s-%s\n' "${RUNNER_DIRECTORY_PREFIX}" "${runner_name}"
+
+  if [ -n "${RUNNER_DIRECTORY_PREFIX}" ]; then
+    printf '%s-%s\n' "${RUNNER_DIRECTORY_PREFIX}" "${runner_name}"
+    return
+  fi
+
+  printf '%s/.runners/%s\n' "${SCRIPT_DIR}" "${runner_name}"
 }
 
 runner_is_started() {

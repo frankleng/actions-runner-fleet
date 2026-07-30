@@ -153,6 +153,26 @@ chmod +x "${archive_dir}/externals/node20/bin/node"
 
 tar -czf "${archive_path}" -C "${archive_dir}" .
 
+default_kit_dir="${temp_dir}/default-kit"
+default_registry_path="${temp_dir}/default-runners.tsv"
+default_runner_dir="${default_kit_dir}/.runners/default-runner"
+mkdir -p "${default_kit_dir}"
+cp "${ROOT_DIR}/manage-runners.sh" "${default_kit_dir}/manage-runners.sh"
+chmod +x "${default_kit_dir}/manage-runners.sh"
+
+RUNNER_TARGET_HELPER_PATH="${ROOT_DIR}/runner-target.sh" \
+RUNNER_REGISTRY_PATH="${default_registry_path}" \
+RUNNER_ARCHIVE_PATH="${archive_path}" \
+RUNNER_DEFER_RECONCILE=1 \
+RUNNER_TEST_CONFIG_LOG="${config_log}" \
+  "${default_kit_dir}/manage-runners.sh" register \
+    "default-runner" \
+    "token-default" \
+    "https://github.com/example-org"
+
+[ -f "${default_runner_dir}/.runner" ]
+grep -Fq $'default-runner\t'"${default_runner_dir}" "${default_registry_path}"
+
 RUNNER_REGISTRY_PATH="${registry_path}" "${SCRIPT_PATH}" --cli track "mac-runner-1" "${runner_dir}"
 RUNNER_REGISTRY_PATH="${registry_path}" "${SCRIPT_PATH}" --cli track "mac-runner-2" "${runner_dir_2}"
 

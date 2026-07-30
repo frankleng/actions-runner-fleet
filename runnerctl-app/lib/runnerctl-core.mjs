@@ -124,7 +124,7 @@ export function defaultRunnerDirectory(rootDir, name) {
     .replace(/^-+/, "")
     .replace(/-+$/, "");
 
-  return `${rootDir}-${sanitizedName}`;
+  return `${rootDir}/.runners/${sanitizedName}`;
 }
 
 export function parseAutoRefreshInterval(value, fallback = DEFAULT_AUTO_REFRESH_INTERVAL_MS) {

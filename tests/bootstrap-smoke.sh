@@ -70,6 +70,21 @@ printf 'launchctl %s\n' "$*" >> "${RUNNER_TEST_OPERATIONS_LOG:?}"
 EOF
 chmod u+x "${launchctl_stub}"
 
+default_layout_output="$(
+  RUNNER_REGISTRY_PATH="${temp_dir}/default-layout-runners.tsv" \
+  RUNNER_MANAGE_RUNNERS_PATH="${manage_stub}" \
+  RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
+  RUNNER_DIRECTORY_PREFIX="" \
+  RUNNER_TEST_OPERATIONS_LOG="${operations_log}" \
+    "${BOOTSTRAP_PATH}" \
+      --dry-run \
+      --url https://github.com/example-org \
+      default-layout-runner
+)"
+grep -Fq \
+  "register: default-layout-runner -> ${ROOT_DIR}/.runners/default-layout-runner" \
+  <<< "${default_layout_output}"
+
 RUNNER_REGISTRATION_TOKEN="smoke-token" \
 RUNNER_REGISTRY_PATH="${registry_path}" \
 RUNNER_MANAGE_RUNNERS_PATH="${manage_stub}" \

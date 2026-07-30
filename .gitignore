@@ -2,6 +2,9 @@
 # everything by default, then allow only the portable fleet-kit source.
 *
 
+# Default home for generated runner installations.
+.runners/
+
 !.gitignore
 !CLAUDE.md
 !README.md
