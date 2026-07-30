@@ -44,10 +44,11 @@ Open this repository's **Releases** page and download:
 Authenticated GitHub CLI users can download the latest release instead:
 
 ```bash
+GITHUB_REPOSITORY='YOUR_GITHUB_OWNER/actions-runner-fleet'
 mkdir actions-runner-download
 cd actions-runner-download
 gh release download \
-  --repo frankleng/actions-runner-fleet \
+  --repo "$GITHUB_REPOSITORY" \
   --pattern 'actions-runner-fleet-kit-macos-arm64-*.tar.gz*'
 shasum -a 256 -c actions-runner-fleet-kit-macos-arm64-2.336.0.tar.gz.sha256
 tar -xzf actions-runner-fleet-kit-macos-arm64-2.336.0.tar.gz
@@ -63,10 +64,14 @@ local registry records absolute runner-directory paths.
 Clone the private repository and prepare the checkout:
 
 ```bash
-gh repo clone frankleng/actions-runner-fleet actions-runner
+GITHUB_REPOSITORY='YOUR_GITHUB_OWNER/actions-runner-fleet'
+gh repo clone "$GITHUB_REPOSITORY" actions-runner
 cd actions-runner
 ./prepare.sh
 ```
+
+Replace `YOUR_GITHUB_OWNER` with the GitHub user or organization that owns the
+private repository.
 
 `prepare.sh` verifies the host, downloads the pinned official runner archive,
 checks its SHA-256, installs the dashboard dependency, and creates an ignored
