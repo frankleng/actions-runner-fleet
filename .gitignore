@@ -4,6 +4,7 @@
 
 !.gitignore
 !README.md
+!security_best_practices_report.md
 !fleet.example.tsv
 
 !bootstrap.sh
