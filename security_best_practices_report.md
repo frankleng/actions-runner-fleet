@@ -2,6 +2,10 @@
 
 Audit date: 2026-07-29
 
+> Post-audit update: the repository and its releases are now public. Statements
+> about private visibility and the audit-time file or commit count are
+> historical evidence; the credential and hardening findings are unchanged.
+
 ## Executive verdict
 
 No private credential was found in the tracked `actions-runner-fleet` tree, its

@@ -32,6 +32,7 @@ trap 'rm -rf "${temp_dir}"' EXIT
 package_root="${temp_dir}/${PACKAGE_NAME}"
 
 mkdir -p "${package_root}/runnerctl-app" "${OUTPUT_DIR}"
+mkdir -p "${package_root}/docs/images"
 
 cp "${ROOT_DIR}/bootstrap.sh" "${package_root}/bootstrap.sh"
 cp "${ROOT_DIR}/restore-fleet.sh" "${package_root}/restore-fleet.sh"
@@ -41,6 +42,10 @@ cp "${ROOT_DIR}/runnerctl" "${package_root}/runnerctl"
 cp "${ROOT_DIR}/runner-target.sh" "${package_root}/runner-target.sh"
 cp "${ROOT_DIR}/CLAUDE.md" "${package_root}/CLAUDE.md"
 cp "${ROOT_DIR}/README.md" "${package_root}/README.md"
+cp "${ROOT_DIR}/docs/images/runnerctl-dashboard-demo.png" \
+  "${package_root}/docs/images/runnerctl-dashboard-demo.png"
+cp "${ROOT_DIR}/docs/images/runnerctl-stats-demo.png" \
+  "${package_root}/docs/images/runnerctl-stats-demo.png"
 cp "${FLEET_SOURCE_PATH}" "${package_root}/fleet.tsv"
 cp "${ROOT_DIR}/fleet.example.tsv" "${package_root}/fleet.example.tsv"
 cp "${RUNNER_ARCHIVE_PATH}" "${package_root}/${RUNNER_ARCHIVE_NAME}"
