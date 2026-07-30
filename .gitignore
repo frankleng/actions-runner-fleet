@@ -1,0 +1,33 @@
+# This directory is also a live GitHub Actions runner installation. Ignore
+# everything by default, then allow only the portable fleet-kit source.
+*
+
+!.gitignore
+!README.md
+!fleet.example.tsv
+
+!bootstrap.sh
+!restore-fleet.sh
+!manage-runners.sh
+!provision-runner-tooling.sh
+!build-portable-package.sh
+!prepare.sh
+!security-audit.sh
+!runnerctl
+
+!overlay/
+!overlay/**
+
+!runnerctl-app/
+runnerctl-app/*
+!runnerctl-app/package.json
+!runnerctl-app/package-lock.json
+!runnerctl-app/bin/
+!runnerctl-app/bin/**
+!runnerctl-app/lib/
+!runnerctl-app/lib/**
+!runnerctl-app/tests/
+!runnerctl-app/tests/**
+
+!tests/
+!tests/**

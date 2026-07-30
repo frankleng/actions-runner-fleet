@@ -1,0 +1,38 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "${1:-}" = "--cli" ]; then
+  shift
+  exec "${SCRIPT_DIR}/manage-runners.sh" "$@"
+fi
+
+NODE_BIN="${RUNNERCTL_NODE_BIN:-}"
+
+if [ -z "${NODE_BIN}" ] && command -v node >/dev/null 2>&1; then
+  NODE_BIN="$(command -v node)"
+fi
+
+if [ -z "${NODE_BIN}" ]; then
+  NODE_BIN="${SCRIPT_DIR}/host-tools/node24/bin/node"
+fi
+
+if [ ! -x "${NODE_BIN}" ]; then
+  ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${SCRIPT_DIR}/actions-runner-osx-arm64-2.336.0.tar.gz}"
+  if [ ! -f "${ARCHIVE_PATH}" ]; then
+    echo "Node.js is unavailable and the bundled runner archive was not found: ${ARCHIVE_PATH}" >&2
+    exit 1
+  fi
+
+  mkdir -p "${SCRIPT_DIR}/host-tools"
+  TEMP_DIR="$(mktemp -d "${SCRIPT_DIR}/host-tools/.node24.XXXXXX")"
+  trap 'rm -rf "${TEMP_DIR}"' EXIT
+  tar -xzf "${ARCHIVE_PATH}" -C "${TEMP_DIR}" ./externals/node24/bin/node
+  mkdir -p "$(dirname "${NODE_BIN}")"
+  mv "${TEMP_DIR}/externals/node24/bin/node" "${NODE_BIN}"
+  chmod u+x "${NODE_BIN}"
+fi
+
+exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-dashboard.mjs" "$@"

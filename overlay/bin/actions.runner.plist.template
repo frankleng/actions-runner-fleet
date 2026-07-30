@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>{{SvcName}}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>{{RunnerRoot}}/runsvc.sh</string>
+    </array>
+    <key>UserName</key>
+    <string>{{User}}</string>
+    <key>WorkingDirectory</key>
+    <string>{{RunnerRoot}}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{{StdoutPath}}</string>
+    <key>StandardErrorPath</key>
+    <string>{{StderrPath}}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>ACTIONS_RUNNER_SVC</key>
+      <string>1</string>
+      <key>HOME</key>
+      <string>{{RuntimeHome}}</string>
+      <key>TMPDIR</key>
+      <string>{{RuntimeTmp}}</string>
+      <key>RUNNER_TEMP</key>
+      <string>{{RunnerTemp}}</string>
+      <key>RUNNER_TOOL_CACHE</key>
+      <string>{{RunnerToolCache}}</string>
+      <key>PNPM_HOME</key>
+      <string>{{PnpmHome}}</string>
+      <key>COREPACK_HOME</key>
+      <string>{{CorepackHome}}</string>
+      <key>PULUMI_HOME</key>
+      <string>{{PulumiHome}}</string>
+      <key>PATH</key>
+      <string>{{RuntimePath}}</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>SessionCreate</key>
+    <true/>
+  </dict>
+</plist>

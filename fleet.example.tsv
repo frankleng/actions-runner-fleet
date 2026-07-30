@@ -1,0 +1,4 @@
+# token-key	GitHub organization or repository URL	runner name
+# Replace every CHANGE_ME value, then save this file as fleet.tsv.
+CHANGE_ME	https://github.com/CHANGE_ME	mac-arm64-1
+CHANGE_ME	https://github.com/CHANGE_ME	mac-arm64-2

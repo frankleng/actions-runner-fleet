@@ -1,0 +1,12 @@
+{
+  "name": "runnerctl-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/runnerctl-core.test.mjs"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81"
+  }
+}
