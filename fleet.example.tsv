@@ -1,4 +1,8 @@
-# token-key	GitHub organization or repository URL	runner name
+# token-key	GitHub target URL	runner name
+# Choose one scope per target:
+#   repository:   https://github.com/OWNER/REPOSITORY
+#   organization: https://github.com/ORGANIZATION
+#   enterprise:   https://github.com/enterprises/ENTERPRISE
 # Replace every CHANGE_ME value, then save this file as fleet.tsv.
 CHANGE_ME	https://github.com/CHANGE_ME	mac-arm64-1
 CHANGE_ME	https://github.com/CHANGE_ME	mac-arm64-2

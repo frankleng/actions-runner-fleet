@@ -16,10 +16,11 @@ package_path="${output_dir}/${PACKAGE_NAME}.tar.gz"
 checksum_path="${package_path}.sha256"
 
 cat > "${fleet_path}" <<'EOF'
-# token-key	GitHub organization or repository URL	runner name
+# token-key	GitHub target URL	runner name
 MY_ORG	https://github.com/example-org	mac-runner-1
 MY_ORG	https://github.com/example-org	mac-runner-2
 MY_REPO	https://github.com/example-user/example-repo	repo-runner-1
+MY_ENTERPRISE	https://github.com/enterprises/example-enterprise	enterprise-runner-1
 EOF
 
 RUNNER_FLEET_PATH="${fleet_path}" /bin/bash "${BUILD_SCRIPT}" "${output_dir}"
@@ -39,7 +40,8 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 [ ! -s "${package_root}/runners.tsv" ]
 [ -f "${package_root}/fleet.tsv" ]
 [ -f "${package_root}/fleet.example.tsv" ]
-[ "$(awk -F '\t' '$1 !~ /^#/ && NF >= 3 { count += 1 } END { print count + 0 }' "${package_root}/fleet.tsv")" -eq 3 ]
+[ -f "${package_root}/runner-target.sh" ]
+[ "$(awk -F '\t' '$1 !~ /^#/ && NF >= 3 { count += 1 } END { print count + 0 }' "${package_root}/fleet.tsv")" -eq 4 ]
 
 for script_path in \
   "${package_root}/bootstrap.sh" \
@@ -47,6 +49,7 @@ for script_path in \
   "${package_root}/manage-runners.sh" \
   "${package_root}/provision-runner-tooling.sh" \
   "${package_root}/runnerctl" \
+  "${package_root}/runner-target.sh" \
   "${package_root}/overlay/env.sh" \
   "${package_root}/overlay/svc.sh" \
   "${package_root}/overlay/runsvc.sh"; do
@@ -88,6 +91,8 @@ dry_run_output="$(
 )"
 grep -q "mac-runner-1" <<< "${dry_run_output}"
 grep -q "repo-runner-1" <<< "${dry_run_output}"
+grep -q "enterprise-runner-1" <<< "${dry_run_output}"
+grep -q "enterprise target" <<< "${dry_run_output}"
 grep -q "fleet restore dry run complete" <<< "${dry_run_output}"
 
 credential_fleet="${temp_dir}/credential-fleet.tsv"

@@ -15,6 +15,7 @@
 !prepare.sh
 !security-audit.sh
 !runnerctl
+!runner-target.sh
 
 !overlay/
 !overlay/**

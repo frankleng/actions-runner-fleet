@@ -44,6 +44,55 @@ export function getRunnerNavigationConfig() {
   };
 }
 
+export function normalizeGitHubRunnerScope(value) {
+  switch (String(value ?? "").trim().toLowerCase()) {
+    case "1":
+    case "repo":
+    case "repository":
+      return "repository";
+    case "2":
+    case "org":
+    case "organization":
+      return "organization";
+    case "3":
+    case "enterprise":
+      return "enterprise";
+    default:
+      return null;
+  }
+}
+
+export function classifyGitHubRunnerTargetUrl(value) {
+  const targetUrl = String(value ?? "").trim().replace(/\/+$/, "");
+
+  if (/^https:\/\/github\.com\/enterprises\/[A-Za-z0-9_.-]+$/.test(targetUrl)) {
+    return "enterprise";
+  }
+
+  if (/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetUrl)) {
+    return "repository";
+  }
+
+  if (/^https:\/\/github\.com\/[A-Za-z0-9_.-]+$/.test(targetUrl)) {
+    return "organization";
+  }
+
+  return null;
+}
+
+export function getGitHubRunnerTargetUrlExample(scope) {
+  switch (normalizeGitHubRunnerScope(scope)) {
+    case "repository":
+      return "https://github.com/OWNER/REPOSITORY";
+    case "organization":
+      return "https://github.com/ORGANIZATION";
+    case "enterprise":
+      return "https://github.com/enterprises/ENTERPRISE";
+    default:
+      return "";
+  }
+}
+
 export function buildManageRunnersArgs(action, payload = {}) {
   switch (action) {
     case "register":
@@ -185,7 +234,7 @@ export function buildRunnerDetailLines(runner) {
     `{blue-fg}Service Installed{/blue-fg} ${runner.serviceInstalled ? "yes" : "no"}`,
     `{blue-fg}Work Folder{/blue-fg} ${runner.workFolder ?? "_work"}`,
     "",
-    `{blue-fg}Repository{/blue-fg}`,
+    `{blue-fg}GitHub Target{/blue-fg}`,
     runner.repository
   ];
 }

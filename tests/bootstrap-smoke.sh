@@ -8,6 +8,10 @@ BOOTSTRAP_PATH="${ROOT_DIR}/bootstrap.sh"
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "${temp_dir}"' EXIT
 
+help_output="$("${BOOTSTRAP_PATH}" --help)"
+grep -Fq "repository, organization, or enterprise" <<< "${help_output}"
+grep -Fq "https://github.com/enterprises/ENTERPRISE" <<< "${help_output}"
+
 registry_path="${temp_dir}/runners.tsv"
 operations_log="${temp_dir}/operations.log"
 manage_stub="${temp_dir}/manage-runners.sh"
@@ -117,6 +121,19 @@ if RUNNER_DEFAULT_URL="" \
 fi
 grep -Fq -- "--url is required" "${temp_dir}/missing-url.err"
 
+enterprise_output="$(
+  RUNNER_REGISTRY_PATH="${temp_dir}/enterprise-runners.tsv" \
+  RUNNER_MANAGE_RUNNERS_PATH="${manage_stub}" \
+  RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
+  RUNNER_DIRECTORY_PREFIX="${temp_dir}/actions-runner" \
+  RUNNER_TEST_OPERATIONS_LOG="${operations_log}" \
+    "${BOOTSTRAP_PATH}" \
+      --dry-run \
+      --url "https://github.com/enterprises/example-enterprise" \
+      enterprise-runner
+)"
+grep -Fq "GitHub registration target: enterprise" <<< "${enterprise_output}"
+
 if RUNNER_REGISTRY_PATH="${temp_dir}/invalid-url-runners.tsv" \
   RUNNER_MANAGE_RUNNERS_PATH="${manage_stub}" \
   RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
@@ -130,4 +147,4 @@ if RUNNER_REGISTRY_PATH="${temp_dir}/invalid-url-runners.tsv" \
   echo "expected bootstrap with an invalid GitHub URL to fail"
   exit 1
 fi
-grep -Fq "organization or repository URL" "${temp_dir}/invalid-url.err"
+grep -Fq "repository, organization, or enterprise URL" "${temp_dir}/invalid-url.err"

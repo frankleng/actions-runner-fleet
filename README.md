@@ -1,9 +1,9 @@
 # Actions Runner Fleet
 
 Set up and manage one or more GitHub Actions self-hosted runners on an
-Apple-silicon Mac. The kit supports organization-level and repository-level
-runners, multiple GitHub targets, launchd services, a terminal dashboard, and
-repeatable migration to a replacement Mac.
+Apple-silicon Mac. The kit supports repository-, organization-, and
+enterprise-level runners, multiple GitHub targets, launchd services, a terminal
+dashboard, and repeatable migration to a replacement Mac.
 
 This repository is private, but it is still designed to contain **no private
 credentials**. Runner registration tokens, generated runner credentials,
@@ -27,7 +27,8 @@ Linux, Windows, or Intel Macs.
 - A macOS account that remains logged in while its launchd agents run
 - Network access to GitHub, Node.js, npm, Pulumi, and AWS download endpoints
 - Node.js and npm when building from this source checkout
-- Admin access to each GitHub organization or repository that will own runners
+- Admin access to each GitHub repository, organization, or enterprise that will
+  own runners
 - About 15 GiB per runner plus at least 10 GiB of free headroom
 
 Xcode, Swift, and CocoaPods are optional unless your workflows build Apple
@@ -77,15 +78,51 @@ private repository.
 checks its SHA-256, installs the dashboard dependency, and creates an ignored
 `fleet.tsv` from `fleet.example.tsv`.
 
+## Choose the GitHub registration scope
+
+Decide who should own and be allowed to use each runner **before** editing
+`fleet.tsv` or generating a token. GitHub supports three registration scopes:
+
+| Scope | Choose it when | Target URL |
+| --- | --- | --- |
+| Repository | Exactly one repository should use the runner | `https://github.com/OWNER/REPOSITORY` |
+| Organization | Multiple repositories in one organization should share the runner | `https://github.com/ORGANIZATION` |
+| Enterprise | Multiple organizations in GitHub Enterprise Cloud should share the runner | `https://github.com/enterprises/ENTERPRISE` |
+
+These are GitHub's three supported ownership scopes. There is no separate
+personal-account-wide runner scope; a runner for a personal repository is
+repository-scoped.
+
+Use the narrowest scope that covers the intended workflows. Organization scope
+is usually the right choice for a fleet shared by several repositories in one
+organization. Enterprise scope requires GitHub Enterprise Cloud and an
+enterprise owner; after registration, runner-group access determines which
+organizations and repositories can use the runner.
+
+Do not guess this choice when preparing a fleet for someone else. Ask: **Should
+this runner serve one repository, several repositories in one organization, or
+repositories across several organizations?** The registration token must come
+from the same scope as the target URL. Moving a runner to another scope later
+requires registering it again with a token from the new scope.
+
+GitHub recommends using self-hosted runners only with private repositories,
+because workflows from forks of a public repository can run untrusted code on
+the runner machine. See
+[GitHub's self-hosted runner setup guide](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners).
+
 ## Configure your fleet
 
 Edit `fleet.tsv`. It is tab-delimited with three columns:
 
+This example shows all three scopes. Keep only the rows for targets you actually
+intend to configure.
+
 ```text
-token-key	GitHub organization or repository URL	runner name
+token-key	GitHub target URL	runner name
 MY_ORG	https://github.com/my-organization	mac-arm64-1
 MY_ORG	https://github.com/my-organization	mac-arm64-2
 MY_REPO	https://github.com/my-user/my-repository	repo-mac-1
+MY_ENTERPRISE	https://github.com/enterprises/my-enterprise	enterprise-mac-1
 ```
 
 Rules:
@@ -105,13 +142,15 @@ value before continuing.
 
 ## Generate registration tokens
 
-GitHub runner registration tokens are short-lived and normally expire after
-about one hour. Generate them immediately before setup:
+GitHub runner registration tokens expire after one hour. Generate one from the
+same scope selected above immediately before setup:
 
-- Organization runner: organization **Settings → Actions → Runners → New
-  self-hosted runner**
 - Repository runner: repository **Settings → Actions → Runners → New
   self-hosted runner**
+- Organization runner: organization **Settings → Actions → Runners → New
+  runner → New self-hosted runner**
+- Enterprise runner: enterprise **Policies → Actions → Runners → New runner →
+  New self-hosted runner**
 
 Select macOS and ARM64 if GitHub asks for a platform. This kit needs only the
 registration token from that page; do not paste the displayed installation
@@ -149,6 +188,7 @@ keys:
 ```bash
 MY_ORG_RUNNER_REGISTRATION_TOKEN='short-lived-token' \
 MY_REPO_RUNNER_REGISTRATION_TOKEN='short-lived-token' \
+MY_ENTERPRISE_RUNNER_REGISTRATION_TOKEN='short-lived-token' \
   ./restore-fleet.sh
 ```
 
@@ -230,14 +270,17 @@ representative workflow for every GitHub target.
 
 ## Add a single runner without a fleet manifest
 
+For guided setup, omit `--url`. The script first asks whether the runner belongs
+to a repository, organization, or enterprise, then asks for that target and its
+matching registration token:
+
 ```bash
-./bootstrap.sh \
-  --url https://github.com/my-organization \
-  mac-arm64-3
+./bootstrap.sh mac-arm64-3
 ```
 
-The script securely prompts for the registration token. Use
-`--replace-existing` only when deliberately moving a same-name runner.
+For unattended setup, pass an explicit target URL and
+`RUNNER_REGISTRATION_TOKEN`. Use `--replace-existing` only when deliberately
+moving a same-name runner.
 
 ## Security model
 
@@ -305,8 +348,8 @@ npm test --prefix runnerctl-app
 
 - **Runner archive missing:** run `./prepare.sh`.
 - **Manifest still contains `CHANGE_ME`:** edit `fleet.tsv`.
-- **Registration token rejected:** generate a fresh token for the exact
-  organization or repository URL in that row.
+- **Registration token rejected:** generate a fresh token from the exact
+  repository, organization, or enterprise scope identified by that row's URL.
 - **Runner name already exists:** stop the old runner and deliberately use
   `--replace-existing`, or delete the old GitHub registration.
 - **Service starts but runner stays offline:** inspect

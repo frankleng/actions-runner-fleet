@@ -237,6 +237,22 @@ printf '%s\n' "${deferred_list_output}" | grep -q "repo-runner-deferred"
 
 RUNNER_REGISTRY_PATH="${registry_path}" \
 RUNNER_PROVISION_SCRIPT_PATH="${provision_stub}" \
+RUNNER_ARCHIVE_PATH="${archive_path}" \
+RUNNER_DEFER_RECONCILE=1 \
+RUNNER_TEST_CONFIG_LOG="${config_log}" \
+"${SCRIPT_PATH}" --cli register \
+  "enterprise-runner-deferred" \
+  "token-789" \
+  "https://github.com/enterprises/example-enterprise" \
+  "${temp_dir}/enterprise-runner-deferred"
+
+[ -f "${temp_dir}/enterprise-runner-deferred/.runner" ]
+grep -q -- "--url https://github.com/enterprises/example-enterprise" "${config_log}"
+enterprise_list_output="$(RUNNER_REGISTRY_PATH="${registry_path}" "${SCRIPT_PATH}" --cli list)"
+printf '%s\n' "${enterprise_list_output}" | grep -q "enterprise-runner-deferred"
+
+RUNNER_REGISTRY_PATH="${registry_path}" \
+RUNNER_PROVISION_SCRIPT_PATH="${provision_stub}" \
 RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user" \
 RUNNER_LAUNCH_PATH="${temp_dir}/launchd-user/Library/LaunchAgents" \
 RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
@@ -248,9 +264,11 @@ RUNNER_TEST_LAUNCHCTL_STATE="${launchctl_state}" \
 grep -q -- "--root ${runner_dir}" "${provision_log}"
 grep -q -- "--root ${runner_dir_2}" "${provision_log}"
 grep -q -- "--root ${temp_dir}/repo-runner-deferred" "${provision_log}"
+grep -q -- "--root ${temp_dir}/enterprise-runner-deferred" "${provision_log}"
 grep -q "load actions.runner.example-org.mac-runner-1" "${launchctl_log}"
 grep -q "load actions.runner.example-org.mac-runner-2" "${launchctl_log}"
 grep -q "load actions.runner.example-repo.repo-runner-deferred" "${launchctl_log}"
+grep -q "load actions.runner.example-enterprise.enterprise-runner-deferred" "${launchctl_log}"
 
 : > "${pgrep_log}"
 : > "${pkill_log}"

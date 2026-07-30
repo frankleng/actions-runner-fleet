@@ -8,8 +8,10 @@ import {
   buildRunnerActivityLines,
   buildRunnerDetailLines,
   buildRunnerServiceName,
+  classifyGitHubRunnerTargetUrl,
   parseRegistry,
   getActionDefinitions,
+  getGitHubRunnerTargetUrlExample,
   getRunnerNavigationConfig,
   getRunnerSelectionEvents,
   buildManageRunnersArgs,
@@ -20,6 +22,7 @@ import {
   shouldCancelPromptOnKey,
   shouldAutoRefresh,
   moveSelectionIndex,
+  normalizeGitHubRunnerScope,
   parseServiceStatusOutput,
   presentServiceState,
   shouldPreservePromptFocus
@@ -77,6 +80,36 @@ test("getRunnerSelectionEvents includes single-click selection updates", () => {
     "select item",
     "select"
   ]);
+});
+
+test("runner registration scope accepts clear names and common abbreviations", () => {
+  assert.equal(normalizeGitHubRunnerScope("repo"), "repository");
+  assert.equal(normalizeGitHubRunnerScope("ORGANIZATION"), "organization");
+  assert.equal(normalizeGitHubRunnerScope("3"), "enterprise");
+  assert.equal(normalizeGitHubRunnerScope("account"), null);
+});
+
+test("runner target URLs distinguish repository, organization, and enterprise scopes", () => {
+  assert.equal(
+    classifyGitHubRunnerTargetUrl("https://github.com/example-user/example-repo"),
+    "repository"
+  );
+  assert.equal(
+    classifyGitHubRunnerTargetUrl("https://github.com/example-org/"),
+    "organization"
+  );
+  assert.equal(
+    classifyGitHubRunnerTargetUrl("https://github.com/enterprises/example-enterprise"),
+    "enterprise"
+  );
+  assert.equal(
+    classifyGitHubRunnerTargetUrl("https://github.com/example/too/many"),
+    null
+  );
+  assert.equal(
+    getGitHubRunnerTargetUrlExample("enterprise"),
+    "https://github.com/enterprises/ENTERPRISE"
+  );
 });
 
 test("runner navigation moves exactly one row for each arrow or vim keypress", (t) => {

@@ -9,12 +9,15 @@ import {
   buildRunnerDetailLines,
   buildManageRunnersArgs,
   defaultRunnerDirectory,
+  classifyGitHubRunnerTargetUrl,
   getRunnerActionSequence,
   getActionDefinitions,
+  getGitHubRunnerTargetUrlExample,
   getRunnerNavigationConfig,
   getRunnerSelectionEvents,
   loadTrackedRunners,
   moveSelectionIndex,
+  normalizeGitHubRunnerScope,
   parseAutoRefreshInterval,
   presentServiceState,
   runCommand,
@@ -351,22 +354,47 @@ async function openRegisterFlow() {
     return;
   }
 
-  const token = await promptInput("Registration token", "", { secret: true });
+  const defaultUrl = process.env.RUNNER_DEFAULT_URL || "";
+  const defaultScope = classifyGitHubRunnerTargetUrl(defaultUrl) || "organization";
+  const scopeInput = await promptInput(
+    "Scope (repository, organization, or enterprise)",
+    defaultScope
+  );
+  if (!scopeInput) {
+    state.actionMessage = "Register cancelled";
+    renderChrome();
+    return;
+  }
+  const scope = normalizeGitHubRunnerScope(scopeInput);
+  if (!scope) {
+    state.actionMessage = "Scope must be repository, organization, or enterprise";
+    renderChrome();
+    return;
+  }
+
+  const urlInput = await promptInput(
+    `${scope} target URL`,
+    classifyGitHubRunnerTargetUrl(defaultUrl) === scope ? defaultUrl : ""
+  );
+  if (!urlInput) {
+    state.actionMessage = "Register cancelled";
+    renderChrome();
+    return;
+  }
+  const url = urlInput.trim().replace(/\/+$/, "");
+  if (classifyGitHubRunnerTargetUrl(url) !== scope) {
+    state.actionMessage = `Expected ${getGitHubRunnerTargetUrlExample(scope)}`;
+    renderChrome();
+    return;
+  }
+
+  const token = await promptInput(`${scope} registration token`, "", { secret: true });
   if (!token) {
     state.actionMessage = "Register cancelled";
     renderChrome();
     return;
   }
 
-  const url = await promptInput(
-    "GitHub organization or repository URL",
-    process.env.RUNNER_DEFAULT_URL || ""
-  );
-  if (!url) {
-    state.actionMessage = "Register cancelled";
-    renderChrome();
-    return;
-  }
   state.actionMessage = `Register will create ${defaultRunnerDirectory(ROOT_DIR, name)}`;
   renderChrome();
   await executeManageRunners("register", {

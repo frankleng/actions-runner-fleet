@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNNER_TARGET_HELPER_PATH="${RUNNER_TARGET_HELPER_PATH:-${ROOT_DIR}/runner-target.sh}"
 REGISTRY_PATH="${RUNNER_REGISTRY_PATH:-${ROOT_DIR}/runners.tsv}"
 DEFAULT_URL="${RUNNER_DEFAULT_URL:-}"
 ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${ROOT_DIR}/actions-runner-osx-arm64-2.336.0.tar.gz}"
@@ -21,7 +22,7 @@ Usage:
   ./${SELF_NAME} track <name> <runner_dir>
   ./${SELF_NAME} reconcile <name>
   ./${SELF_NAME} reconcile-all
-  ./${SELF_NAME} register <name> <token> <url> [runner_dir]
+  ./${SELF_NAME} register <name> <token> <target_url> [runner_dir]
   ./${SELF_NAME} install-service <name>
   ./${SELF_NAME} start <name>
   ./${SELF_NAME} stop <name>
@@ -33,9 +34,18 @@ Notes:
   - Each runner must live in its own directory and have its own name.
   - Set RUNNER_DEFER_RECONCILE=1 to register quickly and provision later.
   - Set RUNNER_REPLACE_EXISTING=1 to replace a GitHub runner with the same name.
+  - Target URLs may identify a repository (OWNER/REPOSITORY), organization
+    (ORGANIZATION), or enterprise (enterprises/ENTERPRISE) under github.com.
   - The registry lives at: ${REGISTRY_PATH}
 EOF
 }
+
+if [ ! -r "${RUNNER_TARGET_HELPER_PATH}" ]; then
+  echo "runner target helper is missing: ${RUNNER_TARGET_HELPER_PATH}" >&2
+  exit 1
+fi
+# shellcheck source=runner-target.sh
+source "${RUNNER_TARGET_HELPER_PATH}"
 
 ensure_registry() {
   touch "${REGISTRY_PATH}"
@@ -305,12 +315,11 @@ register_runner() {
 
   ensure_registry
   [ -n "${url}" ] || {
-    echo "GitHub organization or repository URL is required" >&2
+    echo "GitHub repository, organization, or enterprise URL is required" >&2
     exit 1
   }
-  if ! printf '%s\n' "${url}" |
-    grep -Eq '^https://github\.com/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?/?$'; then
-    echo "GitHub target must be an organization or repository URL under https://github.com/" >&2
+  if ! github_runner_scope_from_url "${url}" >/dev/null; then
+    echo "GitHub target must be a repository, organization, or enterprise URL under https://github.com/" >&2
     exit 1
   fi
 

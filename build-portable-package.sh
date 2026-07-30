@@ -38,6 +38,7 @@ cp "${ROOT_DIR}/restore-fleet.sh" "${package_root}/restore-fleet.sh"
 cp "${ROOT_DIR}/manage-runners.sh" "${package_root}/manage-runners.sh"
 cp "${ROOT_DIR}/provision-runner-tooling.sh" "${package_root}/provision-runner-tooling.sh"
 cp "${ROOT_DIR}/runnerctl" "${package_root}/runnerctl"
+cp "${ROOT_DIR}/runner-target.sh" "${package_root}/runner-target.sh"
 cp "${ROOT_DIR}/README.md" "${package_root}/README.md"
 cp "${FLEET_SOURCE_PATH}" "${package_root}/fleet.tsv"
 cp "${ROOT_DIR}/fleet.example.tsv" "${package_root}/fleet.example.tsv"
@@ -57,6 +58,7 @@ chmod u+x \
   "${package_root}/manage-runners.sh" \
   "${package_root}/provision-runner-tooling.sh" \
   "${package_root}/runnerctl" \
+  "${package_root}/runner-target.sh" \
   "${package_root}/overlay/env.sh" \
   "${package_root}/overlay/svc.sh" \
   "${package_root}/overlay/runsvc.sh"

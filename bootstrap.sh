@@ -4,9 +4,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANAGE_RUNNERS_PATH="${RUNNER_MANAGE_RUNNERS_PATH:-${SCRIPT_DIR}/manage-runners.sh}"
+RUNNER_TARGET_HELPER_PATH="${RUNNER_TARGET_HELPER_PATH:-${SCRIPT_DIR}/runner-target.sh}"
 LAUNCHCTL_BIN="${RUNNER_LAUNCHCTL_BIN:-launchctl}"
 REGISTRY_PATH="${RUNNER_REGISTRY_PATH:-${SCRIPT_DIR}/runners.tsv}"
 GITHUB_URL="${RUNNER_DEFAULT_URL:-}"
+GITHUB_SCOPE=""
 RUNNER_ARCHIVE_VERSION="2.336.0"
 RUNNER_ARCHIVE_SHA256="8e8839c49b7060b6b2154f4931f815df330c27f167d53ef2239ee3dfce28b079"
 RUNNER_ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${SCRIPT_DIR}/actions-runner-osx-arm64-${RUNNER_ARCHIVE_VERSION}.tar.gz}"
@@ -24,8 +26,9 @@ Usage:
   ./bootstrap.sh --check
 
 Options:
-  --url URL      GitHub organization or repository URL (required unless
-                 RUNNER_DEFAULT_URL is set)
+  --url URL      GitHub repository, organization, or enterprise target URL.
+                 If omitted interactively, the script asks which scope to use.
+                 For unattended setup, this or RUNNER_DEFAULT_URL is required.
   --replace-existing
                  Replace a GitHub runner that already uses the supplied name
   --no-start     Register and provision runners without starting them
@@ -33,9 +36,14 @@ Options:
   --check        Verify that this kit is ready for the current host
   -h, --help     Show this help
 
-The script prompts securely for a GitHub runner registration token when a new
-runner must be registered. For unattended setup, provide the short-lived token
-in RUNNER_REGISTRATION_TOKEN.
+Supported target URLs:
+  repository    https://github.com/OWNER/REPOSITORY
+  organization  https://github.com/ORGANIZATION
+  enterprise    https://github.com/enterprises/ENTERPRISE
+
+The script asks for the registration scope before securely prompting for a
+GitHub runner registration token when a new runner must be registered. For
+unattended setup, provide the short-lived token in RUNNER_REGISTRATION_TOKEN.
 EOF
 }
 
@@ -43,6 +51,11 @@ fail() {
   echo "bootstrap failed: $*" >&2
   exit 1
 }
+
+[ -r "${RUNNER_TARGET_HELPER_PATH}" ] ||
+  fail "runner target helper is missing: ${RUNNER_TARGET_HELPER_PATH}"
+# shellcheck source=runner-target.sh
+source "${RUNNER_TARGET_HELPER_PATH}"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -62,7 +75,7 @@ verify_host() {
   [ "${architecture}" = "arm64" ] ||
     fail "this kit requires a native Apple-silicon shell (detected ${architecture})"
 
-  for required_command in awk curl df find grep id pkgutil shasum sleep sw_vers tar; do
+  for required_command in awk curl df find grep id pkgutil shasum sleep sw_vers tar tr; do
     require_command "${required_command}"
   done
   require_command "${LAUNCHCTL_BIN}"
@@ -86,6 +99,43 @@ validate_runner_name() {
       fail "runner names may contain only letters, numbers, dots, underscores, and hyphens: ${runner_name}"
       ;;
   esac
+}
+
+prompt_for_github_url() {
+  local scope_input
+  local target
+
+  echo "Choose where GitHub should register these runners:"
+  echo "  1) repository   one repository only"
+  echo "  2) organization multiple repositories in one organization"
+  echo "  3) enterprise   multiple organizations in GitHub Enterprise Cloud"
+
+  while :; do
+    IFS= read -r -p "Registration scope [1-3]: " scope_input
+    if GITHUB_SCOPE="$(github_runner_normalize_scope "${scope_input}")"; then
+      break
+    fi
+    echo "Enter 1/repository, 2/organization, or 3/enterprise." >&2
+  done
+
+  while :; do
+    case "${GITHUB_SCOPE}" in
+      repository)
+        IFS= read -r -p "Repository (OWNER/REPOSITORY): " target
+        ;;
+      organization)
+        IFS= read -r -p "Organization name: " target
+        ;;
+      enterprise)
+        IFS= read -r -p "Enterprise slug: " target
+        ;;
+    esac
+
+    if GITHUB_URL="$(github_runner_url_from_scope_and_target "${GITHUB_SCOPE}" "${target}")"; then
+      break
+    fi
+    echo "The target is not valid for the selected ${GITHUB_SCOPE} scope." >&2
+  done
 }
 
 runner_dir_for_name() {
@@ -226,14 +276,17 @@ for runner_name in "${RUNNER_NAMES[@]}"; do
   seen_names="${seen_names}${runner_name} "
 done
 
-[ -n "${GITHUB_URL}" ] ||
-  fail "--url is required unless RUNNER_DEFAULT_URL is set"
-
-if ! printf '%s\n' "${GITHUB_URL}" |
-  grep -Eq '^https://github\.com/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?/?$'; then
-  fail "GitHub target must be an organization or repository URL under https://github.com/"
+if [ -z "${GITHUB_URL}" ]; then
+  [ -t 0 ] ||
+    fail "--url is required for unattended setup unless RUNNER_DEFAULT_URL is set"
+  prompt_for_github_url
 fi
 
+if ! GITHUB_SCOPE="$(github_runner_scope_from_url "${GITHUB_URL}")"; then
+  fail "GitHub target must be a repository, organization, or enterprise URL under https://github.com/"
+fi
+
+echo "GitHub registration target: ${GITHUB_SCOPE} (${GITHUB_URL%/})"
 report_disk_headroom
 
 needs_registration=0
@@ -261,7 +314,7 @@ fi
 registration_token="${RUNNER_REGISTRATION_TOKEN:-}"
 if [ "${needs_registration}" -eq 1 ] && [ -z "${registration_token}" ]; then
   [ -t 0 ] || fail "RUNNER_REGISTRATION_TOKEN is required when standard input is not interactive"
-  IFS= read -r -s -p "GitHub runner registration token: " registration_token
+  IFS= read -r -s -p "GitHub ${GITHUB_SCOPE} runner registration token for ${GITHUB_URL%/}: " registration_token
   printf '\n'
 fi
 trap 'registration_token=""' EXIT

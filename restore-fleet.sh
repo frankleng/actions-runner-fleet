@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOOTSTRAP_PATH="${RUNNER_BOOTSTRAP_PATH:-${SCRIPT_DIR}/bootstrap.sh}"
+RUNNER_TARGET_HELPER_PATH="${RUNNER_TARGET_HELPER_PATH:-${SCRIPT_DIR}/runner-target.sh}"
 FLEET_PATH="${RUNNER_FLEET_PATH:-${SCRIPT_DIR}/fleet.tsv}"
 REPLACE_EXISTING=0
 START_RUNNERS=1
@@ -22,9 +23,10 @@ Options:
   --check             Verify the host, bundled runner, and fleet manifest
   -h, --help          Show this help
 
-For interactive setup, the script securely prompts for one short-lived
-registration token per token key in fleet.tsv. For unattended setup, a token
-key such as MY_ORG maps to:
+Each fleet.tsv row must explicitly target a GitHub repository, organization, or
+enterprise. For interactive setup, the script securely prompts for one
+short-lived registration token per token key. For unattended setup, a token key
+such as MY_ORG maps to:
 
   MY_ORG_RUNNER_REGISTRATION_TOKEN
 EOF
@@ -34,6 +36,11 @@ fail() {
   echo "fleet restore failed: $*" >&2
   exit 1
 }
+
+[ -r "${RUNNER_TARGET_HELPER_PATH}" ] ||
+  fail "runner target helper is missing: ${RUNNER_TARGET_HELPER_PATH}"
+# shellcheck source=runner-target.sh
+source "${RUNNER_TARGET_HELPER_PATH}"
 
 validate_fleet() {
   local token_key
@@ -57,9 +64,8 @@ validate_fleet() {
         ;;
     esac
     [ -z "${extra:-}" ] || fail "fleet manifest row has too many columns: ${runner_name}"
-    if ! printf '%s\n' "${github_url}" |
-      grep -Eq '^https://github\.com/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?/?$'; then
-      fail "invalid GitHub organization or repository URL in fleet manifest: ${github_url}"
+    if ! github_runner_scope_from_url "${github_url}" >/dev/null; then
+      fail "invalid GitHub repository, organization, or enterprise URL in fleet manifest: ${github_url}"
     fi
     case "${runner_name}" in
       ""|*[!A-Za-z0-9._-]*)
@@ -101,7 +107,7 @@ validate_fleet() {
     ' "${FLEET_PATH}"
   )"
   [ -z "${conflicting_group}" ] ||
-    fail "token key maps to multiple organization URLs: ${conflicting_group}"
+    fail "token key maps to multiple GitHub target URLs: ${conflicting_group}"
 }
 
 report_optional_workflow_host_tools() {
@@ -149,11 +155,22 @@ report_disk_headroom() {
 }
 
 print_fleet() {
-  awk -F '\t' '
-    $1 !~ /^#/ && NF >= 3 {
-      printf "  %-12s %-34s %s\n", $1, $2, $3
-    }
-  ' "${FLEET_PATH}"
+  local token_key
+  local github_url
+  local runner_name
+  local scope
+  local extra
+
+  printf '  %-12s %-12s %-48s %s\n' "TOKEN KEY" "SCOPE" "GITHUB TARGET" "RUNNER"
+  while IFS=$'\t' read -r token_key github_url runner_name extra; do
+    case "${token_key}" in
+      ""|\#*)
+        continue
+        ;;
+    esac
+    scope="$(github_runner_scope_from_url "${github_url}")"
+    printf '  %-12s %-12s %-48s %s\n' "${token_key}" "${scope}" "${github_url}" "${runner_name}"
+  done < "${FLEET_PATH}"
 }
 
 read_registration_token() {
@@ -235,6 +252,7 @@ group_rows="$(
 
 while IFS=$'\t' read -r token_key github_url; do
   [ -n "${token_key}" ] || continue
+  github_scope="$(github_runner_scope_from_url "${github_url}")"
   runner_names=()
   while IFS=$'\t' read -r row_token_key row_github_url runner_name extra; do
     [ "${row_token_key}" = "${token_key}" ] || continue
@@ -243,7 +261,7 @@ while IFS=$'\t' read -r token_key github_url; do
   done < "${FLEET_PATH}"
 
   echo
-  echo "${github_url}: ${#runner_names[@]} runners"
+  echo "${github_scope} target ${github_url}: ${#runner_names[@]} runners"
 
   bootstrap_options=(--url "${github_url}")
   if [ "${REPLACE_EXISTING}" -eq 1 ]; then
