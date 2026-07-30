@@ -8,6 +8,10 @@
 !security_best_practices_report.md
 !fleet.example.tsv
 
+!docs/
+!docs/images/
+!docs/images/*.png
+
 !bootstrap.sh
 !restore-fleet.sh
 !manage-runners.sh
