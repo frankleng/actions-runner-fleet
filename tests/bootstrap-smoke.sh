@@ -11,6 +11,7 @@ trap 'rm -rf "${temp_dir}"' EXIT
 help_output="$("${BOOTSTRAP_PATH}" --help)"
 grep -Fq "repository, organization, or enterprise" <<< "${help_output}"
 grep -Fq "https://github.com/enterprises/ENTERPRISE" <<< "${help_output}"
+grep -Fq "defaults to organization scope" <<< "${help_output}"
 
 registry_path="${temp_dir}/runners.tsv"
 operations_log="${temp_dir}/operations.log"

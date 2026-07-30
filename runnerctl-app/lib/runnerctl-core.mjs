@@ -4,6 +4,7 @@ import path from "node:path";
 
 const RUNNER_SELECTION_EVENTS = ["select item", "select"];
 export const DEFAULT_AUTO_REFRESH_INTERVAL_MS = 5000;
+export const DEFAULT_GITHUB_RUNNER_SCOPE = "organization";
 const RUNNER_NAVIGATION_BINDINGS = [
   { keys: ["up", "k"], delta: -1 },
   { keys: ["down", "j"], delta: 1 }

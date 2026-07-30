@@ -99,6 +99,10 @@ organization. Enterprise scope requires GitHub Enterprise Cloud and an
 enterprise owner; after registration, runner-group access determines which
 organizations and repositories can use the runner.
 
+This kit therefore defaults to **organization scope**. In guided setup, press
+Enter at the scope prompt to accept it. Choose repository or enterprise
+explicitly when the runner should have narrower or broader ownership.
+
 Do not guess this choice when preparing a fleet for someone else. Ask: **Should
 this runner serve one repository, several repositories in one organization, or
 repositories across several organizations?** The registration token must come
@@ -270,9 +274,9 @@ representative workflow for every GitHub target.
 
 ## Add a single runner without a fleet manifest
 
-For guided setup, omit `--url`. The script first asks whether the runner belongs
-to a repository, organization, or enterprise, then asks for that target and its
-matching registration token:
+For guided setup, omit `--url`. The script defaults to organization scope, then
+asks for the organization and its matching registration token. Select
+repository or enterprise at the scope prompt to override the default:
 
 ```bash
 ./bootstrap.sh mac-arm64-3

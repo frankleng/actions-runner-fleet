@@ -9,6 +9,7 @@ import {
   buildRunnerDetailLines,
   buildRunnerServiceName,
   classifyGitHubRunnerTargetUrl,
+  DEFAULT_GITHUB_RUNNER_SCOPE,
   parseRegistry,
   getActionDefinitions,
   getGitHubRunnerTargetUrlExample,
@@ -83,6 +84,7 @@ test("getRunnerSelectionEvents includes single-click selection updates", () => {
 });
 
 test("runner registration scope accepts clear names and common abbreviations", () => {
+  assert.equal(DEFAULT_GITHUB_RUNNER_SCOPE, "organization");
   assert.equal(normalizeGitHubRunnerScope("repo"), "repository");
   assert.equal(normalizeGitHubRunnerScope("ORGANIZATION"), "organization");
   assert.equal(normalizeGitHubRunnerScope("3"), "enterprise");

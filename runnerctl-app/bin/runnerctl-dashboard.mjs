@@ -10,6 +10,7 @@ import {
   buildManageRunnersArgs,
   defaultRunnerDirectory,
   classifyGitHubRunnerTargetUrl,
+  DEFAULT_GITHUB_RUNNER_SCOPE,
   getRunnerActionSequence,
   getActionDefinitions,
   getGitHubRunnerTargetUrlExample,
@@ -355,7 +356,8 @@ async function openRegisterFlow() {
   }
 
   const defaultUrl = process.env.RUNNER_DEFAULT_URL || "";
-  const defaultScope = classifyGitHubRunnerTargetUrl(defaultUrl) || "organization";
+  const defaultScope = classifyGitHubRunnerTargetUrl(defaultUrl) ||
+    DEFAULT_GITHUB_RUNNER_SCOPE;
   const scopeInput = await promptInput(
     "Scope (repository, organization, or enterprise)",
     defaultScope

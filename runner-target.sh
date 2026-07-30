@@ -3,6 +3,8 @@
 # Shared GitHub Actions runner-target parsing for the fleet shell entrypoints.
 # This file is sourced; do not enable or change the caller's shell options here.
 
+GITHUB_RUNNER_DEFAULT_SCOPE="organization"
+
 github_runner_scope_from_url() {
   local github_url="${1%/}"
 

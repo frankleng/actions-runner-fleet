@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=../runner-target.sh
 source "${ROOT_DIR}/runner-target.sh"
 
+[ "${GITHUB_RUNNER_DEFAULT_SCOPE}" = "organization" ]
 [ "$(github_runner_scope_from_url "https://github.com/example-org")" = "organization" ]
 [ "$(github_runner_scope_from_url "https://github.com/example-user/example-repo/")" = "repository" ]
 [ "$(github_runner_scope_from_url "https://github.com/enterprises/example-enterprise")" = "enterprise" ]

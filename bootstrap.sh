@@ -28,6 +28,7 @@ Usage:
 Options:
   --url URL      GitHub repository, organization, or enterprise target URL.
                  If omitted interactively, the script asks which scope to use.
+                 Press Enter to accept the organization default.
                  For unattended setup, this or RUNNER_DEFAULT_URL is required.
   --replace-existing
                  Replace a GitHub runner that already uses the supplied name
@@ -41,9 +42,11 @@ Supported target URLs:
   organization  https://github.com/ORGANIZATION
   enterprise    https://github.com/enterprises/ENTERPRISE
 
-The script asks for the registration scope before securely prompting for a
-GitHub runner registration token when a new runner must be registered. For
-unattended setup, provide the short-lived token in RUNNER_REGISTRATION_TOKEN.
+The script defaults to organization scope, then securely prompts for a GitHub
+runner registration token when a new runner must be registered. Choose
+repository or enterprise explicitly when organization scope is not appropriate.
+For unattended setup, provide the short-lived token in
+RUNNER_REGISTRATION_TOKEN.
 EOF
 }
 
@@ -107,11 +110,12 @@ prompt_for_github_url() {
 
   echo "Choose where GitHub should register these runners:"
   echo "  1) repository   one repository only"
-  echo "  2) organization multiple repositories in one organization"
+  echo "  2) organization multiple repositories in one organization (default)"
   echo "  3) enterprise   multiple organizations in GitHub Enterprise Cloud"
 
   while :; do
-    IFS= read -r -p "Registration scope [1-3]: " scope_input
+    IFS= read -r -p "Registration scope [2 - organization]: " scope_input
+    scope_input="${scope_input:-${GITHUB_RUNNER_DEFAULT_SCOPE}}"
     if GITHUB_SCOPE="$(github_runner_normalize_scope "${scope_input}")"; then
       break
     fi
