@@ -208,6 +208,7 @@ function printHelp() {
 
 Usage:
   ./runnerctl
+  ./runnerctl stats [--json]
   ./runnerctl --help
   ./runnerctl --cli <command>
 
@@ -226,6 +227,7 @@ Metrics:
   Each row aggregates the runner service and its descendant process tree.
   The table shows live CPU, memory, disk/network rates, and uptime.
   Select a runner for cumulative disk read/write and network transfer totals.
+  Run './runnerctl stats' for a non-interactive Markdown resource table.
 `);
 }
 

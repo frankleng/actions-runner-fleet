@@ -72,4 +72,9 @@ if [ -x "${METRICS_BIN}" ]; then
   export RUNNER_PROCSTATS_BIN="${METRICS_BIN}"
 fi
 
+if [ "${1:-}" = "stats" ]; then
+  shift
+  exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-stats.mjs" "$@"
+fi
+
 exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-dashboard.mjs" "$@"

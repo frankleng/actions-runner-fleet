@@ -262,6 +262,21 @@ From the fleet-kit directory, open the interactive dashboard:
 ./runnerctl
 ```
 
+For a non-interactive snapshot that a model or script can request, use the
+Markdown table or raw JSON output:
+
+```bash
+./runnerctl stats
+./runnerctl stats --json
+```
+
+The table includes one row per runner and columns for CPU, resident memory,
+process count, uptime, disk read/write rates and totals, and network
+receive/send rates and totals. Active runners are sampled for about 11 seconds
+so both disk and network rates have two observations. Set
+`RUNNER_STATS_SAMPLE_MS=0` for an immediate snapshot when rate accuracy is not
+needed.
+
 The dashboard refreshes every five seconds and attributes resources to each
 runner's launchd service plus its descendant process tree:
 

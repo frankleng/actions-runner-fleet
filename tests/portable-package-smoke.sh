@@ -40,6 +40,7 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 [ ! -s "${package_root}/runners.tsv" ]
 [ -f "${package_root}/fleet.tsv" ]
 [ -f "${package_root}/fleet.example.tsv" ]
+[ -f "${package_root}/CLAUDE.md" ]
 [ -f "${package_root}/runner-target.sh" ]
 [ -f "${package_root}/runnerctl-app/native/runnerctl-procstats.c" ]
 [ "$(awk -F '\t' '$1 !~ /^#/ && NF >= 3 { count += 1 } END { print count + 0 }' "${package_root}/fleet.tsv")" -eq 4 ]
@@ -82,6 +83,9 @@ dashboard_help="$(
 grep -q "Auto-refresh" <<< "${dashboard_help}"
 [ -x "${package_root}/host-tools/node24/bin/node" ]
 [ -x "${package_root}/host-tools/runnerctl-procstats" ]
+
+stats_help="$("${package_root}/runnerctl" stats --help)"
+grep -q "Markdown table by default" <<< "${stats_help}"
 
 check_output="$("${package_root}/bootstrap.sh" --check)"
 grep -q "portable runner kit is ready" <<< "${check_output}"
