@@ -5,7 +5,7 @@ Apple-silicon Mac. The kit supports repository-, organization-, and
 enterprise-level runners, multiple GitHub targets, launchd services, a terminal
 dashboard, and repeatable migration to a replacement Mac.
 
-This repository is private, but it is still designed to contain **no private
+This repository is public, but it is designed to contain **no private
 credentials**. Runner registration tokens, generated runner credentials,
 workspaces, logs, caches, environment snapshots, keychains, and downloaded
 tools are never committed.
@@ -38,7 +38,7 @@ small local disk-I/O reader. Without Xcode Command Line Tools, the dashboard
 still shows CPU, memory, uptime, and network metrics, but marks disk I/O
 unavailable.
 
-## Fastest setup: use the private release
+## Fastest setup: use the latest release
 
 Open this repository's **Releases** page and download:
 
@@ -379,8 +379,8 @@ RUNNER_FLEET_PATH='./fleet.example.tsv' \
 The builder:
 
 1. Verifies the official runner archive checksum.
-2. Includes only the manager, dashboard, overlay, README, and selected fleet
-   manifest.
+2. Includes only the manager, dashboard, overlay, README, sanitized demo
+   images, and selected fleet manifest.
 3. Creates an empty runtime `runners.tsv`.
 4. Rejects live credentials, registrations, workspaces, logs, environment
    files, host-downloaded tools, and source-home paths.

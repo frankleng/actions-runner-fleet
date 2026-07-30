@@ -42,6 +42,8 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 [ -f "${package_root}/fleet.example.tsv" ]
 [ -f "${package_root}/CLAUDE.md" ]
 [ -f "${package_root}/runner-target.sh" ]
+[ -f "${package_root}/docs/images/runnerctl-dashboard-demo.png" ]
+[ -f "${package_root}/docs/images/runnerctl-stats-demo.png" ]
 [ -f "${package_root}/runnerctl-app/native/runnerctl-procstats.c" ]
 [ "$(awk -F '\t' '$1 !~ /^#/ && NF >= 3 { count += 1 } END { print count + 0 }' "${package_root}/fleet.tsv")" -eq 4 ]
 
