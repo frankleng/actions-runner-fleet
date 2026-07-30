@@ -33,7 +33,10 @@ Linux, Windows, or Intel Macs.
 
 Xcode, Swift, and CocoaPods are optional unless your workflows build Apple
 software. Install them before cutover when your jobs use `xcodebuild`,
-`swiftc`, `codesign`, or `pod`.
+`swiftc`, `codesign`, or `pod`. The dashboard also uses `clang` once to build a
+small local disk-I/O reader. Without Xcode Command Line Tools, the dashboard
+still shows CPU, memory, uptime, and network metrics, but marks disk I/O
+unavailable.
 
 ## Fastest setup: use the private release
 
@@ -253,13 +256,36 @@ List and inspect runners:
 ./runnerctl --cli status mac-arm64-1
 ```
 
-Open the interactive dashboard:
+From the fleet-kit directory, open the interactive dashboard:
 
 ```bash
 ./runnerctl
 ```
 
-The dashboard refreshes every five seconds. Useful direct commands are:
+The dashboard refreshes every five seconds and attributes resources to each
+runner's launchd service plus its descendant process tree:
+
+- The runner list shows CPU, resident memory, disk read/write rates, network
+  receive/send rates, and service uptime for every tracked runner.
+- The selected runner's detail pane shows process count, current I/O rates,
+  cumulative observed disk bytes read/written, and network bytes
+  received/sent.
+- CPU can exceed 100% when a runner uses more than one core.
+- Totals begin with counters from processes that are alive when the dashboard
+  starts, then remain cumulative for that dashboard session. Very short-lived
+  processes that start and exit entirely between refreshes cannot be counted.
+- Network counters need about 5-10 seconds for the first `nettop` sample and
+  dashboard refresh.
+
+Set a different refresh interval in milliseconds, or disable automatic
+refresh:
+
+```bash
+RUNNER_DASHBOARD_REFRESH_MS=2000 ./runnerctl
+RUNNER_DASHBOARD_REFRESH_MS=0 ./runnerctl
+```
+
+Useful direct commands are:
 
 ```bash
 ./manage-runners.sh start mac-arm64-1
@@ -360,6 +386,11 @@ npm test --prefix runnerctl-app
   `<runner-directory>/_diag/Runner_*.log`.
 - **Dashboard cannot find Node.js:** keep the bundled runner archive beside
   `runnerctl`; it extracts the runner's embedded Node executable when needed.
+- **Dashboard disk I/O is unavailable:** install Xcode Command Line Tools with
+  `xcode-select --install`, then restart `./runnerctl` so it can build the local
+  `proc_pid_rusage` helper.
+- **Dashboard network I/O says starting:** leave it open for at least five
+  seconds so macOS `nettop` can emit its first process sample.
 - **Insufficient disk:** clean old `_work` and tool caches or move the runner
   prefix to a larger volume before registration.
 - **Apple build commands missing:** install/select full Xcode, accept its

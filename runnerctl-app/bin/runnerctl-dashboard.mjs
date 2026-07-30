@@ -26,6 +26,13 @@ import {
   shouldCancelPromptOnKey,
   shouldPreservePromptFocus
 } from "../lib/runnerctl-core.mjs";
+import {
+  buildRunnerMetricLines,
+  formatBytes,
+  formatCpuPercent,
+  formatDuration,
+  RunnerMetricsSampler
+} from "../lib/runnerctl-metrics.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const APP_DIR = path.dirname(path.dirname(__filename));
@@ -37,6 +44,7 @@ const RUNNER_NAVIGATION = getRunnerNavigationConfig();
 const AUTO_REFRESH_INTERVAL_MS = parseAutoRefreshInterval(
   process.env.RUNNER_DASHBOARD_REFRESH_MS
 );
+const metricsSampler = new RunnerMetricsSampler();
 
 if (process.argv.includes("--help") || process.argv.includes("help")) {
   printHelp();
@@ -76,12 +84,12 @@ const header = blessed.box({
 const runnerTable = blessed.list({
   top: 3,
   left: 0,
-  width: "60%",
-  height: "55%",
+  width: "100%",
+  height: "45%",
   keys: RUNNER_NAVIGATION.keys,
   mouse: true,
   border: "line",
-  label: " Tracked Runners ",
+  label: " Runners · CPU MEM · D:R/W/s · N:IN/OUT/s · UP ",
   tags: true,
   scrollable: true,
   alwaysScroll: true,
@@ -98,10 +106,10 @@ const runnerTable = blessed.list({
 });
 
 const detailBox = blessed.box({
-  top: 3,
-  left: "60%",
-  width: "40%",
-  height: "55%",
+  top: "48%",
+  left: 0,
+  width: "55%",
+  height: "44%",
   border: "line",
   label: " Runner Details ",
   tags: true,
@@ -121,12 +129,12 @@ const detailBox = blessed.box({
 });
 
 const outputLog = blessed.log({
-  top: "58%",
-  left: 0,
-  width: "100%",
-  height: "34%",
+  top: "48%",
+  left: "55%",
+  width: "45%",
+  height: "44%",
   border: "line",
-  label: " Activity ",
+  label: " Service Activity ",
   tags: true,
   scrollable: true,
   alwaysScroll: true,
@@ -187,7 +195,10 @@ screen.on("destroy", () => {
   if (autoRefreshTimer) {
     clearInterval(autoRefreshTimer);
   }
+  metricsSampler.close();
 });
+
+process.on("exit", () => metricsSampler.close());
 
 screen.render();
 runnerTable.focus();
@@ -210,11 +221,16 @@ Dashboard keys:
 
 Auto-refresh:
   RUNNER_DASHBOARD_REFRESH_MS defaults to 5000; set to 0 to disable.
+
+Metrics:
+  Each row aggregates the runner service and its descendant process tree.
+  The table shows live CPU, memory, disk/network rates, and uptime.
+  Select a runner for cumulative disk read/write and network transfer totals.
 `);
 }
 
 function bindKeys() {
-  screen.key(["q", "C-c"], () => process.exit(0));
+  screen.key(["q", "C-c"], shutdown);
   screen.key(["r"], () => {
     refreshRunners().catch(handleFatalError);
   });
@@ -241,7 +257,8 @@ function bindKeys() {
 
 async function refreshRunners() {
   setBusy(true, "Refreshing runners");
-  state.runners = await loadTrackedRunners(REGISTRY_PATH);
+  const trackedRunners = await loadTrackedRunners(REGISTRY_PATH);
+  state.runners = await metricsSampler.sample(trackedRunners);
   state.selectedIndex = clampIndex(state.selectedIndex, state.runners.length);
   renderTable();
   renderDetails();
@@ -289,7 +306,12 @@ function renderDetails() {
     return;
   }
 
-  detailBox.setContent(buildRunnerDetailLines(runner).join("\n"));
+  detailBox.setContent(
+    buildRunnerDetailLines(
+      runner,
+      buildRunnerMetricLines(runner.metrics)
+    ).join("\n")
+  );
   renderActivityForRunner(runner);
   screen.render();
 }
@@ -616,13 +638,47 @@ function shorten(value, limit) {
 }
 
 function formatRunnerRow(runner) {
-  const configured = runner.configured ? "cfg" : "---";
   const service = presentServiceState(runner.serviceState);
-  const name = padRight(runner.name, 18);
-  const repo = padRight(shorten(runner.repository, 28), 28);
-  const work = runner.workFolder ?? "_work";
+  const metrics = runner.metrics ?? {};
+  const name = padRight(shorten(runner.name, 18), 18);
+  const status = padRight(compactServiceLabel(service.label), 8);
+  const cpu = padLeft(formatCpuPercent(metrics.cpuPercent), 6);
+  const memory = padLeft(formatBytes(metrics.memoryBytes, { compact: true }), 5);
+  const diskRead = padLeft(
+    formatBytes(metrics.diskReadBytesPerSecond, { compact: true }),
+    5
+  );
+  const diskWrite = padLeft(
+    formatBytes(metrics.diskWriteBytesPerSecond, { compact: true }),
+    5
+  );
+  const networkReceive = padLeft(
+    formatBytes(metrics.networkReceiveBytesPerSecond, { compact: true }),
+    5
+  );
+  const networkSend = padLeft(
+    formatBytes(metrics.networkSendBytesPerSecond, { compact: true }),
+    5
+  );
+  const uptime = padLeft(
+    shorten(formatDuration(metrics.uptimeSeconds).replaceAll(" ", ""), 8),
+    8
+  );
 
-  return `${name} ${configured} {${service.color}-fg}${padRight(service.label, 13)}{/${service.color}-fg} ${repo} ${work}`;
+  return (
+    `${name} {${service.color}-fg}${status}` +
+    `{/${service.color}-fg} ${cpu} ${memory} ` +
+    `${diskRead}/${diskWrite} ${networkReceive}/${networkSend} ${uptime}`
+  );
+}
+
+function compactServiceLabel(serviceLabel) {
+  switch (serviceLabel) {
+    case "not-installed":
+      return "no-svc";
+    default:
+      return serviceLabel;
+  }
 }
 
 function padRight(value, width) {
@@ -631,6 +687,20 @@ function padRight(value, width) {
   }
 
   return value.padEnd(width, " ");
+}
+
+function padLeft(value, width) {
+  if (value.length >= width) {
+    return value;
+  }
+
+  return value.padStart(width, " ");
+}
+
+function shutdown() {
+  metricsSampler.close();
+  screen.destroy();
+  process.exit(0);
 }
 
 function timestamp() {

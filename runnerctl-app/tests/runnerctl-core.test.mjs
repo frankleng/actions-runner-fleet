@@ -20,6 +20,7 @@ import {
   getRunnerActionSequence,
   parseAutoRefreshInterval,
   parseLaunchctlDisabledOutput,
+  parseServicePid,
   shouldCancelPromptOnKey,
   shouldAutoRefresh,
   moveSelectionIndex,
@@ -306,6 +307,26 @@ test("launchd disabled state is matched to the exact runner service", () => {
   );
 });
 
+test("service PID is read from the exact launchctl status row", () => {
+  const output = [
+    "status actions.runner.example-org.mac-runner-3:",
+    "",
+    "Started:",
+    "12345 0 actions.runner.example-org.mac-runner-3",
+    ""
+  ].join("\n");
+
+  assert.equal(
+    parseServicePid(output, "actions.runner.example-org.mac-runner-3"),
+    12345
+  );
+  assert.equal(
+    parseServicePid(output, "actions.runner.example-org.mac-runner-30"),
+    null
+  );
+  assert.equal(parseServicePid("Stopped", "actions.runner.example-org.mac-runner-3"), null);
+});
+
 test("getRunnerActionSequence auto-installs service before start when missing", () => {
   assert.deepEqual(
     getRunnerActionSequence("start", { serviceState: "not-installed" }),
@@ -333,8 +354,24 @@ test("buildRunnerDetailLines puts the runner status at the top of the detail pan
   });
 
   assert.equal(lines[0], "{bold}mac-runner-1{/bold}");
-  assert.match(lines[2], /Status/);
-  assert.match(lines[2], /running/);
+  assert.match(lines[1], /Status/);
+  assert.match(lines[1], /running/);
+
+  const linesWithMetrics = buildRunnerDetailLines(
+    {
+      name: "mac-runner-1",
+      directory: "/Users/example/actions-runner-mac-runner-1",
+      configured: true,
+      serviceInstalled: true,
+      serviceState: "running",
+      workFolder: "_work",
+      repository: "https://github.com/example-org"
+    },
+    ["Runner metric line"]
+  );
+  assert.ok(linesWithMetrics.indexOf("Runner metric line") < linesWithMetrics.indexOf(
+    "{blue-fg}Directory{/blue-fg}"
+  ));
 });
 
 test("buildRunnerActivityLines shows selected runner status output in the activity pane", () => {

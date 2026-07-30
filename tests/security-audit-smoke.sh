@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 AUDIT_PATH="${ROOT_DIR}/security-audit.sh"
 DASHBOARD_PATH="${ROOT_DIR}/runnerctl-app/bin/runnerctl-dashboard.mjs"
 
-grep -Fq 'promptInput("Registration token", "", { secret: true })' "${DASHBOARD_PATH}"
+grep -Fq 'promptInput(`${scope} registration token`, "", { secret: true })' "${DASHBOARD_PATH}"
 grep -Fq 'censor: secret' "${DASHBOARD_PATH}"
 
 temp_dir="$(mktemp -d)"

@@ -35,4 +35,41 @@ if [ ! -x "${NODE_BIN}" ]; then
   chmod u+x "${NODE_BIN}"
 fi
 
+METRICS_SOURCE="${SCRIPT_DIR}/runnerctl-app/native/runnerctl-procstats.c"
+METRICS_BIN="${RUNNER_PROCSTATS_BIN:-${SCRIPT_DIR}/host-tools/runnerctl-procstats}"
+
+if [ -z "${RUNNER_PROCSTATS_BIN:-}" ] &&
+   [ "$(uname -s)" = "Darwin" ] &&
+   [ -f "${METRICS_SOURCE}" ] &&
+   { [ ! -x "${METRICS_BIN}" ] || [ "${METRICS_SOURCE}" -nt "${METRICS_BIN}" ]; }; then
+  METRICS_CLANG_BIN="${RUNNERCTL_CLANG_BIN:-}"
+  if [ -z "${METRICS_CLANG_BIN}" ] && command -v clang >/dev/null 2>&1; then
+    METRICS_CLANG_BIN="$(command -v clang)"
+  fi
+
+  if [ -n "${METRICS_CLANG_BIN}" ]; then
+    mkdir -p "$(dirname "${METRICS_BIN}")"
+    METRICS_TEMP_PATH="$(mktemp "$(dirname "${METRICS_BIN}")/.runnerctl-procstats.XXXXXX")"
+    if "${METRICS_CLANG_BIN}" \
+      -O2 \
+      -std=c11 \
+      -Wall \
+      -Wextra \
+      "${METRICS_SOURCE}" \
+      -o "${METRICS_TEMP_PATH}"; then
+      chmod u+x "${METRICS_TEMP_PATH}"
+      mv "${METRICS_TEMP_PATH}" "${METRICS_BIN}"
+    else
+      rm -f "${METRICS_TEMP_PATH}"
+      echo "warning: disk I/O metrics helper could not be built" >&2
+    fi
+  else
+    echo "warning: clang is unavailable; disk I/O metrics will be disabled" >&2
+  fi
+fi
+
+if [ -x "${METRICS_BIN}" ]; then
+  export RUNNER_PROCSTATS_BIN="${METRICS_BIN}"
+fi
+
 exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-dashboard.mjs" "$@"

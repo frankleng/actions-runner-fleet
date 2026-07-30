@@ -41,6 +41,7 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 [ -f "${package_root}/fleet.tsv" ]
 [ -f "${package_root}/fleet.example.tsv" ]
 [ -f "${package_root}/runner-target.sh" ]
+[ -f "${package_root}/runnerctl-app/native/runnerctl-procstats.c" ]
 [ "$(awk -F '\t' '$1 !~ /^#/ && NF >= 3 { count += 1 } END { print count + 0 }' "${package_root}/fleet.tsv")" -eq 4 ]
 
 for script_path in \
@@ -80,6 +81,7 @@ dashboard_help="$(
 )"
 grep -q "Auto-refresh" <<< "${dashboard_help}"
 [ -x "${package_root}/host-tools/node24/bin/node" ]
+[ -x "${package_root}/host-tools/runnerctl-procstats" ]
 
 check_output="$("${package_root}/bootstrap.sh" --check)"
 grep -q "portable runner kit is ready" <<< "${check_output}"

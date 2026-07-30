@@ -197,6 +197,27 @@ export function parseLaunchctlDisabledOutput(output, serviceName) {
     .some((line) => line.includes(`"${serviceName}" => disabled`));
 }
 
+export function parseServicePid(output, serviceName) {
+  const lines = String(output ?? "").split(/\r?\n/);
+  const startedIndex = lines.findIndex((line) => /^\s*Started:\s*$/.test(line));
+
+  if (startedIndex === -1) {
+    return null;
+  }
+
+  for (const line of lines.slice(startedIndex + 1)) {
+    const match = line.match(/^\s*(\d+)\s+-?\d+\s+(\S+)\s*$/);
+    if (!match || (serviceName && match[2] !== serviceName)) {
+      continue;
+    }
+
+    const pid = Number(match[1]);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  }
+
+  return null;
+}
+
 export function presentServiceState(serviceState) {
   switch (serviceState) {
     case "running":
@@ -220,13 +241,13 @@ export function getRunnerActionSequence(action, runner) {
   return [action];
 }
 
-export function buildRunnerDetailLines(runner) {
+export function buildRunnerDetailLines(runner, metricLines = []) {
   const service = presentServiceState(runner.serviceState);
 
   return [
     `{bold}${runner.name}{/bold}`,
-    "",
     `{yellow-fg}Status{/yellow-fg} {${service.color}-fg}${service.label}{/${service.color}-fg}`,
+    ...metricLines,
     "",
     `{blue-fg}Directory{/blue-fg}`,
     runner.directory,
@@ -347,6 +368,7 @@ export async function readRunnerMetadata(directory) {
   let serviceState = serviceInstalled ? "stopped" : "not-installed";
   let serviceStatusOutput = "";
   let serviceName = "";
+  let servicePid = null;
 
   if (configured) {
     try {
@@ -368,6 +390,7 @@ export async function readRunnerMetadata(directory) {
       .filter(Boolean)
       .join("\n");
     serviceState = parseServiceStatusOutput(serviceStatusOutput);
+    servicePid = parseServicePid(serviceStatusOutput, serviceName);
 
     if (serviceState === "stopped" && serviceName && typeof process.getuid === "function") {
       const launchctlResult = await runCommand(
@@ -393,6 +416,8 @@ export async function readRunnerMetadata(directory) {
     serviceInstalled,
     serviceState,
     serviceStatusOutput,
+    serviceName,
+    servicePid,
     repository,
     workFolder
   };

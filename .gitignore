@@ -28,6 +28,8 @@ runnerctl-app/*
 !runnerctl-app/bin/**
 !runnerctl-app/lib/
 !runnerctl-app/lib/**
+!runnerctl-app/native/
+!runnerctl-app/native/**
 !runnerctl-app/tests/
 !runnerctl-app/tests/**
 
