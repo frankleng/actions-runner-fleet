@@ -262,6 +262,11 @@ From the fleet-kit directory, open the interactive dashboard:
 ./runnerctl
 ```
 
+The screenshots below use sanitized placeholder runner names, paths, service
+identifiers, and process identifiers.
+
+![Sanitized runnerctl dashboard demo](docs/images/runnerctl-dashboard-demo.png)
+
 For a non-interactive snapshot that a model or script can request, use the
 Markdown table or raw JSON output:
 
@@ -269,6 +274,8 @@ Markdown table or raw JSON output:
 ./runnerctl stats
 ./runnerctl stats --json
 ```
+
+![Sanitized model-friendly runner stats demo](docs/images/runnerctl-stats-demo.png)
 
 The table includes one row per runner and columns for CPU, resident memory,
 process count, uptime, disk read/write rates and totals, and network
