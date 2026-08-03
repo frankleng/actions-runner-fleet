@@ -232,16 +232,21 @@ flag.
 
 ## Choose where runner directories live
 
-By default, runner directories are created beside the kit directory. For
-example, `actions-runner` plus runner `mac-arm64-1` produces
-`actions-runner-mac-arm64-1`.
+By default, runner directories are created inside the kit directory under
+`.runners/`. For example, runner `mac-arm64-1` is installed at
+`actions-runner/.runners/mac-arm64-1`. The root `.gitignore` explicitly ignores
+this directory and all runner machine state within it.
 
-Set an absolute prefix before the first registration to choose another
-location:
+To choose another location, pass an explicit runner directory to
+`manage-runners.sh register`. Existing automation can also set an absolute
+prefix before the first fleet registration:
 
 ```bash
 RUNNER_DIRECTORY_PREFIX='/Volumes/CI/actions-runner' ./restore-fleet.sh
 ```
+
+That compatibility override creates paths such as
+`/Volumes/CI/actions-runner-mac-arm64-1`.
 
 Do not move the kit or runner directories after registration. If they must
 move, stop and re-register them so launchd and `runners.tsv` contain the new
@@ -340,6 +345,7 @@ The root `.gitignore` ignores everything by default and allowlists only source
 files. In particular, Git never tracks:
 
 - `.credentials`, `.credentials_rsaparams`, `.runner`, `.env`, or `.path`
+- `.runners/`, including every default runner installation
 - `runners.tsv` or the local `fleet.tsv`
 - `_work`, `_diag`, downloaded tools, runner binaries, or archives
 - Signing certificates, provisioning profiles, private keys, or packages

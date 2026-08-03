@@ -182,13 +182,13 @@ test("buildManageRunnersArgs routes scripted actions to the shell helper", () =>
     name: "mac-runner-1",
     token: "TOKEN",
     url: "https://github.com/example-org",
-    directory: "/Users/example/actions-runner-mac-runner-1"
+    directory: "/Users/example/actions-runner/.runners/mac-runner-1"
   }), [
     "register",
     "mac-runner-1",
     "TOKEN",
     "https://github.com/example-org",
-    "/Users/example/actions-runner-mac-runner-1"
+    "/Users/example/actions-runner/.runners/mac-runner-1"
   ]);
 
   assert.deepEqual(buildManageRunnersArgs("start", { name: "mac-runner-1" }), [
@@ -200,7 +200,7 @@ test("buildManageRunnersArgs routes scripted actions to the shell helper", () =>
 test("defaultRunnerDirectory derives the auto-created runner path from the current install", () => {
   assert.equal(
     defaultRunnerDirectory("/Users/example/actions-runner", "mac runner 1"),
-    "/Users/example/actions-runner-mac-runner-1"
+    "/Users/example/actions-runner/.runners/mac-runner-1"
   );
 });
 

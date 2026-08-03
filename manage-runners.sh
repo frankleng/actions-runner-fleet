@@ -32,6 +32,7 @@ Notes:
   - ./config.sh is only needed once per new runner directory.
   - After a runner is configured, use ./run.sh or ./svc.sh to start it.
   - Each runner must live in its own directory and have its own name.
+  - New runners default to ${ROOT_DIR}/.runners/<runner-name>.
   - Set RUNNER_DEFER_RECONCILE=1 to register quickly and provision later.
   - Set RUNNER_REPLACE_EXISTING=1 to replace a GitHub runner with the same name.
   - Target URLs may identify a repository (OWNER/REPOSITORY), organization
@@ -114,7 +115,7 @@ default_runner_dir() {
   sanitized_name="$(printf '%s' "${name}" | tr -cs 'A-Za-z0-9._-' '-')"
   sanitized_name="${sanitized_name#-}"
   sanitized_name="${sanitized_name%-}"
-  printf '%s\n' "${ROOT_DIR}-${sanitized_name}"
+  printf '%s\n' "${ROOT_DIR}/.runners/${sanitized_name}"
 }
 
 require_overlay() {
