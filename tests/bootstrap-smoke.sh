@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+export RUNNER_SERVICE_MANAGER_OVERRIDE=launchd
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BOOTSTRAP_PATH="${ROOT_DIR}/bootstrap.sh"

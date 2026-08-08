@@ -4,7 +4,9 @@ Audit date: 2026-07-29
 
 > Post-audit update: the repository and its releases are now public. Statements
 > about private visibility and the audit-time file or commit count are
-> historical evidence; the credential and hardening findings are unchanged.
+> historical evidence. ARF-002 and ARF-003 were remediated on 2026-08-08 by
+> moving the runner-local toolchain to pnpm 11.20.0 and Node.js 24.19.0 LTS;
+> the separate download-integrity finding in ARF-004 remains open.
 
 ## Executive verdict
 
@@ -12,10 +14,9 @@ No private credential was found in the tracked `actions-runner-fleet` tree, its
 reachable Git history, or the published `v1.0.0` release archive.
 
 The repository should not yet be treated as hardened for untrusted workflows.
-It provisions a vulnerable pnpm release, provisions a Node.js release that
-predates multiple high-severity security fixes, downloads executable Node.js
-and Pulumi archives without integrity verification, and uses persistent runner
-workspaces without an isolation or cleanup boundary.
+It downloads executable Node.js and Pulumi archives without integrity
+verification and uses persistent runner workspaces without an isolation or
+cleanup boundary.
 
 One urgent credential issue was found outside the target Git repository: an
 ignored, persisted `_work/.../preferences.arc` file from another checkout
@@ -97,11 +98,15 @@ fail-closed cleanup/reimage boundary that removes workspaces, temporary files,
 tool state, and credentials after every job. Document the trust boundary in the
 README.
 
-### ARF-002 — High — Provisioned pnpm 9.4.0 has known high-severity vulnerabilities
+### ARF-002 — Remediated — Provisioned pnpm 9.4.0 had known high-severity vulnerabilities
+
+Status update (2026-08-08): runner provisioning now pins pnpm 11.20.0 and
+installs it through Corepack rather than npm.
 
 Evidence:
 
-- `provision-runner-tooling.sh:19` pins `PNPM_VERSION="9.4.0"`.
+- At the audit date, `provision-runner-tooling.sh:19` pinned
+  `PNPM_VERSION="9.4.0"`.
 - `provision-runner-tooling.sh:237-248` installs that version for every runner.
 - GitHub's reviewed advisory database marks pnpm 9.4.0 as affected by multiple
   later advisories. Examples include command injection in CI environments
@@ -124,11 +129,15 @@ integrity. At the audit date, all reviewed advisories should be checked against
 the selected release; do not assume that a single minimum version covers later
 advisories. Reprovision every existing runner after updating the pin.
 
-### ARF-003 — High — Node.js 22.21.1 predates high-severity security fixes
+### ARF-003 — Remediated — Node.js 22.21.1 predated high-severity security fixes
+
+Status update (2026-08-08): runner provisioning now pins Node.js 24.19.0 LTS.
+The need to verify the downloaded artifact independently remains tracked as
+ARF-004.
 
 Evidence:
 
-- `provision-runner-tooling.sh:18` pins Node.js 22.21.1.
+- At the audit date, `provision-runner-tooling.sh:18` pinned Node.js 22.21.1.
 - `provision-runner-tooling.sh:209-234` installs it into each runner tool cache.
 - Node.js 22.22.0 was a security release, and Node.js 22.23.0 fixed additional
   high-severity issues in June 2026. The follow-up 22.23.1 release is available
@@ -159,7 +168,7 @@ Evidence:
   `provision-runner-tooling.sh:332-337`, showing the intended fail-closed model.
 - Node.js publishes signed `SHASUMS256` files for the exact release, and Pulumi
   publishes per-release checksums:
-  [Node.js 22.21.1 release files](https://nodejs.org/download/release/v22.21.1/),
+  [Node.js 24.19.0 release files](https://nodejs.org/download/release/v24.19.0/),
   [Pulumi CLI versions and checksums](https://www.pulumi.com/docs/install/versions/).
 
 Impact:
@@ -210,13 +219,13 @@ Evidence:
 Impact:
 
 Locally modified, stale, or malicious dependency files can be published even
-when `package-lock.json` is correct.
+when `pnpm-lock.yaml` is correct.
 
 Recommendation:
 
-Run `npm ci --ignore-scripts` in a clean temporary staging directory and package
-that result. Compare the installed dependency tree to the lockfile before
-creating the archive.
+Run `pnpm install --frozen-lockfile --ignore-scripts` in a clean temporary
+staging directory and package that result. Compare the installed dependency
+tree to the lockfile before creating the archive.
 
 ### ARF-007 — Low — Registration tokens cross process argument lists
 

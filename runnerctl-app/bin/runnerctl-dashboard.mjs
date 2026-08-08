@@ -10,6 +10,7 @@ import {
   buildManageRunnersArgs,
   defaultRunnerDirectory,
   classifyGitHubRunnerTargetUrl,
+  DEFAULT_CPU_QUOTA_PERCENT,
   DEFAULT_GITHUB_RUNNER_SCOPE,
   getRunnerActionSequence,
   getActionDefinitions,
@@ -20,6 +21,7 @@ import {
   moveSelectionIndex,
   normalizeGitHubRunnerScope,
   parseAutoRefreshInterval,
+  parseCpuQuotaPercent,
   presentServiceState,
   runCommand,
   shouldAutoRefresh,
@@ -217,6 +219,7 @@ Dashboard keys:
   i  install service for selected runner
   s  start selected runner
   x  stop selected runner
+  c  configure selected runner CPU limit
   r  refresh dashboard
   q  quit
 
@@ -247,6 +250,9 @@ function bindKeys() {
   });
   screen.key(["x"], () => {
     void runRunnerAction("stop");
+  });
+  screen.key(["c"], () => {
+    void openCpuLimitFlow();
   });
   for (const binding of RUNNER_NAVIGATION.bindings) {
     runnerTable.key(binding.keys, () => moveSelection(binding.delta));
@@ -427,6 +433,44 @@ async function openRegisterFlow() {
     name,
     token,
     url
+  });
+}
+
+async function openCpuLimitFlow() {
+  const runner = getSelectedRunner();
+
+  if (!runner) {
+    state.actionMessage = "No runner selected";
+    renderChrome();
+    return;
+  }
+
+  if (process.platform !== "linux") {
+    state.actionMessage = "CPU quotas require Linux systemd user services";
+    renderChrome();
+    return;
+  }
+
+  const value = await promptInput(
+    "CPU limit percent (200 = two CPUs)",
+    String(runner.cpuQuotaPercent ?? DEFAULT_CPU_QUOTA_PERCENT)
+  );
+  if (!value) {
+    state.actionMessage = "CPU limit change cancelled";
+    renderChrome();
+    return;
+  }
+
+  const cpuQuotaPercent = parseCpuQuotaPercent(value);
+  if (!cpuQuotaPercent) {
+    state.actionMessage = "CPU limit must be a whole-number percent from 1 to 100000";
+    renderChrome();
+    return;
+  }
+
+  await executeManageRunners("set-cpu-limit", {
+    name: runner.name,
+    cpuQuotaPercent
   });
 }
 

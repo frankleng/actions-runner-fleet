@@ -5,6 +5,7 @@ import path from "node:path";
 const RUNNER_SELECTION_EVENTS = ["select item", "select"];
 export const DEFAULT_AUTO_REFRESH_INTERVAL_MS = 5000;
 export const DEFAULT_GITHUB_RUNNER_SCOPE = "organization";
+export const DEFAULT_CPU_QUOTA_PERCENT = 200;
 const RUNNER_NAVIGATION_BINDINGS = [
   { keys: ["up", "k"], delta: -1 },
   { keys: ["down", "j"], delta: 1 }
@@ -26,6 +27,7 @@ export function getActionDefinitions() {
     { key: "i", label: "Install Service" },
     { key: "s", label: "Start" },
     { key: "x", label: "Stop" },
+    { key: "c", label: "CPU Limit" },
     { key: "r", label: "Refresh" },
     { key: "q", label: "Quit" }
   ];
@@ -111,11 +113,28 @@ export function buildManageRunnersArgs(action, payload = {}) {
     case "stop":
     case "status":
       return [action, payload.name].filter(Boolean);
+    case "set-cpu-limit":
+      return [action, payload.name, String(payload.cpuQuotaPercent ?? "")].filter(Boolean);
     case "list":
       return ["list"];
     default:
       throw new Error(`unsupported action: ${action}`);
   }
+}
+
+export function parseCpuQuotaPercent(value) {
+  const normalized = String(value ?? "").trim();
+
+  if (!/^\d+$/.test(normalized)) {
+    return null;
+  }
+
+  const percent = Number(normalized);
+  if (!Number.isSafeInteger(percent) || percent < 1 || percent > 100000) {
+    return null;
+  }
+
+  return percent;
 }
 
 export function defaultRunnerDirectory(rootDir, name) {
@@ -247,6 +266,7 @@ export function buildRunnerDetailLines(runner, metricLines = []) {
   return [
     `{bold}${runner.name}{/bold}`,
     `{yellow-fg}Status{/yellow-fg} {${service.color}-fg}${service.label}{/${service.color}-fg}`,
+    `{yellow-fg}CPU Limit{/yellow-fg} ${runner.cpuQuotaPercent ? `${runner.cpuQuotaPercent}%` : "unavailable"}`,
     ...metricLines,
     "",
     `{blue-fg}Directory{/blue-fg}`,
@@ -360,6 +380,7 @@ export async function loadTrackedRunners(registryPath) {
 export async function readRunnerMetadata(directory) {
   const runnerConfigPath = path.join(directory, ".runner");
   const servicePath = path.join(directory, ".service");
+  const cpuQuotaPath = path.join(directory, ".cpu-quota");
   const configured = await fileExists(runnerConfigPath);
   const serviceInstalled = await fileExists(servicePath);
 
@@ -369,6 +390,19 @@ export async function readRunnerMetadata(directory) {
   let serviceStatusOutput = "";
   let serviceName = "";
   let servicePid = null;
+  let cpuQuotaPercent = process.platform === "linux"
+    ? parseCpuQuotaPercent(process.env.RUNNER_DEFAULT_CPU_QUOTA_PERCENT) ??
+      DEFAULT_CPU_QUOTA_PERCENT
+    : null;
+
+  if (process.platform === "linux" && await fileExists(cpuQuotaPath)) {
+    try {
+      cpuQuotaPercent = parseCpuQuotaPercent(await fs.readFile(cpuQuotaPath, "utf8")) ??
+        DEFAULT_CPU_QUOTA_PERCENT;
+    } catch {
+      cpuQuotaPercent = DEFAULT_CPU_QUOTA_PERCENT;
+    }
+  }
 
   if (configured) {
     try {
@@ -418,6 +452,7 @@ export async function readRunnerMetadata(directory) {
     serviceStatusOutput,
     serviceName,
     servicePid,
+    cpuQuotaPercent,
     repository,
     workFolder
   };

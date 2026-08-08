@@ -11,12 +11,13 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 ROOT_DIR="${SCRIPT_DIR}"
+source "${SCRIPT_DIR}/platform.sh"
 DRY_RUN=0
 PRINT_ENV=0
 PRINT_MANIFEST=0
 
-NODE_VERSION="22.21.1"
-PNPM_VERSION="9.4.0"
+NODE_VERSION="24.19.0"
+PNPM_VERSION="11.20.0"
 WRANGLER_VERSION="4.69.0"
 PULUMI_VERSION="3.143.0"
 AWS_VERSION="2.36.11"
@@ -63,24 +64,29 @@ done
 TOOLS_DIR="${ROOT_DIR}/tools"
 HOST_TOOLS_DIR="${RUNNER_HOST_TOOLS_DIR:-${SCRIPT_DIR}/host-tools}"
 LOCAL_BIN_DIR="${TOOLS_DIR}/bin"
-NPM_GLOBAL_DIR="${TOOLS_DIR}/npm-global"
-NPM_GLOBAL_BIN="${NPM_GLOBAL_DIR}/bin"
 PNPM_GLOBAL_DIR="${TOOLS_DIR}/pnpm-global"
 PNPM_HOME="${PNPM_GLOBAL_DIR}/bin"
 COREPACK_HOME="${TOOLS_DIR}/corepack"
+PNPM_TOOLS_DIR="${TOOLS_DIR}/pnpm-tools"
+PNPM_STORE_DIR="${TOOLS_DIR}/pnpm-store"
 PULUMI_HOME="${TOOLS_DIR}/pulumi-home"
 RUNNER_HOME="${ROOT_DIR}/home"
 RUNNER_TMP="${ROOT_DIR}/tmp"
 RUNNER_TEMP="${ROOT_DIR}/_work/_temp"
 RUNNER_TOOL_CACHE="${ROOT_DIR}/_work/_tool"
-NODE_ARCH="arm64"
+NODE_ARCH="${RUNNER_NODE_ARCH}"
 NODE_INSTALL_DIR="${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/${NODE_ARCH}"
 NODE_BIN_DIR="${NODE_INSTALL_DIR}/bin"
 NODE_COMPLETE_MARKER="${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/${NODE_ARCH}.complete"
 PULUMI_INSTALL_DIR="${TOOLS_DIR}/pulumi/${PULUMI_VERSION}"
 AWS_INSTALL_DIR="${HOST_TOOLS_DIR}/aws-cli/${AWS_VERSION}"
-AWS_BIN_PATH="${AWS_INSTALL_DIR}/aws"
-AWS_PKG_URL="${RUNNER_AWS_PKG_URL:-https://awscli.amazonaws.com/AWSCLIV2-${AWS_VERSION}.pkg}"
+if [ "${RUNNER_SERVICE_MANAGER}" = "launchd" ]; then
+  AWS_BIN_PATH="${AWS_INSTALL_DIR}/aws"
+  AWS_PACKAGE_URL="${RUNNER_AWS_PACKAGE_URL:-https://awscli.amazonaws.com/AWSCLIV2-${AWS_VERSION}.pkg}"
+else
+  AWS_BIN_PATH="${AWS_INSTALL_DIR}/v2/current/bin/aws"
+  AWS_PACKAGE_URL="${RUNNER_AWS_PACKAGE_URL:-https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWS_VERSION}.zip}"
+fi
 MANIFEST_PATH="${TOOLS_DIR}/runner-tooling.env"
 AMBIENT_HOME="${HOME:-}"
 
@@ -148,7 +154,7 @@ build_runner_path() {
   local entry
 
   ambient_path="$(sanitize_path "${current_path}")"
-  for entry in "${LOCAL_BIN_DIR}" "${PNPM_HOME}" "${NPM_GLOBAL_BIN}" "${NODE_BIN_DIR}"; do
+  for entry in "${LOCAL_BIN_DIR}" "${PNPM_HOME}" "${NODE_BIN_DIR}"; do
     runner_path="$(append_unique_path_entry "${runner_path}" "${entry}")"
   done
 
@@ -209,7 +215,7 @@ ensure_symlink() {
 download_node() {
   local temp_dir archive_name extract_dir
   temp_dir="$(mktemp -d)"
-  archive_name="node-v${NODE_VERSION}-darwin-arm64.tar.gz"
+  archive_name="node-v${NODE_VERSION}-${RUNNER_NODE_PLATFORM}.tar.gz"
   extract_dir="${temp_dir}/node-extract"
 
   mkdir -p "${extract_dir}"
@@ -217,7 +223,7 @@ download_node() {
   tar -xzf "${temp_dir}/${archive_name}" -C "${extract_dir}"
   mkdir -p "$(dirname "${NODE_INSTALL_DIR}")"
   rm -rf "${NODE_INSTALL_DIR}"
-  mv "${extract_dir}/node-v${NODE_VERSION}-darwin-arm64" "${NODE_INSTALL_DIR}"
+  mv "${extract_dir}/node-v${NODE_VERSION}-${RUNNER_NODE_PLATFORM}" "${NODE_INSTALL_DIR}"
   touch "${NODE_COMPLETE_MARKER}"
   rm -rf "${temp_dir}"
 }
@@ -235,7 +241,16 @@ install_node() {
 }
 
 install_pnpm() {
+  local installed_version=""
+
   if [ -x "${PNPM_HOME}/pnpm" ]; then
+    installed_version="$(
+      COREPACK_HOME="${COREPACK_HOME}" \
+      PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" \
+        "${PNPM_HOME}/pnpm" --version 2>/dev/null || true
+    )"
+  fi
+  if [ "${installed_version}" = "${PNPM_VERSION}" ]; then
     return 0
   fi
 
@@ -243,13 +258,30 @@ install_pnpm() {
     return 0
   fi
 
-  mkdir -p "${PNPM_GLOBAL_DIR}" "${COREPACK_HOME}"
-  PATH="${NODE_BIN_DIR}:${PATH}" "${NODE_BIN_DIR}/npm" install --global --prefix "${PNPM_GLOBAL_DIR}" "pnpm@${PNPM_VERSION}"
+  mkdir -p "${PNPM_HOME}" "${COREPACK_HOME}"
+  COREPACK_HOME="${COREPACK_HOME}" PATH="${NODE_BIN_DIR}:${PATH}" \
+    "${NODE_BIN_DIR}/corepack" install --global "pnpm@${PNPM_VERSION}"
+  COREPACK_HOME="${COREPACK_HOME}" PATH="${NODE_BIN_DIR}:${PATH}" \
+    "${NODE_BIN_DIR}/corepack" enable --install-directory "${PNPM_HOME}" pnpm
+
+  installed_version="$(
+    COREPACK_HOME="${COREPACK_HOME}" \
+    PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" \
+      "${PNPM_HOME}/pnpm" --version
+  )"
+  [ "${installed_version}" = "${PNPM_VERSION}" ] || {
+    echo "pnpm ${PNPM_VERSION} verification failed: ${installed_version}" >&2
+    exit 1
+  }
 }
 
 install_wrangler() {
-  if [ -x "${NPM_GLOBAL_BIN}/wrangler" ]; then
-    ensure_symlink "${NPM_GLOBAL_BIN}/wrangler" "${LOCAL_BIN_DIR}/wrangler"
+  local version_output=""
+
+  if [ -x "${LOCAL_BIN_DIR}/wrangler" ]; then
+    version_output="$(PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" "${LOCAL_BIN_DIR}/wrangler" --version 2>/dev/null || true)"
+  fi
+  if [ "${version_output}" = "${WRANGLER_VERSION}" ]; then
     return 0
   fi
 
@@ -257,9 +289,20 @@ install_wrangler() {
     return 0
   fi
 
-  mkdir -p "${NPM_GLOBAL_DIR}"
-  PATH="${NODE_BIN_DIR}:${PNPM_HOME}:${PATH}" "${NODE_BIN_DIR}/npm" install --global --prefix "${NPM_GLOBAL_DIR}" "wrangler@${WRANGLER_VERSION}"
-  ensure_symlink "${NPM_GLOBAL_BIN}/wrangler" "${LOCAL_BIN_DIR}/wrangler"
+  mkdir -p "${LOCAL_BIN_DIR}" "${PNPM_TOOLS_DIR}" "${PNPM_STORE_DIR}"
+  COREPACK_HOME="${COREPACK_HOME}" PNPM_HOME="${PNPM_HOME}" \
+  PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" \
+    "${PNPM_HOME}/pnpm" add --global \
+      --global-dir "${PNPM_TOOLS_DIR}" \
+      --global-bin-dir "${LOCAL_BIN_DIR}" \
+      --store-dir "${PNPM_STORE_DIR}" \
+      "wrangler@${WRANGLER_VERSION}"
+
+  version_output="$(PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" "${LOCAL_BIN_DIR}/wrangler" --version)"
+  [ "${version_output}" = "${WRANGLER_VERSION}" ] || {
+    echo "Wrangler ${WRANGLER_VERSION} verification failed: ${version_output}" >&2
+    exit 1
+  }
 }
 
 install_pulumi() {
@@ -283,7 +326,7 @@ install_pulumi() {
   else
     local temp_dir archive_name
     temp_dir="$(mktemp -d)"
-    archive_name="pulumi-v${PULUMI_VERSION}-darwin-arm64.tar.gz"
+    archive_name="pulumi-v${PULUMI_VERSION}-${RUNNER_PULUMI_PLATFORM}.tar.gz"
     curl -fsSL "https://get.pulumi.com/releases/sdk/${archive_name}" -o "${temp_dir}/${archive_name}"
     tar -xzf "${temp_dir}/${archive_name}" -C "${temp_dir}"
     cp "${temp_dir}/pulumi/pulumi" "${PULUMI_INSTALL_DIR}/bin/pulumi"
@@ -314,6 +357,21 @@ install_aws() {
 
   mkdir -p "${HOST_TOOLS_DIR}/aws-cli"
 
+  if [ "${RUNNER_SERVICE_MANAGER}" = "systemd-user" ]; then
+    command -v unzip >/dev/null 2>&1 || { echo "unzip is required to install AWS CLI on Linux" >&2; exit 1; }
+    local linux_temp_dir
+    linux_temp_dir="$(mktemp -d)"
+    trap 'rm -rf "${linux_temp_dir}"' RETURN
+    curl -fsSL "${AWS_PACKAGE_URL}" -o "${linux_temp_dir}/awscliv2.zip"
+    unzip -q "${linux_temp_dir}/awscliv2.zip" -d "${linux_temp_dir}"
+    rm -rf "${AWS_INSTALL_DIR}"
+    "${linux_temp_dir}/aws/install" --install-dir "${AWS_INSTALL_DIR}" --bin-dir "${linux_temp_dir}/bin"
+    rm -rf "${linux_temp_dir}"
+    trap - RETURN
+    ensure_symlink "${AWS_BIN_PATH}" "${LOCAL_BIN_DIR}/aws"
+    return 0
+  fi
+
   (
     set -euo pipefail
 
@@ -329,7 +387,7 @@ install_aws() {
     package_path="${temp_dir}/AWSCLIV2.pkg"
     expanded_path="${temp_dir}/expanded"
 
-    curl -fsSL "${AWS_PKG_URL}" -o "${package_path}"
+    curl -fsSL "${AWS_PACKAGE_URL}" -o "${package_path}"
     signature_output="$(pkgutil --check-signature "${package_path}")"
     if ! printf '%s\n' "${signature_output}" | grep -Fq "Developer ID Installer: AMZN Mobile LLC (94KV3E626L)"; then
       echo "AWS CLI package is not signed by the expected Amazon installer identity" >&2
@@ -383,9 +441,10 @@ ensure_directory "${RUNNER_TMP}"
 ensure_directory "${RUNNER_TEMP}"
 ensure_directory "${RUNNER_TOOL_CACHE}"
 ensure_directory "${LOCAL_BIN_DIR}"
-ensure_directory "${NPM_GLOBAL_BIN}"
 ensure_directory "${PNPM_HOME}"
 ensure_directory "${COREPACK_HOME}"
+ensure_directory "${PNPM_TOOLS_DIR}"
+ensure_directory "${PNPM_STORE_DIR}"
 ensure_directory "${PULUMI_HOME}"
 install_node
 install_pnpm

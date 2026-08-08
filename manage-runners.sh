@@ -3,10 +3,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${ROOT_DIR}/platform.sh"
 RUNNER_TARGET_HELPER_PATH="${RUNNER_TARGET_HELPER_PATH:-${ROOT_DIR}/runner-target.sh}"
 REGISTRY_PATH="${RUNNER_REGISTRY_PATH:-${ROOT_DIR}/runners.tsv}"
 DEFAULT_URL="${RUNNER_DEFAULT_URL:-}"
-ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${ROOT_DIR}/actions-runner-osx-arm64-2.336.0.tar.gz}"
+ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${ROOT_DIR}/${RUNNER_ARCHIVE_BASENAME}}"
 OVERLAY_DIR="${RUNNER_OVERLAY_DIR:-${ROOT_DIR}/overlay}"
 PROVISION_SCRIPT_PATH="${RUNNER_PROVISION_SCRIPT_PATH:-${ROOT_DIR}/provision-runner-tooling.sh}"
 SELF_NAME="$(basename "${0}")"
@@ -27,6 +28,7 @@ Usage:
   ./${SELF_NAME} start <name>
   ./${SELF_NAME} stop <name>
   ./${SELF_NAME} status <name>
+  ./${SELF_NAME} set-cpu-limit <name> <percent>
 
 Notes:
   - ./config.sh is only needed once per new runner directory.
@@ -37,6 +39,7 @@ Notes:
   - Set RUNNER_REPLACE_EXISTING=1 to replace a GitHub runner with the same name.
   - Target URLs may identify a repository (OWNER/REPOSITORY), organization
     (ORGANIZATION), or enterprise (enterprises/ENTERPRISE) under github.com.
+  - Linux runner CPU limits are whole-number percentages; 200% equals two CPUs.
   - The registry lives at: ${REGISTRY_PATH}
 EOF
 }
@@ -123,9 +126,8 @@ require_overlay() {
 
   for overlay_file in \
     "${OVERLAY_DIR}/env.sh" \
-    "${OVERLAY_DIR}/svc.sh" \
     "${OVERLAY_DIR}/runsvc.sh" \
-    "${OVERLAY_DIR}/bin/actions.runner.plist.template"; do
+    "${OVERLAY_DIR}/svc.sh"; do
     if [ ! -f "${overlay_file}" ]; then
       echo "managed runner overlay file is missing: ${overlay_file}" >&2
       exit 1
@@ -139,9 +141,14 @@ copy_overlay() {
   require_overlay
   mkdir -p "${runner_dir}/bin"
   cp "${OVERLAY_DIR}/env.sh" "${runner_dir}/env.sh"
-  cp "${OVERLAY_DIR}/svc.sh" "${runner_dir}/svc.sh"
+  if [ "${RUNNER_SERVICE_MANAGER}" = "systemd-user" ]; then
+    cp "${OVERLAY_DIR}/svc-systemd-user.sh" "${runner_dir}/svc.sh"
+  else
+    cp "${OVERLAY_DIR}/svc.sh" "${runner_dir}/svc.sh"
+  fi
   cp "${OVERLAY_DIR}/runsvc.sh" "${runner_dir}/bin/runsvc.sh"
   cp "${OVERLAY_DIR}/bin/actions.runner.plist.template" "${runner_dir}/bin/actions.runner.plist.template"
+  cp "${OVERLAY_DIR}/bin/actions.runner.service.template" "${runner_dir}/bin/actions.runner.service.template"
   chmod u+x "${runner_dir}/env.sh" "${runner_dir}/svc.sh" "${runner_dir}/bin/runsvc.sh"
 }
 
@@ -150,6 +157,7 @@ ensure_runtime_roots() {
 
   mkdir -p \
     "${runner_dir}/home/Library/Logs" \
+    "${runner_dir}/home/.local/state" \
     "${runner_dir}/tmp" \
     "${runner_dir}/_work/_temp" \
     "${runner_dir}/_work/_tool" \
@@ -389,6 +397,44 @@ run_service_command() {
   fi
 }
 
+set_runner_cpu_limit() {
+  local name="$1"
+  local cpu_quota_percent="$2"
+  local runner_dir
+  local quota_path
+
+  if [ "${RUNNER_SERVICE_MANAGER}" != "systemd-user" ]; then
+    echo "per-runner CPU quotas require the Linux systemd user service manager" >&2
+    exit 1
+  fi
+
+  case "${cpu_quota_percent}" in
+    ''|*[!0-9]*)
+      echo "CPU quota must be a whole-number percent (received '${cpu_quota_percent}')" >&2
+      exit 1
+      ;;
+  esac
+  if [ "${cpu_quota_percent}" -lt 1 ] || [ "${cpu_quota_percent}" -gt 100000 ]; then
+    echo "CPU quota must be between 1% and 100000%" >&2
+    exit 1
+  fi
+
+  runner_dir="$(require_runner_dir "${name}")"
+  quota_path="${runner_dir}/.cpu-quota"
+
+  if [ -x "${runner_dir}/svc.sh" ] && grep -q 'set-cpu-limit)' "${runner_dir}/svc.sh"; then
+    (
+      cd "${runner_dir}"
+      ./svc.sh set-cpu-limit "${cpu_quota_percent}"
+    )
+    return 0
+  fi
+
+  printf '%s\n' "${cpu_quota_percent}" > "${quota_path}.tmp"
+  mv "${quota_path}.tmp" "${quota_path}"
+  echo "CPU limit for ${name}: ${cpu_quota_percent}% (applies when the managed service is installed)"
+}
+
 case "${1:-help}" in
   help|-h|--help)
     usage
@@ -451,6 +497,13 @@ case "${1:-help}" in
       exit 1
     fi
     run_service_command "$2" status
+    ;;
+  set-cpu-limit)
+    if [ "$#" -ne 3 ]; then
+      usage
+      exit 1
+    fi
+    set_runner_cpu_limit "$2" "$3"
     ;;
   *)
     usage

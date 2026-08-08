@@ -3,13 +3,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${ROOT_DIR}/platform.sh"
 OUTPUT_DIR="${1:-${ROOT_DIR}/dist}"
-RUNNER_VERSION="2.336.0"
-RUNNER_ARCHIVE_NAME="actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
+RUNNER_ARCHIVE_NAME="${RUNNER_ARCHIVE_BASENAME}"
 RUNNER_ARCHIVE_PATH="${ROOT_DIR}/${RUNNER_ARCHIVE_NAME}"
-RUNNER_ARCHIVE_SHA256="8e8839c49b7060b6b2154f4931f815df330c27f167d53ef2239ee3dfce28b079"
 FLEET_SOURCE_PATH="${RUNNER_FLEET_PATH:-${ROOT_DIR}/fleet.tsv}"
-PACKAGE_NAME="actions-runner-fleet-kit-macos-arm64-${RUNNER_VERSION}"
+PACKAGE_NAME="actions-runner-fleet-kit-${RUNNER_PLATFORM}-${RUNNER_VERSION}"
 PACKAGE_PATH="${OUTPUT_DIR}/${PACKAGE_NAME}.tar.gz"
 CHECKSUM_PATH="${PACKAGE_PATH}.sha256"
 
@@ -23,7 +22,7 @@ fail() {
 [ -f "${FLEET_SOURCE_PATH}" ] ||
   fail "fleet manifest is missing: ${FLEET_SOURCE_PATH}"
 
-actual_checksum="$(shasum -a 256 "${RUNNER_ARCHIVE_PATH}" | awk '{print $1}')"
+actual_checksum="$(runner_sha256 "${RUNNER_ARCHIVE_PATH}" | awk '{print $1}')"
 [ "${actual_checksum}" = "${RUNNER_ARCHIVE_SHA256}" ] ||
   fail "runner archive checksum mismatch"
 
@@ -40,6 +39,7 @@ cp "${ROOT_DIR}/manage-runners.sh" "${package_root}/manage-runners.sh"
 cp "${ROOT_DIR}/provision-runner-tooling.sh" "${package_root}/provision-runner-tooling.sh"
 cp "${ROOT_DIR}/runnerctl" "${package_root}/runnerctl"
 cp "${ROOT_DIR}/runner-target.sh" "${package_root}/runner-target.sh"
+cp "${ROOT_DIR}/platform.sh" "${package_root}/platform.sh"
 cp "${ROOT_DIR}/CLAUDE.md" "${package_root}/CLAUDE.md"
 cp "${ROOT_DIR}/README.md" "${package_root}/README.md"
 cp "${ROOT_DIR}/docs/images/runnerctl-dashboard-demo.png" \
@@ -53,9 +53,11 @@ cp -R "${ROOT_DIR}/overlay" "${package_root}/overlay"
 cp -R "${ROOT_DIR}/runnerctl-app/bin" "${package_root}/runnerctl-app/bin"
 cp -R "${ROOT_DIR}/runnerctl-app/lib" "${package_root}/runnerctl-app/lib"
 cp -R "${ROOT_DIR}/runnerctl-app/native" "${package_root}/runnerctl-app/native"
-cp -R "${ROOT_DIR}/runnerctl-app/node_modules" "${package_root}/runnerctl-app/node_modules"
+if [ -d "${ROOT_DIR}/runnerctl-app/node_modules" ]; then
+  cp -R "${ROOT_DIR}/runnerctl-app/node_modules" "${package_root}/runnerctl-app/node_modules"
+fi
 cp "${ROOT_DIR}/runnerctl-app/package.json" "${package_root}/runnerctl-app/package.json"
-cp "${ROOT_DIR}/runnerctl-app/package-lock.json" "${package_root}/runnerctl-app/package-lock.json"
+cp "${ROOT_DIR}/runnerctl-app/pnpm-lock.yaml" "${package_root}/runnerctl-app/pnpm-lock.yaml"
 
 : > "${package_root}/runners.tsv"
 printf '%s\n' "${RUNNER_VERSION}" > "${package_root}/VERSION"
@@ -66,8 +68,10 @@ chmod u+x \
   "${package_root}/provision-runner-tooling.sh" \
   "${package_root}/runnerctl" \
   "${package_root}/runner-target.sh" \
+  "${package_root}/platform.sh" \
   "${package_root}/overlay/env.sh" \
   "${package_root}/overlay/svc.sh" \
+  "${package_root}/overlay/svc-systemd-user.sh" \
   "${package_root}/overlay/runsvc.sh"
 
 if find "${package_root}" \
@@ -90,7 +94,7 @@ COPYFILE_DISABLE=1 tar -czf "${PACKAGE_PATH}" -C "${temp_dir}" "${PACKAGE_NAME}"
 
 (
   cd "${OUTPUT_DIR}"
-  shasum -a 256 "$(basename "${PACKAGE_PATH}")" > "$(basename "${CHECKSUM_PATH}")"
+  runner_sha256 "$(basename "${PACKAGE_PATH}")" > "$(basename "${CHECKSUM_PATH}")"
 )
 
 archive_listing="$(tar -tzf "${PACKAGE_PATH}")"

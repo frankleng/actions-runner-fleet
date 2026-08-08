@@ -116,6 +116,15 @@ report_optional_workflow_host_tools() {
   local required_command
   local xcode_summary
 
+  if [ "$(uname -s)" != "Darwin" ]; then
+    if command -v docker >/dev/null 2>&1; then
+      echo "optional container workflow tool: $(docker --version 2>/dev/null || true)"
+    else
+      echo "note: Docker is not installed; container-based jobs will not run" >&2
+    fi
+    return 0
+  fi
+
   missing_commands=""
   for required_command in xcodebuild xcode-select pod swiftc; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then

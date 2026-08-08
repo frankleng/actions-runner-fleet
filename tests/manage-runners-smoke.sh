@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+export RUNNER_SERVICE_MANAGER_OVERRIDE=launchd
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT_PATH="${ROOT_DIR}/runnerctl"
@@ -158,6 +159,7 @@ default_registry_path="${temp_dir}/default-runners.tsv"
 default_runner_dir="${default_kit_dir}/.runners/default-runner"
 mkdir -p "${default_kit_dir}"
 cp "${ROOT_DIR}/manage-runners.sh" "${default_kit_dir}/manage-runners.sh"
+cp "${ROOT_DIR}/platform.sh" "${default_kit_dir}/platform.sh"
 chmod +x "${default_kit_dir}/manage-runners.sh"
 
 RUNNER_TARGET_HELPER_PATH="${ROOT_DIR}/runner-target.sh" \

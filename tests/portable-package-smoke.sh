@@ -3,8 +3,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "${ROOT_DIR}/platform.sh"
 BUILD_SCRIPT="${ROOT_DIR}/build-portable-package.sh"
-PACKAGE_NAME="actions-runner-fleet-kit-macos-arm64-2.336.0"
+PACKAGE_NAME="actions-runner-fleet-kit-${RUNNER_PLATFORM}-${RUNNER_VERSION}"
 
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "${temp_dir}"' EXIT
@@ -29,7 +30,7 @@ RUNNER_FLEET_PATH="${fleet_path}" /bin/bash "${BUILD_SCRIPT}" "${output_dir}"
 [ -f "${checksum_path}" ]
 (
   cd "${output_dir}"
-  shasum -a 256 -c "$(basename "${checksum_path}")"
+  runner_sha256_check "$(basename "${checksum_path}")"
 )
 
 mkdir -p "${extract_dir}"
@@ -45,6 +46,8 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 [ -f "${package_root}/docs/images/runnerctl-dashboard-demo.png" ]
 [ -f "${package_root}/docs/images/runnerctl-stats-demo.png" ]
 [ -f "${package_root}/runnerctl-app/native/runnerctl-procstats.c" ]
+[ -f "${package_root}/runnerctl-app/pnpm-lock.yaml" ]
+[ ! -e "${package_root}/runnerctl-app/package-lock.json" ]
 [ "$(awk -F '\t' '$1 !~ /^#/ && NF >= 3 { count += 1 } END { print count + 0 }' "${package_root}/fleet.tsv")" -eq 4 ]
 
 for script_path in \
@@ -84,7 +87,11 @@ dashboard_help="$(
 )"
 grep -q "Auto-refresh" <<< "${dashboard_help}"
 [ -x "${package_root}/host-tools/node24/bin/node" ]
-[ -x "${package_root}/host-tools/runnerctl-procstats" ]
+if [ "$(uname -s)" = "Darwin" ]; then
+  [ -x "${package_root}/host-tools/runnerctl-procstats" ]
+else
+  [ ! -e "${package_root}/host-tools/runnerctl-procstats" ]
+fi
 
 stats_help="$("${package_root}/runnerctl" stats --help)"
 grep -q "Markdown table by default" <<< "${stats_help}"

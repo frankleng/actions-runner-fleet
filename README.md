@@ -1,9 +1,10 @@
 # Actions Runner Fleet
 
-Set up and manage one or more GitHub Actions self-hosted runners on an
-Apple-silicon Mac. The kit supports repository-, organization-, and
-enterprise-level runners, multiple GitHub targets, launchd services, a terminal
-dashboard, and repeatable migration to a replacement Mac.
+Set up and manage one or more GitHub Actions self-hosted runners on Ubuntu x64
+or an Apple-silicon Mac. The kit supports repository-, organization-, and
+enterprise-level runners, multiple GitHub targets, systemd user services on
+Linux, launchd services on macOS, a terminal dashboard, and repeatable host
+migration.
 
 This repository is public, but it is designed to contain **no private
 credentials**. Runner registration tokens, generated runner credentials,
@@ -12,26 +13,30 @@ tools are never committed.
 
 ## What gets installed
 
-- GitHub Actions Runner `2.336.0` for macOS arm64, verified by SHA-256
-- One isolated directory and launchd user agent per runner
-- Pinned runner-local Node.js, pnpm, Wrangler, Pulumi, and AWS CLI tooling
+- GitHub Actions Runner `2.336.0` for Linux x64 or macOS arm64, verified by SHA-256
+- One isolated directory and user service per runner (systemd or launchd)
+- A persistent, dashboard-configurable CPU quota per Linux runner (200% by default)
+- Pinned runner-local Node.js `24.19.0` LTS, pnpm `11.20.0`, Wrangler, Pulumi, and AWS CLI tooling
 - A terminal dashboard for status, registration, start, stop, and reconcile
-- Log rotation and cleanup for runner and launchd diagnostics
+- Log rotation and cleanup for runner and service diagnostics
 
-The setup is intentionally for **Apple-silicon macOS**. It does not configure
-Linux, Windows, or Intel Macs.
+Supported hosts are **Ubuntu/Linux x86_64** and **Apple-silicon macOS arm64**.
+Windows, Linux ARM, and Intel Macs are not currently supported.
 
 ## Requirements
 
-- Apple-silicon Mac using a native `arm64` shell
-- A macOS account that remains logged in while its launchd agents run
-- Network access to GitHub, Node.js, npm, Pulumi, and AWS download endpoints
-- Node.js and npm when building from this source checkout
+- Ubuntu/Linux using an `x86_64` shell, or Apple-silicon macOS using `arm64`
+- On Linux, a working systemd user manager; enable login lingering when runners
+  must survive logout and start at boot: `sudo loginctl enable-linger "$USER"`
+- On macOS, an account that remains logged in while its launchd agents run
+- Network access to GitHub, Node.js, the package registry, Pulumi, and AWS download endpoints
+- Node.js and Corepack when building from this source checkout; setup installs pinned pnpm
 - Admin access to each GitHub repository, organization, or enterprise that will
   own runners
 - About 15 GiB per runner plus at least 10 GiB of free headroom
 
-Xcode, Swift, and CocoaPods are optional unless your workflows build Apple
+Docker is optional on Linux but required for container actions and service
+containers. Xcode, Swift, and CocoaPods are optional on macOS unless workflows build Apple
 software. Install them before cutover when your jobs use `xcodebuild`,
 `swiftc`, `codesign`, or `pod`. The dashboard also uses `clang` once to build a
 small local disk-I/O reader. Without Xcode Command Line Tools, the dashboard
@@ -65,7 +70,8 @@ local registry records absolute runner-directory paths.
 
 ## Setup from the source repository
 
-Clone the private repository and prepare the checkout:
+Clone the repository and prepare the checkout. The correct runner archive is
+selected automatically for the current host:
 
 ```bash
 GITHUB_REPOSITORY='YOUR_GITHUB_OWNER/actions-runner-fleet'
@@ -159,9 +165,9 @@ same scope selected above immediately before setup:
 - Enterprise runner: enterprise **Policies → Actions → Runners → New runner →
   New self-hosted runner**
 
-Select macOS and ARM64 if GitHub asks for a platform. This kit needs only the
-registration token from that page; do not paste the displayed installation
-commands.
+Select Linux/x64 or macOS/ARM64 to match the host if GitHub asks for a platform.
+This kit needs only the registration token from that page; do not paste the
+displayed installation commands.
 
 ## Validate before changing GitHub
 
@@ -172,7 +178,7 @@ Run:
 ./restore-fleet.sh --dry-run
 ```
 
-The check verifies macOS/arm64, the bundled runner checksum, the manifest, the
+The check verifies the supported host/architecture, bundled runner checksum, manifest, the
 manager scripts, and disk headroom. The dry run prints every planned runner
 directory without registering runners or installing services.
 
@@ -185,7 +191,7 @@ For a fleet whose names do not already exist on GitHub:
 ```
 
 The script prompts without echoing for one registration token per token key,
-registers every target group, provisions tools, installs launchd services, and
+registers every target group, provisions tools, installs systemd or launchd services, and
 waits for every runner to report `Listening for Jobs`.
 
 Prompted entry is recommended because the token is never written to disk or
@@ -322,6 +328,24 @@ Useful direct commands are:
 ./manage-runners.sh reconcile-all
 ```
 
+### Configure Linux runner CPU limits
+
+Linux runners default to a `200%` systemd CPU quota, which allows at most two
+logical CPUs per runner. The quota applies to the service's full cgroup, so a
+workflow and every process it launches share the same limit.
+
+In the dashboard, select a runner and press `c` to view or change its limit.
+The change is applied to a running service immediately and is also persisted in
+the runner directory for future starts. The equivalent command is:
+
+```bash
+./manage-runners.sh set-cpu-limit ubuntu-x64-1 200
+```
+
+CPU quota values are whole-number percentages (`100%` is one logical CPU,
+`200%` is two). This resource control is available on Linux systemd user
+services; launchd does not provide an equivalent percentage-based cgroup cap.
+
 After setup, confirm each runner is idle/online in GitHub settings and run a
 representative workflow for every GitHub target.
 
@@ -398,7 +422,7 @@ The builder:
 for test_script in tests/*.sh; do
   /bin/bash "$test_script"
 done
-npm test --prefix runnerctl-app
+pnpm --dir runnerctl-app test
 ./security-audit.sh
 ```
 
