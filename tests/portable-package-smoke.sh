@@ -43,6 +43,7 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 [ -f "${package_root}/fleet.example.tsv" ]
 [ -f "${package_root}/CLAUDE.md" ]
 [ -f "${package_root}/runner-target.sh" ]
+[ -f "${package_root}/patches/cpulimit-0.2-macos.patch" ]
 [ -f "${package_root}/docs/images/runnerctl-dashboard-demo.png" ]
 [ -f "${package_root}/docs/images/runnerctl-stats-demo.png" ]
 [ -f "${package_root}/runnerctl-app/native/runnerctl-procstats.c" ]

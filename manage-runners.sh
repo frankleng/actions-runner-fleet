@@ -15,6 +15,8 @@ SELF_NAME="$(basename "${0}")"
 RUNNER_PGREP_BIN="${RUNNER_PGREP_BIN:-pgrep}"
 RUNNER_PKILL_BIN="${RUNNER_PKILL_BIN:-pkill}"
 RUNNER_STOP_GRACE_SECONDS="${RUNNER_STOP_GRACE_SECONDS:-2}"
+RUNNER_LABELS="${RUNNER_LABELS:-}"
+RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-0}"
 
 usage() {
   cat <<EOF
@@ -40,7 +42,9 @@ Notes:
   - Set RUNNER_REPLACE_EXISTING=1 to replace a GitHub runner with the same name.
   - Target URLs may identify a repository (OWNER/REPOSITORY), organization
     (ORGANIZATION), or enterprise (enterprises/ENTERPRISE) under github.com.
-  - Linux runner CPU limits are whole-number percentages; 200% equals two CPUs.
+  - Runner CPU limits are whole-number percentages; 200% equals two CPUs.
+  - RUNNER_LABELS adds comma-separated custom labels during registration.
+  - RUNNER_NO_DEFAULT_LABELS=1 makes jobs require a custom runner label.
   - The registry lives at: ${REGISTRY_PATH}
 EOF
 }
@@ -355,6 +359,20 @@ register_runner() {
   local url="${3:-${DEFAULT_URL}}"
   local runner_dir="${4:-$(default_runner_dir "${name}")}"
 
+  case "${RUNNER_NO_DEFAULT_LABELS}" in
+    0) ;;
+    1)
+      [ -n "${RUNNER_LABELS}" ] || {
+        echo "RUNNER_LABELS is required when RUNNER_NO_DEFAULT_LABELS=1" >&2
+        exit 1
+      }
+      ;;
+    *)
+      echo "RUNNER_NO_DEFAULT_LABELS must be 0 or 1" >&2
+      exit 1
+      ;;
+  esac
+
   ensure_registry
   [ -n "${url}" ] || {
     echo "GitHub repository, organization, or enterprise URL is required" >&2
@@ -396,6 +414,12 @@ register_runner() {
     if [ "${RUNNER_REPLACE_EXISTING:-0}" = "1" ]; then
       config_args+=(--replace)
     fi
+    if [ "${RUNNER_NO_DEFAULT_LABELS}" = "1" ]; then
+      config_args+=(--no-default-labels)
+    fi
+    if [ -n "${RUNNER_LABELS}" ]; then
+      config_args+=(--labels "${RUNNER_LABELS}")
+    fi
     "${config_args[@]}"
   )
 
@@ -435,11 +459,6 @@ set_runner_cpu_limit() {
   local cpu_quota_percent="$2"
   local runner_dir
   local quota_path
-
-  if [ "${RUNNER_SERVICE_MANAGER}" != "systemd-user" ]; then
-    echo "per-runner CPU quotas require the Linux systemd user service manager" >&2
-    exit 1
-  fi
 
   case "${cpu_quota_percent}" in
     ''|*[!0-9]*)

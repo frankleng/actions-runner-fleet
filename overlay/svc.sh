@@ -12,6 +12,8 @@ RUNNER_STOP_GRACE_SECONDS="${RUNNER_STOP_GRACE_SECONDS:-2}"
 RUNNER_LAUNCHD_USER="${RUNNER_LAUNCHD_USER:-${USER:-$(id -un)}}"
 RUNNER_LOG_RETENTION_DAYS="${RUNNER_LOG_RETENTION_DAYS:-7}"
 RUNNER_LOG_ROTATE_MAX_BYTES="${RUNNER_LOG_ROTATE_MAX_BYTES:-52428800}"
+CPU_QUOTA_PATH="${RUNNER_ROOT}/.cpu-quota"
+DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-200}"
 
 read_runner_json_value() {
   local key="$1"
@@ -72,6 +74,36 @@ require_non_negative_integer() {
       failed "${value_name} must be a non-negative integer (received '${value}')"
       ;;
   esac
+}
+
+validate_cpu_quota_percent() {
+  local value="$1"
+  local maximum_percent
+
+  require_non_negative_integer "CPU quota" "${value}"
+  [ "${value}" -ge 1 ] || failed "CPU quota must be at least 1%"
+  maximum_percent="$(( $(sysctl -n hw.ncpu) * 100 ))"
+  [ "${value}" -le "${maximum_percent}" ] ||
+    failed "CPU quota must not exceed ${maximum_percent}% on this Mac"
+}
+
+read_cpu_quota_percent() {
+  local value="${DEFAULT_CPU_QUOTA_PERCENT}"
+
+  if [ -f "${CPU_QUOTA_PATH}" ]; then
+    value="$(tr -d '[:space:]' < "${CPU_QUOTA_PATH}")"
+  fi
+
+  validate_cpu_quota_percent "${value}"
+  printf '%s\n' "${value}"
+}
+
+persist_cpu_quota_percent() {
+  local value="$1"
+
+  validate_cpu_quota_percent "${value}"
+  printf '%s\n' "${value}" > "${CPU_QUOTA_PATH}.tmp"
+  mv "${CPU_QUOTA_PATH}.tmp" "${CPU_QUOTA_PATH}"
 }
 
 log_file_size_bytes() {
@@ -174,12 +206,15 @@ sync_runtime_files() {
 }
 
 install() {
+  persist_cpu_quota_percent "$(read_cpu_quota_percent)"
   sync_runtime_files
   echo "svc install complete"
 }
 
 status() {
   echo "status ${SVC_NAME}:"
+  echo
+  echo "CPU limit: $(read_cpu_quota_percent)%"
   if [ ! -f "${PLIST_PATH}" ]; then
     echo
     echo "not installed"
@@ -204,6 +239,14 @@ status() {
     echo "Stopped"
     echo
   fi
+}
+
+set_cpu_limit() {
+  local cpu_quota_percent="${1:-}"
+
+  validate_cpu_quota_percent "${cpu_quota_percent}"
+  persist_cpu_quota_percent "${cpu_quota_percent}"
+  echo "CPU limit for ${RUNNER_NAME}: ${cpu_quota_percent}% (applies after the next service restart)"
 }
 
 start() {
@@ -236,7 +279,7 @@ uninstall() {
 usage() {
   cat <<EOF
 Usage:
-./svc.sh [install, start, stop, status, uninstall, prune-logs]
+./svc.sh [install, start, stop, status, set-cpu-limit <percent>, uninstall, prune-logs]
 EOF
 }
 
@@ -310,6 +353,9 @@ case "${SVC_CMD}" in
     ;;
   status)
     status
+    ;;
+  set-cpu-limit)
+    set_cpu_limit "${2:-}"
     ;;
   uninstall)
     uninstall

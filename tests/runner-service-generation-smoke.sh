@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "skipping launchd service smoke test on non-macOS host"
+  exit 0
+fi
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OVERLAY_DIR="${ROOT_DIR}/overlay"
 
@@ -41,6 +46,7 @@ chmod +x "${runner_dir}/env.sh" "${runner_dir}/svc.sh" "${runner_dir}/bin/runsvc
 
 cat > "${runner_dir}/externals/node20/bin/node" <<'EOF'
 #!/bin/bash
+sleep 0.5
 exit 0
 EOF
 chmod +x "${runner_dir}/externals/node20/bin/node"
@@ -96,6 +102,58 @@ grep -q "${runner_dir}/home/Library/Logs/actions.runner.example-org.smoke-runner
 grep -q "${runner_dir}/home/Library/Logs/actions.runner.example-org.smoke-runner/stderr.log" "${plist_path}"
 grep -q '\.env' "${runner_dir}/runsvc.sh"
 grep -q '\.path' "${runner_dir}/runsvc.sh"
+grep -q -- '--include-children' "${runner_dir}/runsvc.sh"
+[ "$(cat "${runner_dir}/.cpu-quota")" = "200" ]
+
+status_output="$(
+  cd "${runner_dir}"
+  RUNNER_LAUNCHD_USER_HOME="${temp_user_home}" \
+  RUNNER_LAUNCH_PATH="${temp_user_home}/Library/LaunchAgents" \
+  RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
+  ./svc.sh status
+)"
+grep -Fq "CPU limit: 200%" <<< "${status_output}"
+
+(
+  cd "${runner_dir}"
+  RUNNER_LAUNCHD_USER_HOME="${temp_user_home}" \
+  RUNNER_LAUNCH_PATH="${temp_user_home}/Library/LaunchAgents" \
+  RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
+  ./svc.sh set-cpu-limit 175
+)
+[ "$(cat "${runner_dir}/.cpu-quota")" = "175" ]
+
+cpulimit_log="${temp_dir}/cpulimit.log"
+mkdir -p "${runner_dir}/tools/bin"
+cat > "${runner_dir}/tools/bin/cpulimit" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" > "${RUNNER_TEST_CPULIMIT_LOG:?}"
+sleep 2
+EOF
+chmod +x "${runner_dir}/tools/bin/cpulimit"
+(
+  cd "${runner_dir}"
+  RUNNER_LOG_PRUNE_INTERVAL_SECONDS=0 \
+  RUNNER_TEST_CPULIMIT_LOG="${cpulimit_log}" \
+    ./runsvc.sh
+)
+grep -Eq '^--limit 175 --include-children --pid [0-9]+$' "${cpulimit_log}"
+
+cat > "${runner_dir}/externals/node20/bin/node" <<'EOF'
+#!/bin/bash
+exec sleep 5
+EOF
+cat > "${runner_dir}/tools/bin/cpulimit" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+if (
+  cd "${runner_dir}"
+  RUNNER_LOG_PRUNE_INTERVAL_SECONDS=0 ./runsvc.sh
+); then
+  echo "expected runner service to stop when cpulimit exits"
+  exit 1
+fi
 
 log_dir="${runner_dir}/home/Library/Logs/actions.runner.example-org.smoke-runner"
 diag_dir="${runner_dir}/_diag"

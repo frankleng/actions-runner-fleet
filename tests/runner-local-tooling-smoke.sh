@@ -76,6 +76,7 @@ printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PNPM_VERSION=11.20.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_WRANGLER_VERSION=4.69.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PULUMI_VERSION=3.143.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_AWS_VERSION=2.36.11"
+printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_CPULIMIT_VERSION=0.2"
 
 run_provision --write-env
 [ -f "${temp_dir}/.env" ]

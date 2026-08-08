@@ -26,6 +26,9 @@
 !runner-target.sh
 !platform.sh
 
+!patches/
+!patches/**
+
 !overlay/
 !overlay/**
 

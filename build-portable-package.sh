@@ -30,7 +30,7 @@ temp_dir="$(mktemp -d)"
 trap 'rm -rf "${temp_dir}"' EXIT
 package_root="${temp_dir}/${PACKAGE_NAME}"
 
-mkdir -p "${package_root}/runnerctl-app" "${OUTPUT_DIR}"
+mkdir -p "${package_root}/runnerctl-app" "${package_root}/patches" "${OUTPUT_DIR}"
 mkdir -p "${package_root}/docs/images"
 
 cp "${ROOT_DIR}/bootstrap.sh" "${package_root}/bootstrap.sh"
@@ -40,6 +40,7 @@ cp "${ROOT_DIR}/provision-runner-tooling.sh" "${package_root}/provision-runner-t
 cp "${ROOT_DIR}/runnerctl" "${package_root}/runnerctl"
 cp "${ROOT_DIR}/runner-target.sh" "${package_root}/runner-target.sh"
 cp "${ROOT_DIR}/platform.sh" "${package_root}/platform.sh"
+cp "${ROOT_DIR}/patches/cpulimit-0.2-macos.patch" "${package_root}/patches/cpulimit-0.2-macos.patch"
 cp "${ROOT_DIR}/CLAUDE.md" "${package_root}/CLAUDE.md"
 cp "${ROOT_DIR}/README.md" "${package_root}/README.md"
 cp "${ROOT_DIR}/docs/images/runnerctl-dashboard-demo.png" \

@@ -17,6 +17,8 @@ START_RUNNERS=1
 CHECK_ONLY=0
 DRY_RUN=0
 REPLACE_EXISTING=0
+RUNNER_LABELS="${RUNNER_LABELS:-}"
+RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-0}"
 RUNNER_NAMES=()
 
 usage() {
@@ -32,6 +34,9 @@ Options:
                  For unattended setup, this or RUNNER_DEFAULT_URL is required.
   --replace-existing
                  Replace a GitHub runner that already uses the supplied name
+  --labels LIST  Add comma-separated custom labels during registration
+  --no-default-labels
+                 Register with only custom labels, so jobs must request one
   --no-start     Register and provision runners without starting them
   --dry-run      Print the setup plan without changing anything
   --check        Verify that this kit is ready for the current host
@@ -241,6 +246,15 @@ while [ "$#" -gt 0 ]; do
       REPLACE_EXISTING=1
       shift
       ;;
+    --labels)
+      [ "$#" -ge 2 ] || fail "--labels requires a value"
+      RUNNER_LABELS="$2"
+      shift 2
+      ;;
+    --no-default-labels)
+      RUNNER_NO_DEFAULT_LABELS=1
+      shift
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -269,6 +283,12 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+case "${RUNNER_NO_DEFAULT_LABELS}" in
+  0) ;;
+  1) [ -n "${RUNNER_LABELS}" ] || fail "--no-default-labels requires --labels" ;;
+  *) fail "RUNNER_NO_DEFAULT_LABELS must be 0 or 1" ;;
+esac
 
 verify_host
 
@@ -356,6 +376,8 @@ for runner_name in "${RUNNER_NAMES[@]}"; do
   RUNNER_ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH}" \
   RUNNER_DEFER_RECONCILE=1 \
   RUNNER_REPLACE_EXISTING="${REPLACE_EXISTING}" \
+  RUNNER_LABELS="${RUNNER_LABELS}" \
+  RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS}" \
     "${MANAGE_RUNNERS_PATH}" register \
       "${runner_name}" \
       "${registration_token}" \

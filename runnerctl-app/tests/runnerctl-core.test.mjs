@@ -209,7 +209,7 @@ test("buildManageRunnersArgs routes scripted actions to the shell helper", () =>
   ]);
 });
 
-test("CPU quota percentages accept systemd multi-core limits", () => {
+test("CPU quota percentages accept multi-core limits", () => {
   assert.equal(DEFAULT_CPU_QUOTA_PERCENT, 200);
   assert.equal(parseCpuQuotaPercent("200"), 200);
   assert.equal(parseCpuQuotaPercent(" 175\n"), 175);

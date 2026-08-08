@@ -445,12 +445,6 @@ async function openCpuLimitFlow() {
     return;
   }
 
-  if (process.platform !== "linux") {
-    state.actionMessage = "CPU quotas require Linux systemd user services";
-    renderChrome();
-    return;
-  }
-
   const value = await promptInput(
     "CPU limit percent (200 = two CPUs)",
     String(runner.cpuQuotaPercent ?? DEFAULT_CPU_QUOTA_PERCENT)

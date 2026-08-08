@@ -212,6 +212,36 @@ fi
 
 grep -q "already tracked" "${temp_dir}/duplicate.err"
 
+if RUNNER_REGISTRY_PATH="${registry_path}" \
+  RUNNER_ARCHIVE_PATH="${archive_path}" \
+  RUNNER_NO_DEFAULT_LABELS=1 \
+  "${SCRIPT_PATH}" --cli register \
+    "missing-label-runner" \
+    "token" \
+    "https://github.com/example-org" \
+    "${temp_dir}/missing-label-runner" \
+    >/dev/null 2>"${temp_dir}/missing-label.err"; then
+  echo "expected label-only registration without a label to fail"
+  exit 1
+fi
+grep -Fq "RUNNER_LABELS is required" "${temp_dir}/missing-label.err"
+[ ! -e "${temp_dir}/missing-label-runner" ]
+
+if RUNNER_REGISTRY_PATH="${registry_path}" \
+  RUNNER_ARCHIVE_PATH="${archive_path}" \
+  RUNNER_NO_DEFAULT_LABELS=invalid \
+  "${SCRIPT_PATH}" --cli register \
+    "invalid-label-setting-runner" \
+    "token" \
+    "https://github.com/example-org" \
+    "${temp_dir}/invalid-label-setting-runner" \
+    >/dev/null 2>"${temp_dir}/invalid-label-setting.err"; then
+  echo "expected invalid label-only setting to fail"
+  exit 1
+fi
+grep -Fq "RUNNER_NO_DEFAULT_LABELS must be 0 or 1" "${temp_dir}/invalid-label-setting.err"
+[ ! -e "${temp_dir}/invalid-label-setting-runner" ]
+
 for managed_runner_dir in "${runner_dir}" "${runner_dir_2}"; do
   runner_name="$(basename "${managed_runner_dir}")"
   cat > "${managed_runner_dir}/.runner" <<EOF
@@ -244,6 +274,8 @@ RUNNER_REGISTRY_PATH="${registry_path}" \
 RUNNER_PROVISION_SCRIPT_PATH="${provision_stub}" \
 RUNNER_ARCHIVE_PATH="${archive_path}" \
 RUNNER_REPLACE_EXISTING=1 \
+RUNNER_LABELS="macos-build" \
+RUNNER_NO_DEFAULT_LABELS=1 \
 RUNNER_TEST_CONFIG_LOG="${config_log}" \
 RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user" \
 RUNNER_LAUNCH_PATH="${temp_dir}/launchd-user/Library/LaunchAgents" \
@@ -255,6 +287,8 @@ RUNNER_TEST_LAUNCHCTL_STATE="${launchctl_state}" \
 
 grep -q -- "--root ${temp_dir}/mac-runner-registered" "${provision_log}"
 grep -q -- "--replace" "${config_log}"
+grep -q -- "--no-default-labels" "${config_log}"
+grep -q -- "--labels macos-build" "${config_log}"
 register_list_output="$(RUNNER_REGISTRY_PATH="${registry_path}" "${SCRIPT_PATH}" --cli list)"
 printf '%s\n' "${register_list_output}" | grep -q "mac-runner-registered"
 

@@ -22,6 +22,9 @@ PNPM_VERSION="11.20.0"
 WRANGLER_VERSION="4.69.0"
 PULUMI_VERSION="3.143.0"
 AWS_VERSION="2.36.11"
+CPULIMIT_VERSION="0.2"
+CPULIMIT_SHA256="64312f9ac569ddcadb615593cd002c94b76e93a0d4625d3ce1abb49e08e2c2da"
+CPULIMIT_MACOS_PATCH_PATH="${SCRIPT_DIR}/patches/cpulimit-0.2-macos.patch"
 
 usage() {
   cat <<EOF
@@ -92,6 +95,8 @@ NODE_BIN_DIR="${NODE_INSTALL_DIR}/bin"
 NODE_COMPLETE_MARKER="${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/${NODE_ARCH}.complete"
 PULUMI_INSTALL_DIR="${HOST_TOOLS_DIR}/pulumi/${PULUMI_VERSION}"
 AWS_INSTALL_DIR="${HOST_TOOLS_DIR}/aws-cli/${AWS_VERSION}"
+CPULIMIT_INSTALL_DIR="${HOST_TOOLS_DIR}/cpulimit/${CPULIMIT_VERSION}"
+CPULIMIT_BIN_PATH="${CPULIMIT_INSTALL_DIR}/cpulimit"
 if [ "${RUNNER_SERVICE_MANAGER}" = "launchd" ]; then
   AWS_BIN_PATH="${AWS_INSTALL_DIR}/aws"
   AWS_PACKAGE_URL="${RUNNER_AWS_PACKAGE_URL:-https://awscli.amazonaws.com/AWSCLIV2-${AWS_VERSION}.pkg}"
@@ -186,6 +191,7 @@ RUNNER_TOOL_PNPM_VERSION=${PNPM_VERSION}
 RUNNER_TOOL_WRANGLER_VERSION=${WRANGLER_VERSION}
 RUNNER_TOOL_PULUMI_VERSION=${PULUMI_VERSION}
 RUNNER_TOOL_AWS_VERSION=${AWS_VERSION}
+RUNNER_TOOL_CPULIMIT_VERSION=${CPULIMIT_VERSION}
 EOF
 }
 
@@ -492,6 +498,71 @@ install_aws() {
   ensure_symlink "${AWS_BIN_PATH}" "${LOCAL_BIN_DIR}/aws"
 }
 
+install_cpulimit() {
+  if [ "${RUNNER_SERVICE_MANAGER}" != "launchd" ]; then
+    return 0
+  fi
+
+  if [ -x "${CPULIMIT_BIN_PATH}" ]; then
+    ensure_symlink "${CPULIMIT_BIN_PATH}" "${LOCAL_BIN_DIR}/cpulimit"
+    return 0
+  fi
+
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    return 0
+  fi
+
+  command -v make >/dev/null 2>&1 || {
+    echo "make is required to install cpulimit on macOS" >&2
+    exit 1
+  }
+  command -v cc >/dev/null 2>&1 || {
+    echo "a C compiler is required to install cpulimit on macOS" >&2
+    exit 1
+  }
+  command -v patch >/dev/null 2>&1 || {
+    echo "patch is required to install cpulimit on macOS" >&2
+    exit 1
+  }
+  mkdir -p "${HOST_TOOLS_DIR}"
+
+  (
+    set -euo pipefail
+
+    local temp_dir
+    local archive_path
+    local source_dir
+    local actual_checksum
+
+    temp_dir="$(mktemp -d "${HOST_TOOLS_DIR}/.cpulimit-${CPULIMIT_VERSION}.XXXXXX")"
+    trap 'rm -rf "${temp_dir}"' EXIT
+    archive_path="${temp_dir}/cpulimit-${CPULIMIT_VERSION}.tar.gz"
+    source_dir="${temp_dir}/cpulimit-${CPULIMIT_VERSION}"
+
+    curl -fsSL \
+      "https://github.com/opsengine/cpulimit/archive/refs/tags/v${CPULIMIT_VERSION}.tar.gz" \
+      -o "${archive_path}"
+    actual_checksum="$(runner_sha256 "${archive_path}" | awk '{print $1}')"
+    [ "${actual_checksum}" = "${CPULIMIT_SHA256}" ] || {
+      echo "cpulimit ${CPULIMIT_VERSION} checksum mismatch" >&2
+      exit 1
+    }
+
+    tar -xzf "${archive_path}" -C "${temp_dir}"
+    [ -f "${CPULIMIT_MACOS_PATCH_PATH}" ] || {
+      echo "cpulimit macOS patch is missing: ${CPULIMIT_MACOS_PATCH_PATH}" >&2
+      exit 1
+    }
+    patch -d "${source_dir}" -p1 -i "${CPULIMIT_MACOS_PATCH_PATH}"
+    make -C "${source_dir}/src"
+    mkdir -p "${CPULIMIT_INSTALL_DIR}"
+    cp "${source_dir}/src/cpulimit" "${CPULIMIT_BIN_PATH}"
+    chmod u+x "${CPULIMIT_BIN_PATH}"
+  )
+
+  ensure_symlink "${CPULIMIT_BIN_PATH}" "${LOCAL_BIN_DIR}/cpulimit"
+}
+
 write_manifest() {
   if [ "${DRY_RUN}" -eq 1 ]; then
     return 0
@@ -531,6 +602,7 @@ install_pnpm
 install_wrangler
 install_pulumi
 install_aws
+install_cpulimit
 write_manifest
 if [ "${DRY_RUN}" -eq 0 ]; then
   write_env_files

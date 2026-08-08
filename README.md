@@ -17,7 +17,7 @@ tools are never committed.
 - One isolated directory and user service per runner (systemd or launchd);
   runner binaries are copy-on-write clones of a shared image where the
   filesystem supports it (XFS/Btrfs reflinks, APFS clonefiles)
-- A persistent, dashboard-configurable CPU quota per Linux runner (200% by default)
+- A persistent, dashboard-configurable CPU quota per runner (200% by default)
 - Pinned Node.js `24.19.0` LTS, pnpm `11.20.0`, Wrangler, Pulumi, and AWS CLI
   tooling installed once per host under `host-tools/` and shared by every
   runner, along with a shared Actions tool cache, pnpm store, and npm cache;
@@ -43,12 +43,11 @@ Windows, Linux ARM, and Intel Macs are not currently supported.
   per runner, and at least 10 GiB of free headroom
 
 Docker is optional on Linux but required for container actions and service
-containers. Xcode, Swift, and CocoaPods are optional on macOS unless workflows build Apple
-software. Install them before cutover when your jobs use `xcodebuild`,
-`swiftc`, `codesign`, or `pod`. The dashboard also uses `clang` once to build a
-small local disk-I/O reader. Without Xcode Command Line Tools, the dashboard
-still shows CPU, memory, uptime, and network metrics, but marks disk I/O
-unavailable.
+containers. Xcode, Swift, and CocoaPods are optional on macOS unless workflows
+build Apple software. Install them before cutover when your jobs use
+`xcodebuild`, `swiftc`, `codesign`, or `pod`. Xcode Command Line Tools are
+required to build the pinned macOS CPU limiter during provisioning. The
+dashboard also uses `clang` once to build a small local disk-I/O reader.
 
 ## Fastest setup: use the latest release
 
@@ -159,6 +158,22 @@ Each token key becomes an optional environment-variable prefix. For example,
 
 The release contains a placeholder `fleet.tsv`; replace every `CHANGE_ME`
 value before continuing.
+
+New runners receive GitHub's default `self-hosted`, operating-system, and
+architecture labels. To make a runner eligible only for workflows that request
+a purpose-specific label, register it without those defaults:
+
+```bash
+RUNNER_REGISTRATION_TOKEN='short-lived-token' \
+  ./bootstrap.sh \
+    --url https://github.com/my-organization \
+    --labels macos-build \
+    --no-default-labels \
+    macos-build-1
+```
+
+Those workflows must use `runs-on: macos-build`. Labels can only be set by the
+configuration script during initial registration or replacement.
 
 ## Generate registration tokens
 
@@ -335,23 +350,26 @@ Useful direct commands are:
 ./manage-runners.sh reconcile-all
 ```
 
-### Configure Linux runner CPU limits
+### Configure runner CPU limits
 
-Linux runners default to a `200%` systemd CPU quota, which allows at most two
-logical CPUs per runner. The quota applies to the service's full cgroup, so a
-workflow and every process it launches share the same limit.
+Runners default to a `200%` CPU quota, which allows at most two logical CPUs per
+runner. Linux applies the quota to the full systemd service cgroup. macOS uses
+a pinned `cpulimit` build that monitors the listener and its descendants. In
+both cases, a workflow and every process it launches share the same limit.
 
 In the dashboard, select a runner and press `c` to view or change its limit.
-The change is applied to a running service immediately and is also persisted in
-the runner directory for future starts. The equivalent command is:
+The change is persisted in the runner directory for future starts. Linux
+applies it live; macOS applies it at the next service restart so an in-progress
+job is never interrupted. The equivalent command is:
 
 ```bash
-./manage-runners.sh set-cpu-limit ubuntu-x64-1 200
+./manage-runners.sh set-cpu-limit macos-build-1 200
 ```
 
 CPU quota values are whole-number percentages (`100%` is one logical CPU,
-`200%` is two). This resource control is available on Linux systemd user
-services; launchd does not provide an equivalent percentage-based cgroup cap.
+`200%` is two). On macOS, the value cannot exceed the host's logical CPU count.
+The macOS limiter follows the runner's process tree; a workflow that explicitly
+detaches and reparents a process can escape that best-effort cap.
 
 After setup, confirm each runner is idle/online in GitHub settings and run a
 representative workflow for every GitHub target.
