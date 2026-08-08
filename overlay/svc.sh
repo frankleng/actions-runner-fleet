@@ -18,7 +18,7 @@ read_runner_json_value() {
 
   awk -F '"' -v field_name="${key}" '
     NR == 1 { sub(/^\xef\xbb\xbf/, "") }
-    $2 == field_name { print $4; exit }
+    { for (i = 2; i <= NF; i += 2) if ($i == field_name) { print $(i + 2); exit } }
   ' "${RUNNER_METADATA_PATH}"
 }
 

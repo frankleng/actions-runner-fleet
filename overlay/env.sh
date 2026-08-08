@@ -16,11 +16,15 @@ RUNNER_TEMP="${RUNNER_ROOT}/_work/_temp"
 RUNNER_TOOL_CACHE="${RUNNER_ROOT}/_work/_tool"
 TOOLS_DIR="${RUNNER_ROOT}/tools"
 LOCAL_BIN_DIR="${TOOLS_DIR}/bin"
-NPM_GLOBAL_BIN="${TOOLS_DIR}/npm-global/bin"
 PNPM_HOME="${TOOLS_DIR}/pnpm-global/bin"
 COREPACK_HOME="${TOOLS_DIR}/corepack"
 PULUMI_HOME="${TOOLS_DIR}/pulumi-home"
-NODE_BIN_DIR="${RUNNER_TOOL_CACHE}/node/22.21.1/arm64/bin"
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) NODE_ARCH="arm64" ;;
+  Linux:x86_64) NODE_ARCH="x64" ;;
+  *) echo "unsupported runner host: $(uname -s) $(uname -m)" >&2; exit 1 ;;
+esac
+NODE_BIN_DIR="${RUNNER_TOOL_CACHE}/node/24.19.0/${NODE_ARCH}/bin"
 AMBIENT_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 AMBIENT_HOME="${HOME:-}"
 RUNNER_PATH=""
@@ -71,7 +75,7 @@ build_runner_path() {
   local entry
   local IFS=':'
 
-  for entry in "${LOCAL_BIN_DIR}" "${PNPM_HOME}" "${NPM_GLOBAL_BIN}" "${NODE_BIN_DIR}"; do
+  for entry in "${LOCAL_BIN_DIR}" "${PNPM_HOME}" "${NODE_BIN_DIR}"; do
     path_value="$(append_unique_path_entry "${path_value}" "${entry}")"
   done
 
@@ -98,7 +102,6 @@ write_env_file() {
     "${RUNNER_TEMP}" \
     "${RUNNER_TOOL_CACHE}" \
     "${LOCAL_BIN_DIR}" \
-    "${NPM_GLOBAL_BIN}" \
     "${PNPM_HOME}" \
     "${COREPACK_HOME}" \
     "${PULUMI_HOME}"

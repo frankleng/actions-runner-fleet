@@ -3,6 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/platform.sh"
 
 if [ "${1:-}" = "--cli" ]; then
   shift
@@ -20,7 +21,7 @@ if [ -z "${NODE_BIN}" ]; then
 fi
 
 if [ ! -x "${NODE_BIN}" ]; then
-  ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${SCRIPT_DIR}/actions-runner-osx-arm64-2.336.0.tar.gz}"
+  ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${SCRIPT_DIR}/${RUNNER_ARCHIVE_BASENAME}}"
   if [ ! -f "${ARCHIVE_PATH}" ]; then
     echo "Node.js is unavailable and the bundled runner archive was not found: ${ARCHIVE_PATH}" >&2
     exit 1

@@ -1,0 +1,17 @@
+[Unit]
+Description=GitHub Actions Runner ({{RunnerName}})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{RunnerRoot}}
+ExecStart={{RunnerRoot}}/runsvc.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+CPUQuota={{CPUQuotaPercent}}%
+
+[Install]
+WantedBy=default.target

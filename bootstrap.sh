@@ -5,13 +5,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANAGE_RUNNERS_PATH="${RUNNER_MANAGE_RUNNERS_PATH:-${SCRIPT_DIR}/manage-runners.sh}"
 RUNNER_TARGET_HELPER_PATH="${RUNNER_TARGET_HELPER_PATH:-${SCRIPT_DIR}/runner-target.sh}"
+source "${SCRIPT_DIR}/platform.sh"
 LAUNCHCTL_BIN="${RUNNER_LAUNCHCTL_BIN:-launchctl}"
 REGISTRY_PATH="${RUNNER_REGISTRY_PATH:-${SCRIPT_DIR}/runners.tsv}"
 GITHUB_URL="${RUNNER_DEFAULT_URL:-}"
 GITHUB_SCOPE=""
-RUNNER_ARCHIVE_VERSION="2.336.0"
-RUNNER_ARCHIVE_SHA256="8e8839c49b7060b6b2154f4931f815df330c27f167d53ef2239ee3dfce28b079"
-RUNNER_ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${SCRIPT_DIR}/actions-runner-osx-arm64-${RUNNER_ARCHIVE_VERSION}.tar.gz}"
+RUNNER_ARCHIVE_VERSION="${RUNNER_VERSION}"
+RUNNER_ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${SCRIPT_DIR}/${RUNNER_ARCHIVE_BASENAME}}"
 RUNNER_DIRECTORY_PREFIX="${RUNNER_DIRECTORY_PREFIX:-}"
 START_RUNNERS=1
 CHECK_ONLY=0
@@ -74,15 +74,21 @@ verify_host() {
   os_name="$(uname -s)"
   architecture="$(uname -m)"
 
-  [ "${os_name}" = "Darwin" ] ||
-    fail "this kit supports macOS only (detected ${os_name})"
-  [ "${architecture}" = "arm64" ] ||
-    fail "this kit requires a native Apple-silicon shell (detected ${architecture})"
+  case "${os_name}:${architecture}" in
+    Darwin:arm64|Linux:x86_64) ;;
+    *) fail "unsupported host: ${os_name} ${architecture}" ;;
+  esac
 
-  for required_command in awk curl df find grep id pkgutil shasum sleep sw_vers tar tr; do
+  for required_command in awk curl df find grep id sleep tar tr "${RUNNER_SHA256_COMMAND}"; do
     require_command "${required_command}"
   done
-  require_command "${LAUNCHCTL_BIN}"
+  if [ "${os_name}" = "Darwin" ]; then
+    require_command pkgutil
+    require_command sw_vers
+    require_command "${LAUNCHCTL_BIN}"
+  else
+    require_command systemctl
+  fi
 
   [ -x "${MANAGE_RUNNERS_PATH}" ] ||
     fail "runner manager is missing or not executable: ${MANAGE_RUNNERS_PATH}"
@@ -90,7 +96,7 @@ verify_host() {
     fail "runner archive is missing: ${RUNNER_ARCHIVE_PATH}"
 
   local actual_checksum
-  actual_checksum="$(shasum -a 256 "${RUNNER_ARCHIVE_PATH}" | awk '{print $1}')"
+  actual_checksum="$(runner_sha256 "${RUNNER_ARCHIVE_PATH}" | awk '{print $1}')"
   [ "${actual_checksum}" = "${RUNNER_ARCHIVE_SHA256}" ] ||
     fail "runner archive checksum mismatch"
 }
@@ -177,6 +183,9 @@ enable_runner_service() {
   local owner
   local service_name
 
+  if [ "${RUNNER_SERVICE_MANAGER}" != "launchd" ]; then
+    return 0
+  fi
   owner="${GITHUB_URL%/}"
   owner="${owner##*/}"
   service_name="actions.runner.${owner}.${runner_name// /_}"
@@ -265,7 +274,11 @@ verify_host
 
 if [ "${CHECK_ONLY}" -eq 1 ]; then
   echo "portable runner kit is ready"
-  echo "host: $(sw_vers -productName) $(sw_vers -productVersion) ($(uname -m))"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "host: $(sw_vers -productName) $(sw_vers -productVersion) ($(uname -m))"
+  else
+    echo "host: $(. /etc/os-release && echo "${PRETTY_NAME}") ($(uname -m))"
+  fi
   echo "runner archive: ${RUNNER_ARCHIVE_VERSION} (checksum verified)"
   echo "registry: ${REGISTRY_PATH}"
   exit 0

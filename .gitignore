@@ -24,6 +24,7 @@
 !security-audit.sh
 !runnerctl
 !runner-target.sh
+!platform.sh
 
 !overlay/
 !overlay/**
@@ -31,7 +32,7 @@
 !runnerctl-app/
 runnerctl-app/*
 !runnerctl-app/package.json
-!runnerctl-app/package-lock.json
+!runnerctl-app/pnpm-lock.yaml
 !runnerctl-app/bin/
 !runnerctl-app/bin/**
 !runnerctl-app/lib/

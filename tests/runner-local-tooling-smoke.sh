@@ -3,12 +3,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "${ROOT_DIR}/platform.sh"
 SCRIPT_PATH="${ROOT_DIR}/provision-runner-tooling.sh"
 
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "${temp_dir}"' EXIT
 
-mkdir -p "${temp_dir}/_work/_tool/node/22.21.1/arm64/bin"
+mkdir -p "${temp_dir}/_work/_tool/node/24.19.0/${RUNNER_NODE_ARCH}/bin"
 host_home="${temp_dir}/host-home"
 mkdir -p "${host_home}/Library/pnpm" "${host_home}/setup-pnpm"
 
@@ -22,7 +23,7 @@ printf '%s\n' "${env_output}" | grep -q "RUNNER_TOOL_CACHE=${temp_dir}/_work/_to
 printf '%s\n' "${env_output}" | grep -q "PNPM_HOME=${temp_dir}/tools/pnpm-global/bin"
 printf '%s\n' "${env_output}" | grep -q "COREPACK_HOME=${temp_dir}/tools/corepack"
 printf '%s\n' "${env_output}" | grep -q "PULUMI_HOME=${temp_dir}/tools/pulumi-home"
-printf '%s\n' "${env_output}" | grep -q "PATH=${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global/bin:${temp_dir}/tools/npm-global/bin:${temp_dir}/_work/_tool/node/22.21.1/arm64/bin:"
+printf '%s\n' "${env_output}" | grep -q "PATH=${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global/bin:${temp_dir}/_work/_tool/node/24.19.0/${RUNNER_NODE_ARCH}/bin:"
 if printf '%s\n' "${env_output}" | grep -Fq "${host_home}/Library/pnpm"; then
   echo "expected runner-local PATH to exclude the host pnpm directory"
   exit 1
@@ -41,10 +42,10 @@ eval "${env_output}"
 [[ "${PNPM_HOME}" == "${temp_dir}/tools/pnpm-global/bin" ]]
 [[ "${COREPACK_HOME}" == "${temp_dir}/tools/corepack" ]]
 [[ "${PULUMI_HOME}" == "${temp_dir}/tools/pulumi-home" ]]
-[[ "${PATH}" == "${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global/bin:${temp_dir}/tools/npm-global/bin:${temp_dir}/_work/_tool/node/22.21.1/arm64/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Little Snitch.app/Contents/Components" ]]
+[[ "${PATH}" == "${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global/bin:${temp_dir}/_work/_tool/node/24.19.0/${RUNNER_NODE_ARCH}/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Little Snitch.app/Contents/Components" ]]
 
-printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_NODE_VERSION=22.21.1"
-printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PNPM_VERSION=9.4.0"
+printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_NODE_VERSION=24.19.0"
+printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PNPM_VERSION=11.20.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_WRANGLER_VERSION=4.69.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PULUMI_VERSION=3.143.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_AWS_VERSION=2.36.11"

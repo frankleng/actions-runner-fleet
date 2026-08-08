@@ -9,6 +9,7 @@ import {
   buildRunnerDetailLines,
   buildRunnerServiceName,
   classifyGitHubRunnerTargetUrl,
+  DEFAULT_CPU_QUOTA_PERCENT,
   DEFAULT_GITHUB_RUNNER_SCOPE,
   parseRegistry,
   getActionDefinitions,
@@ -19,6 +20,7 @@ import {
   defaultRunnerDirectory,
   getRunnerActionSequence,
   parseAutoRefreshInterval,
+  parseCpuQuotaPercent,
   parseLaunchctlDisabledOutput,
   parseServicePid,
   shouldCancelPromptOnKey,
@@ -72,6 +74,7 @@ test("getActionDefinitions returns dashboard actions", () => {
     "i",
     "s",
     "x",
+    "c",
     "r",
     "q"
   ]);
@@ -195,6 +198,24 @@ test("buildManageRunnersArgs routes scripted actions to the shell helper", () =>
     "start",
     "mac-runner-1"
   ]);
+
+  assert.deepEqual(buildManageRunnersArgs("set-cpu-limit", {
+    name: "ubuntu-runner-1",
+    cpuQuotaPercent: 200
+  }), [
+    "set-cpu-limit",
+    "ubuntu-runner-1",
+    "200"
+  ]);
+});
+
+test("CPU quota percentages accept systemd multi-core limits", () => {
+  assert.equal(DEFAULT_CPU_QUOTA_PERCENT, 200);
+  assert.equal(parseCpuQuotaPercent("200"), 200);
+  assert.equal(parseCpuQuotaPercent(" 175\n"), 175);
+  assert.equal(parseCpuQuotaPercent("0"), null);
+  assert.equal(parseCpuQuotaPercent("2.5"), null);
+  assert.equal(parseCpuQuotaPercent("unlimited"), null);
 });
 
 test("defaultRunnerDirectory derives the auto-created runner path from the current install", () => {
@@ -349,6 +370,7 @@ test("buildRunnerDetailLines puts the runner status at the top of the detail pan
     configured: true,
     serviceInstalled: true,
     serviceState: "running",
+    cpuQuotaPercent: 200,
     workFolder: "_work",
     repository: "https://github.com/example-org"
   });
@@ -356,6 +378,8 @@ test("buildRunnerDetailLines puts the runner status at the top of the detail pan
   assert.equal(lines[0], "{bold}mac-runner-1{/bold}");
   assert.match(lines[1], /Status/);
   assert.match(lines[1], /running/);
+  assert.match(lines[2], /CPU Limit/);
+  assert.match(lines[2], /200%/);
 
   const linesWithMetrics = buildRunnerDetailLines(
     {
@@ -364,6 +388,7 @@ test("buildRunnerDetailLines puts the runner status at the top of the detail pan
       configured: true,
       serviceInstalled: true,
       serviceState: "running",
+      cpuQuotaPercent: 200,
       workFolder: "_work",
       repository: "https://github.com/example-org"
     },
