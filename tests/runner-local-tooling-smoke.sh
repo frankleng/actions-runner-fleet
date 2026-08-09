@@ -13,6 +13,22 @@ host_tools_dir="${temp_dir}/host-tools"
 pnpm_store_dir="${temp_dir}/pnpm-store"
 tool_cache_dir="${host_tools_dir}/tool-cache"
 mkdir -p "${tool_cache_dir}/node/24.19.0/${RUNNER_NODE_ARCH}/bin"
+mkdir -p "${host_tools_dir}/pnpm-tools/bin" "${temp_dir}/tools/bin"
+cat > "${host_tools_dir}/pnpm-tools/bin/wrangler" <<'EOF'
+#!/bin/sh
+basedir="$(dirname "$0")"
+cat "${basedir}/../wrangler-version"
+EOF
+chmod u+x "${host_tools_dir}/pnpm-tools/bin/wrangler"
+printf '4.69.0\n' > "${host_tools_dir}/pnpm-tools/wrangler-version"
+
+# Reproduce the original migration bug: pnpm's launcher works at its shared
+# path, but a symlink changes $0 and makes its relative module lookup fail.
+ln -s "${host_tools_dir}/pnpm-tools/bin/wrangler" "${temp_dir}/tools/bin/wrangler"
+if "${temp_dir}/tools/bin/wrangler" --version >/dev/null 2>&1; then
+  echo "expected the relocated pnpm launcher symlink to fail"
+  exit 1
+fi
 host_home="${temp_dir}/host-home"
 mkdir -p "${host_home}/Library/pnpm" "${host_home}/setup-pnpm"
 
@@ -64,6 +80,9 @@ printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_AWS_VERSION=2.36.11"
 run_provision --write-env
 [ -f "${temp_dir}/.env" ]
 [ -f "${temp_dir}/.path" ]
+[ -x "${temp_dir}/tools/bin/wrangler" ]
+[ ! -L "${temp_dir}/tools/bin/wrangler" ]
+[ "$("${temp_dir}/tools/bin/wrangler" --version)" = "4.69.0" ]
 grep -q "RUNNER_TOOL_CACHE=${tool_cache_dir}" "${temp_dir}/.env"
 grep -q "^${temp_dir}/tools/bin:" "${temp_dir}/.path"
 grep -qx "store-dir=${pnpm_store_dir}" "${temp_dir}/home/.npmrc"

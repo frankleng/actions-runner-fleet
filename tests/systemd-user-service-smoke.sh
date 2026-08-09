@@ -13,6 +13,12 @@ loginctl_stub="${temp_dir}/loginctl"
 loginctl_log="${temp_dir}/loginctl.log"
 
 mkdir -p "${runner_dir}/bin" "${runner_dir}/_diag"
+mkdir -p "${temp_dir}/host-tools/pnpm-tools/bin"
+cat > "${temp_dir}/host-tools/pnpm-tools/bin/wrangler" <<'EOF'
+#!/bin/sh
+printf '4.69.0\n'
+EOF
+chmod u+x "${temp_dir}/host-tools/pnpm-tools/bin/wrangler"
 cp "${ROOT_DIR}/overlay/svc-systemd-user.sh" "${runner_dir}/svc.sh"
 cp "${ROOT_DIR}/overlay/env.sh" "${runner_dir}/env.sh"
 cp "${ROOT_DIR}/overlay/runsvc.sh" "${runner_dir}/bin/runsvc.sh"

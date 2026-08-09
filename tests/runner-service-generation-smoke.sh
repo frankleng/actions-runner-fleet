@@ -17,6 +17,12 @@ process_state="${temp_dir}/process.state"
 trap 'rm -rf "${temp_dir}"' EXIT
 
 mkdir -p "${runner_dir}/bin" "${runner_dir}/externals/node20/bin" "${temp_user_home}"
+mkdir -p "${temp_dir}/host-tools/pnpm-tools/bin"
+cat > "${temp_dir}/host-tools/pnpm-tools/bin/wrangler" <<'EOF'
+#!/bin/sh
+printf '4.69.0\n'
+EOF
+chmod u+x "${temp_dir}/host-tools/pnpm-tools/bin/wrangler"
 runner_dir="$(cd "${runner_dir}" && pwd -P)"
 temp_user_home="$(cd "${temp_user_home}" && pwd -P)"
 

@@ -236,6 +236,7 @@ write_env_files() {
     "${LOCAL_BIN_DIR}" \
     "${PNPM_HOME}"
 
+  ensure_exec_wrapper "${PNPM_TOOLS_BIN_DIR}/wrangler" "${LOCAL_BIN_DIR}/wrangler"
   env_file_lines > "${env_path}.tmp"
   build_runner_path "${current_path}" > "${path_path}.tmp"
   mv "${env_path}.tmp" "${env_path}"
@@ -261,6 +262,29 @@ ensure_symlink() {
 
   mkdir -p "$(dirname "${link_path}")"
   ln -sfn "${target}" "${link_path}"
+}
+
+# pnpm command launchers resolve their backing module relative to $0. Symlinking
+# one into a runner-local bin directory therefore makes it search for the
+# shared virtual store under the runner root. Use a wrapper so the shared
+# launcher sees its real path and retains the module resolution pnpm generated.
+ensure_exec_wrapper() {
+  local target="$1"
+  local wrapper_path="$2"
+  local temp_wrapper_path="${wrapper_path}.tmp"
+
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    return 0
+  fi
+  if [ ! -x "${target}" ]; then
+    echo "runner tool launcher is missing or not executable: ${target}" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "${wrapper_path}")"
+  printf '#!/bin/bash\nexec %q "$@"\n' "${target}" > "${temp_wrapper_path}"
+  chmod u+x "${temp_wrapper_path}"
+  mv "${temp_wrapper_path}" "${wrapper_path}"
 }
 
 download_node() {
@@ -354,7 +378,6 @@ install_wrangler() {
     }
   fi
 
-  ensure_symlink "${PNPM_TOOLS_BIN_DIR}/wrangler" "${LOCAL_BIN_DIR}/wrangler"
 }
 
 install_pulumi() {
