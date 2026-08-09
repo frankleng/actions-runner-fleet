@@ -15,6 +15,7 @@ source "${SCRIPT_DIR}/platform.sh"
 DRY_RUN=0
 PRINT_ENV=0
 PRINT_MANIFEST=0
+WRITE_ENV=0
 
 NODE_VERSION="24.19.0"
 PNPM_VERSION="11.20.0"
@@ -25,9 +26,12 @@ AWS_VERSION="2.36.11"
 usage() {
   cat <<EOF
 Usage:
-  ./provision-runner-tooling.sh [--root PATH] [--dry-run] [--print-env] [--print-manifest]
+  ./provision-runner-tooling.sh [--root PATH] [--dry-run] [--print-env] [--print-manifest] [--write-env]
 
-Installs a pinned runner-local toolchain under the runner root.
+Installs a pinned toolchain for the runner root. Version-pinned tools and the
+pnpm store are shared by every runner on the host; only symlinks, pnpm shims,
+and runtime state live under the runner root. --write-env refreshes the
+runner's .env, .path, and home .npmrc without reinstalling anything.
 EOF
 }
 
@@ -49,6 +53,10 @@ while [ "$#" -gt 0 ]; do
       PRINT_MANIFEST=1
       shift
       ;;
+    --write-env)
+      WRITE_ENV=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -61,24 +69,28 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# Per-runner state stays under the runner root; everything version-pinned and
+# content-addressed is shared by all runners on this host.
 TOOLS_DIR="${ROOT_DIR}/tools"
 HOST_TOOLS_DIR="${RUNNER_HOST_TOOLS_DIR:-${SCRIPT_DIR}/host-tools}"
 LOCAL_BIN_DIR="${TOOLS_DIR}/bin"
 PNPM_GLOBAL_DIR="${TOOLS_DIR}/pnpm-global"
 PNPM_HOME="${PNPM_GLOBAL_DIR}/bin"
-COREPACK_HOME="${TOOLS_DIR}/corepack"
-PNPM_TOOLS_DIR="${TOOLS_DIR}/pnpm-tools"
-PNPM_STORE_DIR="${TOOLS_DIR}/pnpm-store"
-PULUMI_HOME="${TOOLS_DIR}/pulumi-home"
+COREPACK_HOME="${HOST_TOOLS_DIR}/corepack"
+PNPM_TOOLS_DIR="${HOST_TOOLS_DIR}/pnpm-tools"
+PNPM_TOOLS_BIN_DIR="${PNPM_TOOLS_DIR}/bin"
+PNPM_STORE_DIR="${RUNNER_PNPM_STORE_DIR:-${SCRIPT_DIR}/.pnpm-store}"
+NPM_CACHE_DIR="${HOST_TOOLS_DIR}/npm-cache"
+PULUMI_HOME="${HOST_TOOLS_DIR}/pulumi-home"
 RUNNER_HOME="${ROOT_DIR}/home"
 RUNNER_TMP="${ROOT_DIR}/tmp"
 RUNNER_TEMP="${ROOT_DIR}/_work/_temp"
-RUNNER_TOOL_CACHE="${ROOT_DIR}/_work/_tool"
+RUNNER_TOOL_CACHE="${RUNNER_SHARED_TOOL_CACHE:-${HOST_TOOLS_DIR}/tool-cache}"
 NODE_ARCH="${RUNNER_NODE_ARCH}"
 NODE_INSTALL_DIR="${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/${NODE_ARCH}"
 NODE_BIN_DIR="${NODE_INSTALL_DIR}/bin"
 NODE_COMPLETE_MARKER="${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/${NODE_ARCH}.complete"
-PULUMI_INSTALL_DIR="${TOOLS_DIR}/pulumi/${PULUMI_VERSION}"
+PULUMI_INSTALL_DIR="${HOST_TOOLS_DIR}/pulumi/${PULUMI_VERSION}"
 AWS_INSTALL_DIR="${HOST_TOOLS_DIR}/aws-cli/${AWS_VERSION}"
 if [ "${RUNNER_SERVICE_MANAGER}" = "launchd" ]; then
   AWS_BIN_PATH="${AWS_INSTALL_DIR}/aws"
@@ -177,11 +189,8 @@ RUNNER_TOOL_AWS_VERSION=${AWS_VERSION}
 EOF
 }
 
-print_env() {
-  local current_path="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
-  local runner_path
-
-  runner_path="$(build_runner_path "${current_path}")"
+env_file_lines() {
+  printf 'LANG=%q\n' "${LANG:-en_US.UTF-8}"
   printf 'HOME=%q\n' "${RUNNER_HOME}"
   printf 'TMPDIR=%q\n' "${RUNNER_TMP}"
   printf 'RUNNER_TEMP=%q\n' "${RUNNER_TEMP}"
@@ -189,7 +198,49 @@ print_env() {
   printf 'PNPM_HOME=%q\n' "${PNPM_HOME}"
   printf 'COREPACK_HOME=%q\n' "${COREPACK_HOME}"
   printf 'PULUMI_HOME=%q\n' "${PULUMI_HOME}"
-  printf 'PATH=%q\n' "${runner_path}"
+}
+
+print_env() {
+  local current_path="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+
+  env_file_lines
+  printf 'PATH=%q\n' "$(build_runner_path "${current_path}")"
+}
+
+# Point package managers in runner jobs at the shared content-addressable
+# stores; without this, every runner home accumulates a private copy. Both
+# stores are safe for concurrent use by multiple runners on one filesystem.
+write_npmrc() {
+  local npmrc_path="${RUNNER_HOME}/.npmrc"
+  local temp_npmrc_path="${npmrc_path}.tmp"
+
+  {
+    if [ -f "${npmrc_path}" ]; then
+      grep -v -e '^store-dir=' -e '^cache=' "${npmrc_path}" || true
+    fi
+    printf 'store-dir=%s\n' "${PNPM_STORE_DIR}"
+    printf 'cache=%s\n' "${NPM_CACHE_DIR}"
+  } > "${temp_npmrc_path}"
+  mv "${temp_npmrc_path}" "${npmrc_path}"
+}
+
+write_env_files() {
+  local env_path="${ROOT_DIR}/.env"
+  local path_path="${ROOT_DIR}/.path"
+  local current_path="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+
+  mkdir -p \
+    "${RUNNER_HOME}/Library/Logs" \
+    "${RUNNER_TMP}" \
+    "${RUNNER_TEMP}" \
+    "${LOCAL_BIN_DIR}" \
+    "${PNPM_HOME}"
+
+  env_file_lines > "${env_path}.tmp"
+  build_runner_path "${current_path}" > "${path_path}.tmp"
+  mv "${env_path}.tmp" "${env_path}"
+  mv "${path_path}.tmp" "${path_path}"
+  write_npmrc
 }
 
 ensure_directory() {
@@ -278,31 +329,32 @@ install_pnpm() {
 install_wrangler() {
   local version_output=""
 
-  if [ -x "${LOCAL_BIN_DIR}/wrangler" ]; then
-    version_output="$(PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" "${LOCAL_BIN_DIR}/wrangler" --version 2>/dev/null || true)"
-  fi
-  if [ "${version_output}" = "${WRANGLER_VERSION}" ]; then
-    return 0
+  if [ -x "${PNPM_TOOLS_BIN_DIR}/wrangler" ]; then
+    version_output="$(PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" "${PNPM_TOOLS_BIN_DIR}/wrangler" --version 2>/dev/null || true)"
   fi
 
-  if [ "${DRY_RUN}" -eq 1 ]; then
-    return 0
+  if [ "${version_output}" != "${WRANGLER_VERSION}" ]; then
+    if [ "${DRY_RUN}" -eq 1 ]; then
+      return 0
+    fi
+
+    mkdir -p "${PNPM_TOOLS_BIN_DIR}" "${PNPM_STORE_DIR}"
+    COREPACK_HOME="${COREPACK_HOME}" PNPM_HOME="${PNPM_HOME}" \
+    PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" \
+      "${PNPM_HOME}/pnpm" add --global \
+        --global-dir "${PNPM_TOOLS_DIR}" \
+        --global-bin-dir "${PNPM_TOOLS_BIN_DIR}" \
+        --store-dir "${PNPM_STORE_DIR}" \
+        "wrangler@${WRANGLER_VERSION}"
+
+    version_output="$(PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" "${PNPM_TOOLS_BIN_DIR}/wrangler" --version)"
+    [ "${version_output}" = "${WRANGLER_VERSION}" ] || {
+      echo "Wrangler ${WRANGLER_VERSION} verification failed: ${version_output}" >&2
+      exit 1
+    }
   fi
 
-  mkdir -p "${LOCAL_BIN_DIR}" "${PNPM_TOOLS_DIR}" "${PNPM_STORE_DIR}"
-  COREPACK_HOME="${COREPACK_HOME}" PNPM_HOME="${PNPM_HOME}" \
-  PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" \
-    "${PNPM_HOME}/pnpm" add --global \
-      --global-dir "${PNPM_TOOLS_DIR}" \
-      --global-bin-dir "${LOCAL_BIN_DIR}" \
-      --store-dir "${PNPM_STORE_DIR}" \
-      "wrangler@${WRANGLER_VERSION}"
-
-  version_output="$(PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" "${LOCAL_BIN_DIR}/wrangler" --version)"
-  [ "${version_output}" = "${WRANGLER_VERSION}" ] || {
-    echo "Wrangler ${WRANGLER_VERSION} verification failed: ${version_output}" >&2
-    exit 1
-  }
+  ensure_symlink "${PNPM_TOOLS_BIN_DIR}/wrangler" "${LOCAL_BIN_DIR}/wrangler"
 }
 
 install_pulumi() {
@@ -436,6 +488,11 @@ if [ "${PRINT_ENV}" -eq 1 ]; then
   exit 0
 fi
 
+if [ "${WRITE_ENV}" -eq 1 ]; then
+  write_env_files
+  exit 0
+fi
+
 ensure_directory "${RUNNER_HOME}/Library/Logs"
 ensure_directory "${RUNNER_TMP}"
 ensure_directory "${RUNNER_TEMP}"
@@ -443,7 +500,7 @@ ensure_directory "${RUNNER_TOOL_CACHE}"
 ensure_directory "${LOCAL_BIN_DIR}"
 ensure_directory "${PNPM_HOME}"
 ensure_directory "${COREPACK_HOME}"
-ensure_directory "${PNPM_TOOLS_DIR}"
+ensure_directory "${PNPM_TOOLS_BIN_DIR}"
 ensure_directory "${PNPM_STORE_DIR}"
 ensure_directory "${PULUMI_HOME}"
 install_node
@@ -452,3 +509,6 @@ install_wrangler
 install_pulumi
 install_aws
 write_manifest
+if [ "${DRY_RUN}" -eq 0 ]; then
+  write_env_files
+fi

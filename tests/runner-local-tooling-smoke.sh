@@ -9,21 +9,32 @@ SCRIPT_PATH="${ROOT_DIR}/provision-runner-tooling.sh"
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "${temp_dir}"' EXIT
 
-mkdir -p "${temp_dir}/_work/_tool/node/24.19.0/${RUNNER_NODE_ARCH}/bin"
+host_tools_dir="${temp_dir}/host-tools"
+pnpm_store_dir="${temp_dir}/pnpm-store"
+tool_cache_dir="${host_tools_dir}/tool-cache"
+mkdir -p "${tool_cache_dir}/node/24.19.0/${RUNNER_NODE_ARCH}/bin"
 host_home="${temp_dir}/host-home"
 mkdir -p "${host_home}/Library/pnpm" "${host_home}/setup-pnpm"
 
-env_output="$(HOME="${host_home}" PATH="/usr/bin:/bin:${host_home}/Library/pnpm:/usr/sbin:${host_home}/setup-pnpm:/sbin:/Applications/Little Snitch.app/Contents/Components" /bin/bash "${SCRIPT_PATH}" --root "${temp_dir}" --dry-run --print-env)"
-manifest_output="$(/bin/bash "${SCRIPT_PATH}" --root "${temp_dir}" --dry-run --print-manifest)"
+run_provision() {
+  HOME="${host_home}" \
+  PATH="/usr/bin:/bin:${host_home}/Library/pnpm:/usr/sbin:${host_home}/setup-pnpm:/sbin:/Applications/Little Snitch.app/Contents/Components" \
+  RUNNER_HOST_TOOLS_DIR="${host_tools_dir}" \
+  RUNNER_PNPM_STORE_DIR="${pnpm_store_dir}" \
+    /bin/bash "${SCRIPT_PATH}" --root "${temp_dir}" "$@"
+}
+
+env_output="$(run_provision --dry-run --print-env)"
+manifest_output="$(run_provision --dry-run --print-manifest)"
 
 printf '%s\n' "${env_output}" | grep -q "HOME=${temp_dir}/home"
 printf '%s\n' "${env_output}" | grep -q "TMPDIR=${temp_dir}/tmp"
 printf '%s\n' "${env_output}" | grep -q "RUNNER_TEMP=${temp_dir}/_work/_temp"
-printf '%s\n' "${env_output}" | grep -q "RUNNER_TOOL_CACHE=${temp_dir}/_work/_tool"
+printf '%s\n' "${env_output}" | grep -q "RUNNER_TOOL_CACHE=${tool_cache_dir}"
 printf '%s\n' "${env_output}" | grep -q "PNPM_HOME=${temp_dir}/tools/pnpm-global/bin"
-printf '%s\n' "${env_output}" | grep -q "COREPACK_HOME=${temp_dir}/tools/corepack"
-printf '%s\n' "${env_output}" | grep -q "PULUMI_HOME=${temp_dir}/tools/pulumi-home"
-printf '%s\n' "${env_output}" | grep -q "PATH=${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global/bin:${temp_dir}/_work/_tool/node/24.19.0/${RUNNER_NODE_ARCH}/bin:"
+printf '%s\n' "${env_output}" | grep -q "COREPACK_HOME=${host_tools_dir}/corepack"
+printf '%s\n' "${env_output}" | grep -q "PULUMI_HOME=${host_tools_dir}/pulumi-home"
+printf '%s\n' "${env_output}" | grep -q "PATH=${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global/bin:${tool_cache_dir}/node/24.19.0/${RUNNER_NODE_ARCH}/bin:"
 if printf '%s\n' "${env_output}" | grep -Fq "${host_home}/Library/pnpm"; then
   echo "expected runner-local PATH to exclude the host pnpm directory"
   exit 1
@@ -38,17 +49,34 @@ eval "${env_output}"
 [[ "${HOME}" == "${temp_dir}/home" ]]
 [[ "${TMPDIR}" == "${temp_dir}/tmp" ]]
 [[ "${RUNNER_TEMP}" == "${temp_dir}/_work/_temp" ]]
-[[ "${RUNNER_TOOL_CACHE}" == "${temp_dir}/_work/_tool" ]]
+[[ "${RUNNER_TOOL_CACHE}" == "${tool_cache_dir}" ]]
 [[ "${PNPM_HOME}" == "${temp_dir}/tools/pnpm-global/bin" ]]
-[[ "${COREPACK_HOME}" == "${temp_dir}/tools/corepack" ]]
-[[ "${PULUMI_HOME}" == "${temp_dir}/tools/pulumi-home" ]]
-[[ "${PATH}" == "${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global/bin:${temp_dir}/_work/_tool/node/24.19.0/${RUNNER_NODE_ARCH}/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Little Snitch.app/Contents/Components" ]]
+[[ "${COREPACK_HOME}" == "${host_tools_dir}/corepack" ]]
+[[ "${PULUMI_HOME}" == "${host_tools_dir}/pulumi-home" ]]
+[[ "${PATH}" == "${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global/bin:${tool_cache_dir}/node/24.19.0/${RUNNER_NODE_ARCH}/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Little Snitch.app/Contents/Components" ]]
 
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_NODE_VERSION=24.19.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PNPM_VERSION=11.20.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_WRANGLER_VERSION=4.69.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PULUMI_VERSION=3.143.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_AWS_VERSION=2.36.11"
+
+run_provision --write-env
+[ -f "${temp_dir}/.env" ]
+[ -f "${temp_dir}/.path" ]
+grep -q "RUNNER_TOOL_CACHE=${tool_cache_dir}" "${temp_dir}/.env"
+grep -q "^${temp_dir}/tools/bin:" "${temp_dir}/.path"
+grep -qx "store-dir=${pnpm_store_dir}" "${temp_dir}/home/.npmrc"
+grep -qx "cache=${host_tools_dir}/npm-cache" "${temp_dir}/home/.npmrc"
+
+# --write-env must replace stale managed lines rather than stacking duplicates.
+printf 'store-dir=/somewhere/stale\ncache=/somewhere/stale\nregistry=https://registry.example.com\n' > "${temp_dir}/home/.npmrc"
+run_provision --write-env
+grep -qx "store-dir=${pnpm_store_dir}" "${temp_dir}/home/.npmrc"
+grep -qx "cache=${host_tools_dir}/npm-cache" "${temp_dir}/home/.npmrc"
+grep -qx "registry=https://registry.example.com" "${temp_dir}/home/.npmrc"
+[ "$(grep -c '^store-dir=' "${temp_dir}/home/.npmrc")" -eq 1 ]
+[ "$(grep -c '^cache=' "${temp_dir}/home/.npmrc")" -eq 1 ]
 
 if [ -n "${HOME:-}" ] && grep -Fq "${HOME}" "${SCRIPT_PATH}" "${ROOT_DIR}/overlay/env.sh"; then
   echo "runner tooling must not contain a source-machine home path"

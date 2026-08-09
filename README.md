@@ -14,9 +14,14 @@ tools are never committed.
 ## What gets installed
 
 - GitHub Actions Runner `2.336.0` for Linux x64 or macOS arm64, verified by SHA-256
-- One isolated directory and user service per runner (systemd or launchd)
+- One isolated directory and user service per runner (systemd or launchd);
+  runner binaries are copy-on-write clones of a shared image where the
+  filesystem supports it (XFS/Btrfs reflinks, APFS clonefiles)
 - A persistent, dashboard-configurable CPU quota per Linux runner (200% by default)
-- Pinned runner-local Node.js `24.19.0` LTS, pnpm `11.20.0`, Wrangler, Pulumi, and AWS CLI tooling
+- Pinned Node.js `24.19.0` LTS, pnpm `11.20.0`, Wrangler, Pulumi, and AWS CLI
+  tooling installed once per host under `host-tools/` and shared by every
+  runner, along with a shared Actions tool cache, pnpm store, and npm cache;
+  each runner keeps only symlinks, shims, and its own runtime state
 - A terminal dashboard for status, registration, start, stop, and reconcile
 - Log rotation and cleanup for runner and service diagnostics
 
@@ -26,14 +31,16 @@ Windows, Linux ARM, and Intel Macs are not currently supported.
 ## Requirements
 
 - Ubuntu/Linux using an `x86_64` shell, or Apple-silicon macOS using `arm64`
-- On Linux, a working systemd user manager; enable login lingering when runners
-  must survive logout and start at boot: `sudo loginctl enable-linger "$USER"`
+- On Linux, a working systemd user manager. Setup enables login lingering
+  automatically so runners start at boot; if that is not permitted for the
+  account, it warns and the fallback is `sudo loginctl enable-linger "$USER"`
 - On macOS, an account that remains logged in while its launchd agents run
 - Network access to GitHub, Node.js, the package registry, Pulumi, and AWS download endpoints
 - Node.js and Corepack when building from this source checkout; setup installs pinned pnpm
 - Admin access to each GitHub repository, organization, or enterprise that will
   own runners
-- About 15 GiB per runner plus at least 10 GiB of free headroom
+- About 15 GiB of shared tooling and caches per host, a few GiB of workspace
+  per runner, and at least 10 GiB of free headroom
 
 Docker is optional on Linux but required for container actions and service
 containers. Xcode, Swift, and CocoaPods are optional on macOS unless workflows build Apple

@@ -81,6 +81,27 @@ cat > "${provision_stub}" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 printf '%s\n' "$*" >> "${RUNNER_TEST_PROVISION_LOG:?}"
+root=""
+write_env=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --root) root="$2"; shift 2 ;;
+    --write-env) write_env=1; shift ;;
+    *) shift ;;
+  esac
+done
+if [ "${write_env}" -eq 1 ] && [ -n "${root}" ]; then
+  {
+    printf 'HOME=%q\n' "${root}/home"
+    printf 'TMPDIR=%q\n' "${root}/tmp"
+    printf 'RUNNER_TEMP=%q\n' "${root}/_work/_temp"
+    printf 'RUNNER_TOOL_CACHE=%q\n' "${root}/tool-cache"
+    printf 'PNPM_HOME=%q\n' "${root}/pnpm-home"
+    printf 'COREPACK_HOME=%q\n' "${root}/corepack"
+    printf 'PULUMI_HOME=%q\n' "${root}/pulumi-home"
+  } > "${root}/.env"
+  printf '%s\n' "${PATH}" > "${root}/.path"
+fi
 EOF
 chmod +x "${provision_stub}"
 

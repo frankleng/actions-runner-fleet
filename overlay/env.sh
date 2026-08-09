@@ -10,118 +10,17 @@ while [ -h "${SOURCE}" ]; do
 done
 RUNNER_ROOT="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
 
-RUNNER_HOME="${RUNNER_ROOT}/home"
-RUNNER_TMP="${RUNNER_ROOT}/tmp"
-RUNNER_TEMP="${RUNNER_ROOT}/_work/_temp"
-RUNNER_TOOL_CACHE="${RUNNER_ROOT}/_work/_tool"
-TOOLS_DIR="${RUNNER_ROOT}/tools"
-LOCAL_BIN_DIR="${TOOLS_DIR}/bin"
-PNPM_HOME="${TOOLS_DIR}/pnpm-global/bin"
-COREPACK_HOME="${TOOLS_DIR}/corepack"
-PULUMI_HOME="${TOOLS_DIR}/pulumi-home"
-case "$(uname -s):$(uname -m)" in
-  Darwin:arm64) NODE_ARCH="arm64" ;;
-  Linux:x86_64) NODE_ARCH="x64" ;;
-  *) echo "unsupported runner host: $(uname -s) $(uname -m)" >&2; exit 1 ;;
-esac
-NODE_BIN_DIR="${RUNNER_TOOL_CACHE}/node/24.19.0/${NODE_ARCH}/bin"
-AMBIENT_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
-AMBIENT_HOME="${HOME:-}"
-RUNNER_PATH=""
+KIT_ROOT="${RUNNER_KIT_ROOT:-}"
+if [ -z "${KIT_ROOT}" ] && [ -f "${RUNNER_ROOT}/.kit-root" ]; then
+  KIT_ROOT="$(cat "${RUNNER_ROOT}/.kit-root")"
+fi
+# Runners default to <kit>/.runners/<name>, so the kit is two levels up.
+KIT_ROOT="${KIT_ROOT:-$(cd "${RUNNER_ROOT}/../.." && pwd)}"
 
-is_filtered_path_entry() {
-  local entry="$1"
+PROVISION_SCRIPT_PATH="${RUNNER_PROVISION_SCRIPT_PATH:-${KIT_ROOT}/provision-runner-tooling.sh}"
+if [ ! -x "${PROVISION_SCRIPT_PATH}" ]; then
+  echo "provisioning script is missing or not executable: ${PROVISION_SCRIPT_PATH}" >&2
+  exit 1
+fi
 
-  if [ -z "${entry}" ]; then
-    return 0
-  fi
-
-  if [ -n "${AMBIENT_HOME}" ] && {
-    [ "${entry}" = "${AMBIENT_HOME}/Library/pnpm" ] ||
-    [ "${entry}" = "${AMBIENT_HOME}/setup-pnpm" ]
-  }; then
-    return 0
-  fi
-
-  return 1
-}
-
-append_unique_path_entry() {
-  local current="$1"
-  local entry="$2"
-
-  if [ -z "${entry}" ]; then
-    printf '%s\n' "${current}"
-    return 0
-  fi
-
-  case ":${current}:" in
-    *":${entry}:"*)
-      printf '%s\n' "${current}"
-      ;;
-    *)
-      if [ -n "${current}" ]; then
-        printf '%s:%s\n' "${current}" "${entry}"
-      else
-        printf '%s\n' "${entry}"
-      fi
-      ;;
-  esac
-}
-
-build_runner_path() {
-  local current_path="$1"
-  local path_value=""
-  local entry
-  local IFS=':'
-
-  for entry in "${LOCAL_BIN_DIR}" "${PNPM_HOME}" "${NODE_BIN_DIR}"; do
-    path_value="$(append_unique_path_entry "${path_value}" "${entry}")"
-  done
-
-  read -r -a entries <<< "${current_path}"
-  for entry in "${entries[@]}"; do
-    if is_filtered_path_entry "${entry}"; then
-      continue
-    fi
-    path_value="$(append_unique_path_entry "${path_value}" "${entry}")"
-  done
-
-  printf '%s\n' "${path_value}"
-}
-
-write_env_file() {
-  local env_path="${RUNNER_ROOT}/.env"
-  local temp_env_path="${env_path}.tmp"
-  local path_path="${RUNNER_ROOT}/.path"
-  local temp_path_path="${path_path}.tmp"
-
-  mkdir -p \
-    "${RUNNER_HOME}/Library/Logs" \
-    "${RUNNER_TMP}" \
-    "${RUNNER_TEMP}" \
-    "${RUNNER_TOOL_CACHE}" \
-    "${LOCAL_BIN_DIR}" \
-    "${PNPM_HOME}" \
-    "${COREPACK_HOME}" \
-    "${PULUMI_HOME}"
-
-  RUNNER_PATH="$(build_runner_path "${AMBIENT_PATH}")"
-
-  {
-    printf 'LANG=%q\n' "${LANG:-en_US.UTF-8}"
-    printf 'HOME=%q\n' "${RUNNER_HOME}"
-    printf 'TMPDIR=%q\n' "${RUNNER_TMP}"
-    printf 'RUNNER_TEMP=%q\n' "${RUNNER_TEMP}"
-    printf 'RUNNER_TOOL_CACHE=%q\n' "${RUNNER_TOOL_CACHE}"
-    printf 'PNPM_HOME=%q\n' "${PNPM_HOME}"
-    printf 'COREPACK_HOME=%q\n' "${COREPACK_HOME}"
-    printf 'PULUMI_HOME=%q\n' "${PULUMI_HOME}"
-  } > "${temp_env_path}"
-  printf '%s\n' "${RUNNER_PATH}" > "${temp_path_path}"
-
-  mv "${temp_env_path}" "${env_path}"
-  mv "${temp_path_path}" "${path_path}"
-}
-
-write_env_file
+exec "${PROVISION_SCRIPT_PATH}" --root "${RUNNER_ROOT}" --write-env

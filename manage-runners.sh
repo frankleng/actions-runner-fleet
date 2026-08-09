@@ -8,6 +8,7 @@ RUNNER_TARGET_HELPER_PATH="${RUNNER_TARGET_HELPER_PATH:-${ROOT_DIR}/runner-targe
 REGISTRY_PATH="${RUNNER_REGISTRY_PATH:-${ROOT_DIR}/runners.tsv}"
 DEFAULT_URL="${RUNNER_DEFAULT_URL:-}"
 ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${ROOT_DIR}/${RUNNER_ARCHIVE_BASENAME}}"
+IMAGE_DIR="${RUNNER_IMAGE_DIR:-${ARCHIVE_PATH%.tar.gz}.image}"
 OVERLAY_DIR="${RUNNER_OVERLAY_DIR:-${ROOT_DIR}/overlay}"
 PROVISION_SCRIPT_PATH="${RUNNER_PROVISION_SCRIPT_PATH:-${ROOT_DIR}/provision-runner-tooling.sh}"
 SELF_NAME="$(basename "${0}")"
@@ -140,6 +141,7 @@ copy_overlay() {
 
   require_overlay
   mkdir -p "${runner_dir}/bin"
+  printf '%s\n' "${ROOT_DIR}" > "${runner_dir}/.kit-root"
   cp "${OVERLAY_DIR}/env.sh" "${runner_dir}/env.sh"
   if [ "${RUNNER_SERVICE_MANAGER}" = "systemd-user" ]; then
     cp "${OVERLAY_DIR}/svc-systemd-user.sh" "${runner_dir}/svc.sh"
@@ -160,7 +162,6 @@ ensure_runtime_roots() {
     "${runner_dir}/home/.local/state" \
     "${runner_dir}/tmp" \
     "${runner_dir}/_work/_temp" \
-    "${runner_dir}/_work/_tool" \
     "${runner_dir}/tools"
 }
 
@@ -194,7 +195,6 @@ reconcile_runner_dir() {
 
   (
     cd "${runner_dir}"
-    ./env.sh
     ./svc.sh install
   )
 
@@ -316,6 +316,39 @@ reconcile_all_runners() {
   done < <(tracked_runner_rows)
 }
 
+# Extract the runner archive once per archive; new runner directories are
+# copy-on-write clones of the image (reflink on XFS/Btrfs, clonefile on APFS),
+# so the runner binaries occupy disk space only once per host.
+ensure_runner_image() {
+  local staging_dir
+
+  if [ -d "${IMAGE_DIR}" ]; then
+    return 0
+  fi
+
+  staging_dir="$(mktemp -d "$(dirname "${IMAGE_DIR}")/.runner-image.XXXXXX")"
+  tar -xzf "${ARCHIVE_PATH}" -C "${staging_dir}"
+
+  if [ -d "${IMAGE_DIR}" ]; then
+    rm -rf "${staging_dir}"
+  else
+    mv "${staging_dir}" "${IMAGE_DIR}"
+  fi
+}
+
+clone_runner_image() {
+  local runner_dir="$1"
+
+  mkdir -p "${runner_dir}"
+  if cp -a --reflink=auto "${IMAGE_DIR}/." "${runner_dir}/" 2>/dev/null; then
+    return 0
+  fi
+  if cp -c -Rp "${IMAGE_DIR}/." "${runner_dir}/" 2>/dev/null; then
+    return 0
+  fi
+  cp -Rp "${IMAGE_DIR}/." "${runner_dir}/"
+}
+
 register_runner() {
   local name="$1"
   local token="$2"
@@ -347,8 +380,8 @@ register_runner() {
     exit 1
   fi
 
-  mkdir -p "${runner_dir}"
-  tar -xzf "${ARCHIVE_PATH}" -C "${runner_dir}"
+  ensure_runner_image
+  clone_runner_image "${runner_dir}"
 
   (
     cd "${runner_dir}"

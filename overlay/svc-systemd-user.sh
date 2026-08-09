@@ -6,6 +6,7 @@ RUNNER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER_METADATA_PATH="${RUNNER_ROOT}/.runner"
 SVC_CMD="${1:-status}"
 SYSTEMCTL_BIN="${RUNNER_SYSTEMCTL_BIN:-systemctl}"
+LOGINCTL_BIN="${RUNNER_LOGINCTL_BIN:-loginctl}"
 UNIT_DIR="${RUNNER_SYSTEMD_USER_DIR:-${HOME}/.config/systemd/user}"
 
 read_runner_json_value() {
@@ -88,7 +89,26 @@ apply_live_cpu_quota() {
   fi
 }
 
+# User units only start at boot when the account lingers; enable it so runners
+# come back after a reboot without an interactive login.
+ensure_linger() {
+  local runner_user
+
+  command -v "${LOGINCTL_BIN}" >/dev/null 2>&1 || return 0
+  runner_user="$(id -un)"
+  if [ "$("${LOGINCTL_BIN}" show-user "${runner_user}" --property=Linger --value 2>/dev/null)" = "yes" ]; then
+    return 0
+  fi
+
+  if "${LOGINCTL_BIN}" enable-linger "${runner_user}" 2>/dev/null; then
+    echo "enabled login lingering; runners will start at boot"
+  else
+    echo "warning: runners will not start at boot until lingering is enabled: sudo loginctl enable-linger ${runner_user}" >&2
+  fi
+}
+
 install_service() {
+  ensure_linger
   (cd "${RUNNER_ROOT}" && ./env.sh)
   cp "${RUNNER_ROOT}/bin/runsvc.sh" "${RUNNER_ROOT}/runsvc.sh"
   chmod u+x "${RUNNER_ROOT}/runsvc.sh"

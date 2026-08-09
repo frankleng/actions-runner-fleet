@@ -9,6 +9,8 @@ runner_dir="${temp_dir}/runner"
 unit_dir="${temp_dir}/units"
 systemctl_stub="${temp_dir}/systemctl"
 systemctl_log="${temp_dir}/systemctl.log"
+loginctl_stub="${temp_dir}/loginctl"
+loginctl_log="${temp_dir}/loginctl.log"
 
 mkdir -p "${runner_dir}/bin" "${runner_dir}/_diag"
 cp "${ROOT_DIR}/overlay/svc-systemd-user.sh" "${runner_dir}/svc.sh"
@@ -29,6 +31,20 @@ esac
 EOF
 chmod u+x "${systemctl_stub}"
 
+cat > "${loginctl_stub}" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${RUNNER_TEST_LOGINCTL_LOG:?}"
+case "$*" in
+  show-user*) echo "no" ;;
+esac
+EOF
+chmod u+x "${loginctl_stub}"
+
+RUNNER_PROVISION_SCRIPT_PATH="${ROOT_DIR}/provision-runner-tooling.sh" \
+RUNNER_HOST_TOOLS_DIR="${temp_dir}/host-tools" \
+RUNNER_PNPM_STORE_DIR="${temp_dir}/pnpm-store" \
+RUNNER_LOGINCTL_BIN="${loginctl_stub}" RUNNER_TEST_LOGINCTL_LOG="${loginctl_log}" \
 RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" install
 status_output="$(RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" status)"
 
@@ -43,6 +59,7 @@ grep -Fq "CPU limit: 200%" <<< "${status_output}"
 grep -Fq "4242 0 actions.runner.example-org.ubuntu-runner-1" <<< "${status_output}"
 grep -Fq -- "--user daemon-reload" "${systemctl_log}"
 grep -Fq -- "--user enable actions.runner.example-org.ubuntu-runner-1.service" "${systemctl_log}"
+grep -Fq -- "enable-linger $(id -un)" "${loginctl_log}"
 grep -Fq -- "--user set-property --runtime actions.runner.example-org.ubuntu-runner-1.service CPUQuota=200%" "${systemctl_log}"
 
 RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" set-cpu-limit 175

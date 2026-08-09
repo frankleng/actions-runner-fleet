@@ -219,10 +219,10 @@ report_disk_headroom() {
 
   available_kib="$(df -Pk "${SCRIPT_DIR}" | awk 'NR == 2 { print $4 }')"
   runner_count="${#RUNNER_NAMES[@]}"
-  recommended_kib="$(( (10 + (runner_count * 15)) * 1024 * 1024 ))"
+  recommended_kib="$(( (25 + (runner_count * 5)) * 1024 * 1024 ))"
 
   if [ "${available_kib}" -lt "${recommended_kib}" ]; then
-    echo "warning: only $(( available_kib / 1024 / 1024 )) GiB is free; allow roughly 15 GiB per runner plus 10 GiB of headroom" >&2
+    echo "warning: only $(( available_kib / 1024 / 1024 )) GiB is free; allow roughly 15 GiB of shared tooling plus 5 GiB per runner and 10 GiB of headroom" >&2
   fi
 }
 

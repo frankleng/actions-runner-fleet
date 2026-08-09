@@ -67,7 +67,13 @@ chmod +x "${pkill_stub}"
 
 (
   cd "${runner_dir}"
+  RUNNER_PROVISION_SCRIPT_PATH="${ROOT_DIR}/provision-runner-tooling.sh" \
+  RUNNER_HOST_TOOLS_DIR="${temp_dir}/host-tools" \
+  RUNNER_PNPM_STORE_DIR="${temp_dir}/pnpm-store" \
   ./env.sh
+  RUNNER_PROVISION_SCRIPT_PATH="${ROOT_DIR}/provision-runner-tooling.sh" \
+  RUNNER_HOST_TOOLS_DIR="${temp_dir}/host-tools" \
+  RUNNER_PNPM_STORE_DIR="${temp_dir}/pnpm-store" \
   RUNNER_LAUNCHD_USER_HOME="${temp_user_home}" \
   RUNNER_LAUNCH_PATH="${temp_user_home}/Library/LaunchAgents" \
   RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
