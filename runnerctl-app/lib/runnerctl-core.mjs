@@ -463,10 +463,10 @@ export async function readRunnerMetadata(directory) {
     serviceState = parseServiceStatusOutput(serviceStatusOutput);
     servicePid = parseServicePid(serviceStatusOutput, serviceName);
 
-    if (serviceState === "stopped" && serviceName && typeof process.getuid === "function") {
+    if (serviceState === "stopped" && serviceName && process.platform === "darwin") {
       const launchctlResult = await runCommand(
         process.env.RUNNER_LAUNCHCTL_BIN ?? "launchctl",
-        ["print-disabled", `gui/${process.getuid()}`],
+        ["print-disabled", "system"],
         { env: process.env }
       );
       const launchctlOutput = [launchctlResult.stdout.trim(), launchctlResult.stderr.trim()]

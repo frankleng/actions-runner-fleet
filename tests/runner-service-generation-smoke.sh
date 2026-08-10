@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+export RUNNER_LAUNCHD_TEST_SKIP_ROOT=1
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "skipping launchd service smoke test on non-macOS host"
@@ -12,6 +13,7 @@ OVERLAY_DIR="${ROOT_DIR}/overlay"
 
 temp_dir="$(mktemp -d)"
 temp_user_home="${temp_dir}/launchd-user"
+launch_daemons_path="${temp_dir}/Library/LaunchDaemons"
 runner_dir="${temp_dir}/runner"
 launchctl_stub="${temp_dir}/launchctl"
 pgrep_stub="${temp_dir}/pgrep"
@@ -22,7 +24,7 @@ process_state="${temp_dir}/process.state"
 expected_default_cpu_quota="$(( $(sysctl -n hw.ncpu) * 50 ))"
 trap 'rm -rf "${temp_dir}"' EXIT
 
-mkdir -p "${runner_dir}/bin" "${runner_dir}/externals/node20/bin" "${temp_user_home}"
+mkdir -p "${runner_dir}/bin" "${runner_dir}/externals/node20/bin" "${temp_user_home}" "${launch_daemons_path}"
 mkdir -p "${temp_dir}/host-tools/pnpm-tools/bin"
 cat > "${temp_dir}/host-tools/pnpm-tools/bin/wrangler" <<'EOF'
 #!/bin/sh
@@ -88,12 +90,12 @@ chmod +x "${pkill_stub}"
   RUNNER_HOST_TOOLS_DIR="${temp_dir}/host-tools" \
   RUNNER_PNPM_STORE_DIR="${temp_dir}/pnpm-store" \
   RUNNER_LAUNCHD_USER_HOME="${temp_user_home}" \
-  RUNNER_LAUNCH_PATH="${temp_user_home}/Library/LaunchAgents" \
+  RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
   RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
   ./svc.sh install
 )
 
-plist_path="${temp_user_home}/Library/LaunchAgents/actions.runner.example-org.smoke-runner.plist"
+plist_path="${launch_daemons_path}/actions.runner.example-org.smoke-runner.plist"
 
 grep -q "<key>HOME</key>" "${plist_path}"
 grep -q "<string>${runner_dir}/home</string>" "${plist_path}"
@@ -101,6 +103,11 @@ grep -q "<key>TMPDIR</key>" "${plist_path}"
 grep -q "<string>${runner_dir}/tmp/managed-job</string>" "${plist_path}"
 grep -q "${runner_dir}/home/Library/Logs/actions.runner.example-org.smoke-runner/stdout.log" "${plist_path}"
 grep -q "${runner_dir}/home/Library/Logs/actions.runner.example-org.smoke-runner/stderr.log" "${plist_path}"
+grep -q '<key>UserName</key>' "${plist_path}"
+if grep -q '<key>ProcessType</key>' "${plist_path}"; then
+  echo "system LaunchDaemon must not use the interactive process type"
+  exit 1
+fi
 grep -q '\.env' "${runner_dir}/runsvc.sh"
 grep -q '\.path' "${runner_dir}/runsvc.sh"
 grep -q -- '--include-children' "${runner_dir}/runsvc.sh"
@@ -109,7 +116,7 @@ grep -q -- '--include-children' "${runner_dir}/runsvc.sh"
 status_output="$(
   cd "${runner_dir}"
   RUNNER_LAUNCHD_USER_HOME="${temp_user_home}" \
-  RUNNER_LAUNCH_PATH="${temp_user_home}/Library/LaunchAgents" \
+  RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
   RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
   ./svc.sh status
 )"
@@ -118,7 +125,7 @@ grep -Fq "CPU limit: ${expected_default_cpu_quota}%" <<< "${status_output}"
 (
   cd "${runner_dir}"
   RUNNER_LAUNCHD_USER_HOME="${temp_user_home}" \
-  RUNNER_LAUNCH_PATH="${temp_user_home}/Library/LaunchAgents" \
+  RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
   RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
   ./svc.sh set-cpu-limit 175
 )
@@ -201,7 +208,7 @@ printf '%s\n' "2001" > "${process_state}"
 (
   cd "${runner_dir}"
   RUNNER_LAUNCHD_USER_HOME="${temp_user_home}" \
-  RUNNER_LAUNCH_PATH="${temp_user_home}/Library/LaunchAgents" \
+  RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
   RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
   RUNNER_PGREP_BIN="${pgrep_stub}" \
   RUNNER_PKILL_BIN="${pkill_stub}" \

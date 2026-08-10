@@ -2,6 +2,7 @@
 
 set -euo pipefail
 export RUNNER_SERVICE_MANAGER_OVERRIDE=launchd
+export RUNNER_LAUNCHD_TEST_SKIP_ROOT=1
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT_PATH="${ROOT_DIR}/runnerctl"
@@ -33,7 +34,10 @@ pgrep_stub="${temp_dir}/pgrep"
 pkill_stub="${temp_dir}/pkill"
 runner_dir="${temp_dir}/mac-runner-1"
 runner_dir_2="${temp_dir}/mac-runner-2"
-mkdir -p "${runner_dir}" "${runner_dir_2}" "${archive_dir}/bin" "${archive_dir}/externals/node20/bin"
+launch_daemons_path="${temp_dir}/Library/LaunchDaemons"
+legacy_launch_agents_path="${temp_dir}/launchd-user/Library/LaunchAgents"
+mkdir -p "${runner_dir}" "${runner_dir_2}" "${archive_dir}/bin" \
+  "${archive_dir}/externals/node20/bin" "${launch_daemons_path}" "${legacy_launch_agents_path}"
 
 cat > "${launchctl_stub}" <<'EOF'
 #!/bin/bash
@@ -43,33 +47,42 @@ state_path="${RUNNER_TEST_LAUNCHCTL_STATE:?}"
 command="${1:-}"
 shift || true
 case "${command}" in
-  enable|kickstart) exit 0 ;;
-  load|bootstrap)
-    if [ "${command}" = bootstrap ]; then shift; fi
-    if [ "${1:-}" = "-w" ]; then
-      shift
-    fi
-    plist_path="${1:?}"
+  bootstrap)
+    [ "${1:-}" = "system" ]
+    plist_path="${2:?}"
     svc_name="$(basename "${plist_path}" .plist)"
     printf '%s\n' "${svc_name}" >> "${state_path}"
-    printf 'load %s\n' "${svc_name}" >> "${log_path}"
+    printf 'bootstrap %s\n' "${svc_name}" >> "${log_path}"
     ;;
-  unload)
-    plist_path="${1:?}"
-    svc_name="$(basename "${plist_path}" .plist)"
+  bootout)
+    svc_name="${1##*/}"
     if [ -f "${state_path}" ]; then
       grep -vx "${svc_name}" "${state_path}" > "${state_path}.tmp" || true
       mv "${state_path}.tmp" "${state_path}"
     fi
-    printf 'unload %s\n' "${svc_name}" >> "${log_path}"
+    printf 'bootout %s\n' "${svc_name}" >> "${log_path}"
     ;;
-  list)
-    if [ -f "${state_path}" ]; then
-      while IFS= read -r svc_name; do
-        [ -n "${svc_name}" ] || continue
-        printf '123\t0\t%s\n' "${svc_name}"
-      done < "${state_path}"
+  print)
+    svc_name="${1##*/}"
+    if [ -f "${state_path}" ] && grep -Fxq "${svc_name}" "${state_path}"; then
+      printf 'system/%s = {\n\tpid = 123\n}\n' "${svc_name}"
+    else
+      exit 113
     fi
+    ;;
+  print-disabled)
+    printf 'disabled services = {\n'
+    if [ -n "${RUNNER_TEST_DISABLED_SERVICE:-}" ]; then
+      printf '  "%s" => disabled\n' "${RUNNER_TEST_DISABLED_SERVICE}"
+    fi
+    printf '}\n'
+    ;;
+  enable)
+    printf 'enable %s\n' "${1##*/}" >> "${log_path}"
+    ;;
+  kickstart)
+    [ "${1:-}" != "-k" ] || { printf 'kickstart -k would kill a running listener\n' >&2; exit 1; }
+    printf 'kickstart %s\n' "${1##*/}" >> "${log_path}"
     ;;
   *)
     printf 'unexpected launchctl command: %s\n' "${command}" >&2
@@ -254,10 +267,18 @@ for managed_runner_dir in "${runner_dir}" "${runner_dir_2}"; do
 EOF
 done
 
+legacy_service_name="actions.runner.example-org.mac-runner-1"
+legacy_plist_path="${legacy_launch_agents_path}/${legacy_service_name}.plist"
+: > "${legacy_plist_path}"
+printf '%s\n' "${legacy_service_name}" > "${launchctl_state}"
+inactive_legacy_service_name="actions.runner.example-org.mac-runner-2"
+inactive_legacy_plist_path="${legacy_launch_agents_path}/${inactive_legacy_service_name}.plist"
+: > "${inactive_legacy_plist_path}"
+
 RUNNER_REGISTRY_PATH="${registry_path}" \
 RUNNER_PROVISION_SCRIPT_PATH="${provision_stub}" \
 RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user" \
-RUNNER_LAUNCH_PATH="${temp_dir}/launchd-user/Library/LaunchAgents" \
+RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
 RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
 RUNNER_TEST_PROVISION_LOG="${provision_log}" \
 RUNNER_TEST_LAUNCHCTL_LOG="${launchctl_log}" \
@@ -267,6 +288,39 @@ RUNNER_TEST_LAUNCHCTL_STATE="${launchctl_state}" \
 grep -q -- "--root ${runner_dir}" "${provision_log}"
 [ -f "${runner_dir}/.env" ]
 [ -f "${runner_dir}/.path" ]
+[ -f "${launch_daemons_path}/${legacy_service_name}.plist" ]
+[ ! -f "${legacy_plist_path}" ]
+grep -q "bootout ${legacy_service_name}" "${launchctl_log}"
+grep -q "bootstrap ${legacy_service_name}" "${launchctl_log}"
+
+# An installed legacy agent that is not loaded must also be brought online
+# immediately instead of waiting for the next reboot.
+RUNNER_REGISTRY_PATH="${registry_path}" \
+RUNNER_PROVISION_SCRIPT_PATH="${provision_stub}" \
+RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user" \
+RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
+RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
+RUNNER_TEST_PROVISION_LOG="${provision_log}" \
+RUNNER_TEST_LAUNCHCTL_LOG="${launchctl_log}" \
+RUNNER_TEST_LAUNCHCTL_STATE="${launchctl_state}" \
+"${SCRIPT_PATH}" --cli reconcile "mac-runner-2"
+
+[ ! -f "${inactive_legacy_plist_path}" ]
+grep -Fxq "${inactive_legacy_service_name}" "${launchctl_state}"
+grep -q "bootstrap ${inactive_legacy_service_name}" "${launchctl_log}"
+
+: > "${launchctl_state}"
+disabled_status_output="$(
+  cd "${runner_dir}"
+  RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user" \
+  RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
+  RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
+  RUNNER_TEST_LAUNCHCTL_LOG="${launchctl_log}" \
+  RUNNER_TEST_LAUNCHCTL_STATE="${launchctl_state}" \
+  RUNNER_TEST_DISABLED_SERVICE="${legacy_service_name}" \
+  ./svc.sh status
+)"
+grep -Fq "Disabled" <<< "${disabled_status_output}"
 
 : > "${provision_log}"
 : > "${launchctl_log}"
@@ -280,7 +334,7 @@ RUNNER_LABELS="macos-build" \
 RUNNER_NO_DEFAULT_LABELS=1 \
 RUNNER_TEST_CONFIG_LOG="${config_log}" \
 RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user" \
-RUNNER_LAUNCH_PATH="${temp_dir}/launchd-user/Library/LaunchAgents" \
+RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
 RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
 RUNNER_TEST_PROVISION_LOG="${provision_log}" \
 RUNNER_TEST_LAUNCHCTL_LOG="${launchctl_log}" \
@@ -333,7 +387,7 @@ printf '%s\n' "${enterprise_list_output}" | grep -q "enterprise-runner-deferred"
 RUNNER_REGISTRY_PATH="${registry_path}" \
 RUNNER_PROVISION_SCRIPT_PATH="${provision_stub}" \
 RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user" \
-RUNNER_LAUNCH_PATH="${temp_dir}/launchd-user/Library/LaunchAgents" \
+RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
 RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
 RUNNER_TEST_PROVISION_LOG="${provision_log}" \
 RUNNER_TEST_LAUNCHCTL_LOG="${launchctl_log}" \
@@ -344,10 +398,10 @@ grep -q -- "--root ${runner_dir}" "${provision_log}"
 grep -q -- "--root ${runner_dir_2}" "${provision_log}"
 grep -q -- "--root ${temp_dir}/repo-runner-deferred" "${provision_log}"
 grep -q -- "--root ${temp_dir}/enterprise-runner-deferred" "${provision_log}"
-grep -q "load actions.runner.example-org.mac-runner-1" "${launchctl_log}"
-grep -q "load actions.runner.example-org.mac-runner-2" "${launchctl_log}"
-grep -q "load actions.runner.example-repo.repo-runner-deferred" "${launchctl_log}"
-grep -q "load actions.runner.example-enterprise.enterprise-runner-deferred" "${launchctl_log}"
+grep -q "bootstrap actions.runner.example-org.mac-runner-1" "${launchctl_log}"
+grep -q "bootstrap actions.runner.example-org.mac-runner-2" "${launchctl_log}"
+grep -q "bootstrap actions.runner.example-repo.repo-runner-deferred" "${launchctl_log}"
+grep -q "bootstrap actions.runner.example-enterprise.enterprise-runner-deferred" "${launchctl_log}"
 
 : > "${pgrep_log}"
 : > "${pkill_log}"
@@ -356,7 +410,7 @@ printf '%s\n' "1001" > "${process_state}"
 RUNNER_REGISTRY_PATH="${registry_path}" \
 RUNNER_PROVISION_SCRIPT_PATH="${provision_stub}" \
 RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user" \
-RUNNER_LAUNCH_PATH="${temp_dir}/launchd-user/Library/LaunchAgents" \
+RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
 RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
 RUNNER_TEST_PROVISION_LOG="${provision_log}" \
 RUNNER_TEST_LAUNCHCTL_LOG="${launchctl_log}" \

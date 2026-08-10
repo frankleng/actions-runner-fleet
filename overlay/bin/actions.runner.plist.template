@@ -43,8 +43,6 @@
       <key>PATH</key>
       <string>{{RuntimePath}}</string>
     </dict>
-    <key>ProcessType</key>
-    <string>Interactive</string>
     <key>SessionCreate</key>
     <true/>
   </dict>

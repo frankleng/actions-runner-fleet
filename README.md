@@ -22,8 +22,9 @@ at boot on Linux (with login lingering) and Windows, or at login on macOS. See
 
 - GitHub Actions Runner `2.336.0` for Linux x64, macOS arm64, or Windows x64,
   verified by SHA-256
-- One isolated directory and user service per runner (systemd, launchd, or a
-  per-user scheduled task on Windows); runner binaries are copy-on-write clones
+- One isolated directory and background service per runner (a lingering systemd
+  user service on Linux, a system LaunchDaemon on macOS, or a per-user scheduled
+  task on Windows); runner binaries are copy-on-write clones
   of a shared image where the filesystem supports it (XFS/Btrfs reflinks, APFS
   clonefiles) and full copies on NTFS
 - A persistent, dashboard-configurable CPU quota per runner (50% of the
@@ -48,7 +49,8 @@ ARM, and Intel Macs are not currently supported.
 - On Linux, a working systemd user manager. Setup enables login lingering
   automatically so runners start at boot; if that is not permitted for the
   account, it warns and the fallback is `sudo loginctl enable-linger "$USER"`
-- On macOS, an account that remains logged in while its launchd agents run
+- On macOS, administrator access during service installation; runners execute
+  as the setup account but start at boot and do not require that account to log in
 - On Windows, an elevated PowerShell under the runner account to install headless tasks,
   and [Git for Windows](https://git-scm.com/download/win), which `gh auth login`
   and `actions/checkout` need; no desktop login is required after installation
@@ -246,6 +248,12 @@ For a fleet whose names do not already exist on GitHub:
 The script prompts without echoing for one registration token per token key,
 registers every target group, provisions tools, installs systemd or launchd services, and
 waits for every runner to report `Listening for Jobs`.
+
+On macOS, service installation prompts once for an administrator password so it
+can write a root-owned plist to `/Library/LaunchDaemons`. Do not run the whole
+setup command with `sudo`: each LaunchDaemon drops privileges to the account
+that owns and configured its runner, and then starts at boot without an
+interactive sign-in.
 
 Prompted entry is recommended because the token is never written to disk or
 shell history. For unattended setup, provide variables derived from the token

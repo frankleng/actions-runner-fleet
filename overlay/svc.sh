@@ -13,13 +13,18 @@ if [ -f "${RUNNER_ROOT}/.autoscale-slot.json" ]; then
 fi
 SVC_CMD="${1:-status}"
 RUNNER_LAUNCHCTL_BIN="${RUNNER_LAUNCHCTL_BIN:-launchctl}"
+RUNNER_SUDO_BIN="${RUNNER_SUDO_BIN:-sudo}"
+RUNNER_INSTALL_BIN="${RUNNER_INSTALL_BIN:-/usr/bin/install}"
 RUNNER_PGREP_BIN="${RUNNER_PGREP_BIN:-pgrep}"
 RUNNER_PKILL_BIN="${RUNNER_PKILL_BIN:-pkill}"
 RUNNER_STOP_GRACE_SECONDS="${RUNNER_STOP_GRACE_SECONDS:-2}"
-RUNNER_LAUNCHD_USER="${RUNNER_LAUNCHD_USER:-${USER:-$(id -un)}}"
+RUNNER_LAUNCHD_USER="${RUNNER_LAUNCHD_USER:-${SUDO_USER:-${USER:-$(id -un)}}}"
+# Test-only seam for exercising LaunchDaemon behavior in a temporary directory.
+RUNNER_LAUNCHD_TEST_SKIP_ROOT="${RUNNER_LAUNCHD_TEST_SKIP_ROOT:-0}"
 RUNNER_LOG_RETENTION_DAYS="${RUNNER_LOG_RETENTION_DAYS:-7}"
 RUNNER_LOG_ROTATE_MAX_BYTES="${RUNNER_LOG_ROTATE_MAX_BYTES:-52428800}"
 CPU_QUOTA_PATH="${RUNNER_ROOT}/.cpu-quota"
+INSTALL_STARTED_SERVICE=0
 
 read_runner_json_value() {
   local key="$1"
@@ -73,8 +78,13 @@ SVC_NAME="${SVC_NAME// /_}"
 RUNNER_HOME="${RUNNER_ROOT}/home"
 RUNNER_LOG_DIR="${RUNNER_HOME}/Library/Logs/${SVC_NAME}"
 LAUNCHD_USER_HOME="${RUNNER_LAUNCHD_USER_HOME:-$(default_launchd_user_home)}"
-LAUNCH_PATH="${RUNNER_LAUNCH_PATH:-${LAUNCHD_USER_HOME}/Library/LaunchAgents}"
+LAUNCH_PATH="${RUNNER_LAUNCH_PATH:-/Library/LaunchDaemons}"
 PLIST_PATH="${LAUNCH_PATH}/${SVC_NAME}.plist"
+LAUNCHD_DOMAIN="system"
+LAUNCHD_SERVICE_TARGET="${LAUNCHD_DOMAIN}/${SVC_NAME}"
+LEGACY_LAUNCH_PATH="${RUNNER_LEGACY_LAUNCH_PATH:-${LAUNCHD_USER_HOME}/Library/LaunchAgents}"
+LEGACY_PLIST_PATH="${LEGACY_LAUNCH_PATH}/${SVC_NAME}.plist"
+LEGACY_SERVICE_TARGET="gui/$(id -u "${RUNNER_LAUNCHD_USER}")/${SVC_NAME}"
 TEMPLATE_PATH="$(kit_or_runner_file bin/actions.runner.plist.template bin/actions.runner.plist.template)"
 RUNSVC_SOURCE_PATH="$(kit_or_runner_file runsvc.sh bin/runsvc.sh)"
 TEMP_PATH="${RUNNER_ROOT}/bin/actions.runner.plist.temp"
@@ -120,6 +130,22 @@ AVAILABLE_CPU_COUNT="$(detect_available_cpu_count)"
 MAX_CPU_QUOTA_PERCENT="$((AVAILABLE_CPU_COUNT * 100))"
 CALCULATED_DEFAULT_CPU_QUOTA_PERCENT="$((MAX_CPU_QUOTA_PERCENT * 50 / 100))"
 DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-${CALCULATED_DEFAULT_CPU_QUOTA_PERCENT}}"
+
+run_privileged() {
+  if [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT}" = "1" ] || [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    "${RUNNER_SUDO_BIN}" "$@"
+  fi
+}
+
+run_privileged_launchctl() {
+  run_privileged "${RUNNER_LAUNCHCTL_BIN}" "$@"
+}
+
+service_is_loaded() {
+  run_privileged_launchctl print "$1" >/dev/null 2>&1
+}
 
 require_non_negative_integer() {
   local value_name="$1"
@@ -231,6 +257,8 @@ load_runtime_environment() {
 }
 
 render_plist() {
+  local -a plist_install_args
+
   if [ ! -f "${TEMPLATE_PATH}" ]; then
     failed "service template not found at ${TEMPLATE_PATH}"
   fi
@@ -239,7 +267,10 @@ render_plist() {
   for value in "${PLIST_PATH}" "${SVC_NAME}" "${RUNNER_LAUNCHD_USER}" "${RUNNER_ROOT}" "${HOME}" "${TMPDIR}" "${RUNNER_TEMP}" "${RUNNER_TOOL_CACHE}" "${PNPM_HOME}" "${COREPACK_HOME}" "${PULUMI_HOME}" "${PATH}"; do
     case "${value}" in *[!a-zA-Z0-9_./:@+-]*) failed "Unsupported runtime path for service template" ;; esac
   done
-  mkdir -p "${LAUNCH_PATH}" "${RUNNER_LOG_DIR}"
+  mkdir -p "${RUNNER_LOG_DIR}"
+  if [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT}" = "1" ]; then
+    mkdir -p "${LAUNCH_PATH}"
+  fi
 
   sed \
     -e "s#{{SvcName}}#${SVC_NAME}#g" \
@@ -255,12 +286,29 @@ render_plist() {
     -e "s#{{RuntimePath}}#${PATH}#g" \
     -e "s#{{StdoutPath}}#${RUNNER_LOG_DIR}/stdout.log#g" \
     -e "s#{{StderrPath}}#${RUNNER_LOG_DIR}/stderr.log#g" \
-    "${TEMPLATE_PATH}" > "${TEMP_PATH}" || failed "failed to render plist"
+    "${TEMPLATE_PATH}" > "${TEMP_PATH}" || {
+      rm -f "${TEMP_PATH}"
+      failed "failed to render plist"
+    }
   if grep -q '{{' "${TEMP_PATH}"; then
     rm -f "${TEMP_PATH}"
     failed "service template ${TEMPLATE_PATH} left unrendered placeholders; run ./manage-runners.sh reconcile ${RUNNER_NAME}"
   fi
-  mv "${TEMP_PATH}" "${PLIST_PATH}" || failed "failed to write plist"
+
+  plutil -lint "${TEMP_PATH}" >/dev/null || {
+    rm -f "${TEMP_PATH}"
+    failed "rendered launchd plist is invalid"
+  }
+  if [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT}" = "1" ]; then
+    plist_install_args=(-m 0644 "${TEMP_PATH}" "${PLIST_PATH}")
+  else
+    plist_install_args=(-o root -g wheel -m 0644 "${TEMP_PATH}" "${PLIST_PATH}")
+  fi
+  if ! run_privileged "${RUNNER_INSTALL_BIN}" "${plist_install_args[@]}"; then
+    rm -f "${TEMP_PATH}"
+    failed "failed to install ${PLIST_PATH}; macOS administrator access is required"
+  fi
+  rm -f "${TEMP_PATH}"
 }
 
 sync_runtime_files() {
@@ -274,12 +322,32 @@ sync_runtime_files() {
 }
 
 install() {
+  local migrated_legacy_agent=0
+
   persist_cpu_quota_percent "$(read_cpu_quota_percent)"
   sync_runtime_files
+
+  if [ "${LEGACY_PLIST_PATH}" != "${PLIST_PATH}" ] && [ -f "${LEGACY_PLIST_PATH}" ]; then
+    migrated_legacy_agent=1
+    if service_is_loaded "${LEGACY_SERVICE_TARGET}"; then
+      run_privileged_launchctl bootout "${LEGACY_SERVICE_TARGET}" 2>/dev/null ||
+        run_privileged_launchctl unload "${LEGACY_PLIST_PATH}" 2>/dev/null || true
+    fi
+    rm -f "${LEGACY_PLIST_PATH}" || failed "failed to remove legacy LaunchAgent ${LEGACY_PLIST_PATH}"
+    echo "migrated legacy LaunchAgent to system LaunchDaemon"
+  fi
+
+  if [ "${migrated_legacy_agent}" -eq 1 ]; then
+    start_launch_daemon
+    INSTALL_STARTED_SERVICE=1
+  fi
   echo "svc install complete"
 }
 
 status() {
+  local service_pid
+  local status_out
+
   echo "status ${SVC_NAME}:"
   echo
   echo "CPU limit: $(read_cpu_quota_percent)%"
@@ -294,14 +362,15 @@ status() {
   echo "${PLIST_PATH}"
   echo
 
-  status_out="$(
-    "${RUNNER_LAUNCHCTL_BIN}" list 2>/dev/null |
-      awk -v service_name="${SVC_NAME}" '$3 == service_name && $1 ~ /^[0-9]+$/ && $1 > 0 { print }' ||
-      true
-  )"
-  if [ -n "${status_out}" ]; then
+  status_out="$("${RUNNER_LAUNCHCTL_BIN}" print "${LAUNCHD_SERVICE_TARGET}" 2>/dev/null || true)"
+  service_pid="$(printf '%s\n' "${status_out}" | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
+  if [ -n "${service_pid}" ]; then
     echo "Started:"
-    echo "${status_out}"
+    echo "${service_pid} 0 ${SVC_NAME}"
+    echo
+  elif "${RUNNER_LAUNCHCTL_BIN}" print-disabled "${LAUNCHD_DOMAIN}" 2>/dev/null |
+    grep -Fq "\"${SVC_NAME}\" => disabled"; then
+    echo "Disabled"
     echo
   else
     echo "Stopped"
@@ -317,19 +386,28 @@ set_cpu_limit() {
   echo "CPU limit for ${RUNNER_NAME}: ${cpu_quota_percent}% (running wrappers reload within one second)"
 }
 
+start_launch_daemon() {
+  run_privileged_launchctl enable "${LAUNCHD_SERVICE_TARGET}" ||
+    failed "failed to enable ${LAUNCHD_SERVICE_TARGET}"
+
+  if service_is_loaded "${LAUNCHD_SERVICE_TARGET}"; then
+    # No -k: never kill an already running listener.
+    run_privileged_launchctl kickstart "${LAUNCHD_SERVICE_TARGET}" ||
+      failed "failed to start ${LAUNCHD_SERVICE_TARGET}"
+  else
+    run_privileged_launchctl bootstrap "${LAUNCHD_DOMAIN}" "${PLIST_PATH}" ||
+      failed "failed to bootstrap ${PLIST_PATH}"
+  fi
+}
+
 start() {
   if [ ! -f "${PLIST_PATH}" ]; then
     install
   fi
 
   echo "starting ${SVC_NAME}"
-  local domain="gui/$(id -u)"
-  "${RUNNER_LAUNCHCTL_BIN}" enable "${domain}/${SVC_NAME}" || failed "failed to enable service"
-  if "${RUNNER_LAUNCHCTL_BIN}" list | awk -v name="${SVC_NAME}" '$3 == name { found=1 } END { exit !found }'; then
-    # No -k: never kill an already running listener.
-    "${RUNNER_LAUNCHCTL_BIN}" kickstart "${domain}/${SVC_NAME}" || failed "failed to start loaded service"
-  else
-    "${RUNNER_LAUNCHCTL_BIN}" bootstrap "${domain}" "${PLIST_PATH}" || failed "failed to load service"
+  if [ "${INSTALL_STARTED_SERVICE}" -ne 1 ]; then
+    start_launch_daemon
   fi
   status
 }
@@ -342,13 +420,17 @@ stop() {
   fi
 
   echo "stopping ${SVC_NAME}"
-  "${RUNNER_LAUNCHCTL_BIN}" unload "${PLIST_PATH}" || failed "failed to unload ${PLIST_PATH}"
+  if service_is_loaded "${LAUNCHD_SERVICE_TARGET}"; then
+    run_privileged_launchctl bootout "${LAUNCHD_SERVICE_TARGET}" ||
+      failed "failed to boot out ${LAUNCHD_SERVICE_TARGET}"
+  fi
   status
 }
 
 uninstall() {
   stop
-  rm -f "${PLIST_PATH}" "${CONFIG_PATH}"
+  run_privileged rm -f "${PLIST_PATH}" || failed "failed to remove ${PLIST_PATH}"
+  rm -f "${CONFIG_PATH}"
 }
 
 usage() {
