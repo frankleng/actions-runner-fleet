@@ -22,7 +22,6 @@ import {
   normalizeGitHubRunnerScope,
   parseAutoRefreshInterval,
   parseCpuQuotaPercent,
-  presentServiceState,
   runCommand,
   shouldAutoRefresh,
   shouldCancelPromptOnKey,
@@ -30,11 +29,12 @@ import {
 } from "../lib/runnerctl-core.mjs";
 import {
   buildRunnerMetricLines,
-  formatBytes,
-  formatCpuPercent,
-  formatDuration,
   RunnerMetricsSampler
 } from "../lib/runnerctl-metrics.mjs";
+import {
+  formatRunnerTableHeader,
+  formatRunnerTableRow
+} from "../lib/runnerctl-table.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const APP_DIR = path.dirname(path.dirname(__filename));
@@ -91,7 +91,7 @@ const runnerTable = blessed.list({
   keys: RUNNER_NAVIGATION.keys,
   mouse: true,
   border: "line",
-  label: " Runners · CPU MEM · D:R/W/s · N:IN/OUT/s · UP ",
+  label: formatRunnerTableHeader(),
   tags: true,
   scrollable: true,
   alwaysScroll: true,
@@ -296,7 +296,7 @@ function renderChrome() {
 }
 
 function renderTable() {
-  const rows = state.runners.map((runner) => formatRunnerRow(runner));
+  const rows = state.runners.map((runner) => formatRunnerTableRow(runner));
   runnerTable.setItems(rows.length > 0 ? rows : ["No tracked runners"]);
   runnerTable.select(Math.min(state.selectedIndex, Math.max(rows.length - 1, 0)));
   screen.render();
@@ -673,74 +673,6 @@ function clampIndex(index, length) {
   }
 
   return Math.max(0, Math.min(index, length - 1));
-}
-
-function shorten(value, limit) {
-  if (value.length <= limit) {
-    return value;
-  }
-
-  return `${value.slice(0, limit - 1)}…`;
-}
-
-function formatRunnerRow(runner) {
-  const service = presentServiceState(runner.serviceState);
-  const metrics = runner.metrics ?? {};
-  const name = padRight(shorten(runner.name, 18), 18);
-  const status = padRight(compactServiceLabel(service.label), 8);
-  const cpu = padLeft(formatCpuPercent(metrics.cpuPercent), 6);
-  const memory = padLeft(formatBytes(metrics.memoryBytes, { compact: true }), 5);
-  const diskRead = padLeft(
-    formatBytes(metrics.diskReadBytesPerSecond, { compact: true }),
-    5
-  );
-  const diskWrite = padLeft(
-    formatBytes(metrics.diskWriteBytesPerSecond, { compact: true }),
-    5
-  );
-  const networkReceive = padLeft(
-    formatBytes(metrics.networkReceiveBytesPerSecond, { compact: true }),
-    5
-  );
-  const networkSend = padLeft(
-    formatBytes(metrics.networkSendBytesPerSecond, { compact: true }),
-    5
-  );
-  const uptime = padLeft(
-    shorten(formatDuration(metrics.uptimeSeconds).replaceAll(" ", ""), 8),
-    8
-  );
-
-  return (
-    `${name} {${service.color}-fg}${status}` +
-    `{/${service.color}-fg} ${cpu} ${memory} ` +
-    `${diskRead}/${diskWrite} ${networkReceive}/${networkSend} ${uptime}`
-  );
-}
-
-function compactServiceLabel(serviceLabel) {
-  switch (serviceLabel) {
-    case "not-installed":
-      return "no-svc";
-    default:
-      return serviceLabel;
-  }
-}
-
-function padRight(value, width) {
-  if (value.length >= width) {
-    return value;
-  }
-
-  return value.padEnd(width, " ");
-}
-
-function padLeft(value, width) {
-  if (value.length >= width) {
-    return value;
-  }
-
-  return value.padStart(width, " ");
 }
 
 function shutdown() {
