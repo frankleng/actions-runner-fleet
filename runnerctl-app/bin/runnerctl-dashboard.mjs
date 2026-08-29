@@ -12,6 +12,7 @@ import {
   classifyGitHubRunnerTargetUrl,
   DEFAULT_CPU_QUOTA_PERCENT,
   DEFAULT_GITHUB_RUNNER_SCOPE,
+  MAX_CPU_QUOTA_PERCENT,
   getRunnerActionSequence,
   getActionDefinitions,
   getGitHubRunnerTargetUrlExample,
@@ -452,7 +453,7 @@ async function openCpuLimitFlow() {
   }
 
   const value = await promptInput(
-    "CPU limit percent (200 = two CPUs)",
+    `CPU limit percent (50% host = ${DEFAULT_CPU_QUOTA_PERCENT}%; max ${MAX_CPU_QUOTA_PERCENT}%)`,
     String(runner.cpuQuotaPercent ?? DEFAULT_CPU_QUOTA_PERCENT)
   );
   if (!value) {
@@ -463,7 +464,7 @@ async function openCpuLimitFlow() {
 
   const cpuQuotaPercent = parseCpuQuotaPercent(value);
   if (!cpuQuotaPercent) {
-    state.actionMessage = "CPU limit must be a whole-number percent from 1 to 100000";
+    state.actionMessage = `CPU limit must be a whole-number percent from 1 to ${MAX_CPU_QUOTA_PERCENT}`;
     renderChrome();
     return;
   }

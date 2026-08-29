@@ -27,12 +27,46 @@ UNIT_PATH="${UNIT_DIR}/${UNIT_NAME}"
 TEMPLATE_PATH="${RUNNER_ROOT}/bin/actions.runner.service.template"
 CONFIG_PATH="${RUNNER_ROOT}/.service"
 CPU_QUOTA_PATH="${RUNNER_ROOT}/.cpu-quota"
-DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-200}"
 
 fail() {
   echo "Failed: $*" >&2
   exit 1
 }
+
+detect_available_cpu_count() {
+  local cpu_count=""
+  local nproc_bin="${RUNNER_NPROC_BIN:-nproc}"
+  local getconf_bin="${RUNNER_GETCONF_BIN:-getconf}"
+
+  if command -v "${nproc_bin}" >/dev/null 2>&1; then
+    cpu_count="$("${nproc_bin}" 2>/dev/null || true)"
+  fi
+  cpu_count="${cpu_count//[[:space:]]/}"
+
+  case "${cpu_count}" in
+    ''|*[!0-9]*|0)
+      cpu_count=""
+      ;;
+  esac
+
+  if [ -z "${cpu_count}" ] && command -v "${getconf_bin}" >/dev/null 2>&1; then
+    cpu_count="$("${getconf_bin}" _NPROCESSORS_ONLN 2>/dev/null || true)"
+    cpu_count="${cpu_count//[[:space:]]/}"
+  fi
+
+  case "${cpu_count}" in
+    ''|*[!0-9]*|0)
+      fail "could not determine the number of available logical CPUs"
+      ;;
+  esac
+
+  printf '%s\n' "${cpu_count}"
+}
+
+AVAILABLE_CPU_COUNT="$(detect_available_cpu_count)"
+MAX_CPU_QUOTA_PERCENT="$((AVAILABLE_CPU_COUNT * 100))"
+CALCULATED_DEFAULT_CPU_QUOTA_PERCENT="$((MAX_CPU_QUOTA_PERCENT * 50 / 100))"
+DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-${CALCULATED_DEFAULT_CPU_QUOTA_PERCENT}}"
 
 validate_cpu_quota_percent() {
   local value="$1"
@@ -44,7 +78,8 @@ validate_cpu_quota_percent() {
   esac
 
   [ "${value}" -ge 1 ] || fail "CPU quota must be at least 1%"
-  [ "${value}" -le 100000 ] || fail "CPU quota must not exceed 100000%"
+  [ "${value}" -le "${MAX_CPU_QUOTA_PERCENT}" ] || \
+    fail "CPU quota must not exceed ${MAX_CPU_QUOTA_PERCENT}% (${AVAILABLE_CPU_COUNT} logical CPUs available)"
 }
 
 read_cpu_quota_percent() {

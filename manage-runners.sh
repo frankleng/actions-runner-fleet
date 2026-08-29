@@ -16,6 +16,37 @@ RUNNER_PGREP_BIN="${RUNNER_PGREP_BIN:-pgrep}"
 RUNNER_PKILL_BIN="${RUNNER_PKILL_BIN:-pkill}"
 RUNNER_STOP_GRACE_SECONDS="${RUNNER_STOP_GRACE_SECONDS:-2}"
 
+detect_available_cpu_count() {
+  local cpu_count=""
+  local nproc_bin="${RUNNER_NPROC_BIN:-nproc}"
+  local getconf_bin="${RUNNER_GETCONF_BIN:-getconf}"
+
+  if command -v "${nproc_bin}" >/dev/null 2>&1; then
+    cpu_count="$("${nproc_bin}" 2>/dev/null || true)"
+  fi
+  cpu_count="${cpu_count//[[:space:]]/}"
+
+  case "${cpu_count}" in
+    ''|*[!0-9]*|0)
+      cpu_count=""
+      ;;
+  esac
+
+  if [ -z "${cpu_count}" ] && command -v "${getconf_bin}" >/dev/null 2>&1; then
+    cpu_count="$("${getconf_bin}" _NPROCESSORS_ONLN 2>/dev/null || true)"
+    cpu_count="${cpu_count//[[:space:]]/}"
+  fi
+
+  case "${cpu_count}" in
+    ''|*[!0-9]*|0)
+      echo "could not determine the number of available logical CPUs" >&2
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "${cpu_count}"
+}
+
 usage() {
   cat <<EOF
 Usage:
@@ -40,7 +71,8 @@ Notes:
   - Set RUNNER_REPLACE_EXISTING=1 to replace a GitHub runner with the same name.
   - Target URLs may identify a repository (OWNER/REPOSITORY), organization
     (ORGANIZATION), or enterprise (enterprises/ENTERPRISE) under github.com.
-  - Linux runner CPU limits are whole-number percentages; 200% equals two CPUs.
+  - Linux runner CPU limits are whole-number percentages; 100% equals one CPU,
+    and the maximum matches the logical CPUs available to this process.
   - The registry lives at: ${REGISTRY_PATH}
 EOF
 }
@@ -435,6 +467,8 @@ set_runner_cpu_limit() {
   local cpu_quota_percent="$2"
   local runner_dir
   local quota_path
+  local available_cpu_count
+  local max_cpu_quota_percent
 
   if [ "${RUNNER_SERVICE_MANAGER}" != "systemd-user" ]; then
     echo "per-runner CPU quotas require the Linux systemd user service manager" >&2
@@ -447,8 +481,10 @@ set_runner_cpu_limit() {
       exit 1
       ;;
   esac
-  if [ "${cpu_quota_percent}" -lt 1 ] || [ "${cpu_quota_percent}" -gt 100000 ]; then
-    echo "CPU quota must be between 1% and 100000%" >&2
+  available_cpu_count="$(detect_available_cpu_count)"
+  max_cpu_quota_percent="$((available_cpu_count * 100))"
+  if [ "${cpu_quota_percent}" -lt 1 ] || [ "${cpu_quota_percent}" -gt "${max_cpu_quota_percent}" ]; then
+    echo "CPU quota must be between 1% and ${max_cpu_quota_percent}% (${available_cpu_count} logical CPUs available)" >&2
     exit 1
   fi
 
