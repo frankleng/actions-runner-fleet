@@ -3,7 +3,7 @@
 set -euo pipefail
 
 RUNNER_LOG_PRUNE_INTERVAL_SECONDS="${RUNNER_LOG_PRUNE_INTERVAL_SECONDS:-3600}"
-RUNNER_DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-200}"
+RUNNER_DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-}"
 RUNNER_CPU_QUOTA_PATH="${RUNNER_CPU_QUOTA_PATH:-.cpu-quota}"
 RUNNER_CPULIMIT_BIN="${RUNNER_CPULIMIT_BIN:-./tools/bin/cpulimit}"
 PID=""
@@ -80,6 +80,10 @@ read_cpu_quota_percent() {
 
   if [ -f "${RUNNER_CPU_QUOTA_PATH}" ]; then
     cpu_quota_percent="$(tr -d '[:space:]' < "${RUNNER_CPU_QUOTA_PATH}")"
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    cpu_quota_percent="$(( $(sysctl -n hw.ncpu) * 50 ))"
+  else
+    cpu_quota_percent=200
   fi
 
   case "${cpu_quota_percent}" in

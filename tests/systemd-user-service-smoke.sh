@@ -11,6 +11,8 @@ systemctl_stub="${temp_dir}/systemctl"
 systemctl_log="${temp_dir}/systemctl.log"
 loginctl_stub="${temp_dir}/loginctl"
 loginctl_log="${temp_dir}/loginctl.log"
+nproc_stub="${temp_dir}/nproc"
+registry_path="${temp_dir}/runners.tsv"
 
 mkdir -p "${runner_dir}/bin" "${runner_dir}/_diag"
 mkdir -p "${temp_dir}/host-tools/pnpm-tools/bin"
@@ -47,29 +49,50 @@ esac
 EOF
 chmod u+x "${loginctl_stub}"
 
+cat > "${nproc_stub}" <<'EOF'
+#!/bin/sh
+printf '6\n'
+EOF
+chmod u+x "${nproc_stub}"
+
 RUNNER_PROVISION_SCRIPT_PATH="${ROOT_DIR}/provision-runner-tooling.sh" \
 RUNNER_HOST_TOOLS_DIR="${temp_dir}/host-tools" \
 RUNNER_PNPM_STORE_DIR="${temp_dir}/pnpm-store" \
 RUNNER_LOGINCTL_BIN="${loginctl_stub}" RUNNER_TEST_LOGINCTL_LOG="${loginctl_log}" \
+RUNNER_NPROC_BIN="${nproc_stub}" \
 RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" install
-status_output="$(RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" status)"
+status_output="$(RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" status)"
 
 unit_path="${unit_dir}/actions.runner.example-org.ubuntu-runner-1.service"
 [ -f "${unit_path}" ]
 grep -Fq "WorkingDirectory=${runner_dir}" "${unit_path}"
 grep -Fq "ExecStart=${runner_dir}/runsvc.sh" "${unit_path}"
-grep -Fq "CPUQuota=200%" "${unit_path}"
-grep -Fxq "200" "${runner_dir}/.cpu-quota"
+grep -Fq "Slice=background.slice" "${unit_path}"
+grep -Fq "CPUQuota=300%" "${unit_path}"
+grep -Fxq "300" "${runner_dir}/.cpu-quota"
 grep -Fq "Started:" <<< "${status_output}"
-grep -Fq "CPU limit: 200%" <<< "${status_output}"
+grep -Fq "CPU limit: 300%" <<< "${status_output}"
 grep -Fq "4242 0 actions.runner.example-org.ubuntu-runner-1" <<< "${status_output}"
 grep -Fq -- "--user daemon-reload" "${systemctl_log}"
 grep -Fq -- "--user enable actions.runner.example-org.ubuntu-runner-1.service" "${systemctl_log}"
 grep -Fq -- "enable-linger $(id -un)" "${loginctl_log}"
-grep -Fq -- "--user set-property --runtime actions.runner.example-org.ubuntu-runner-1.service CPUQuota=200%" "${systemctl_log}"
+grep -Fq -- "--user set-property --runtime actions.runner.example-org.ubuntu-runner-1.service CPUQuota=300%" "${systemctl_log}"
 
-RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" set-cpu-limit 175
+if RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" set-cpu-limit 601 >"${temp_dir}/quota.out" 2>"${temp_dir}/quota.err"; then
+  echo "expected a CPU quota above the available CPU capacity to fail" >&2
+  exit 1
+fi
+grep -Fq "must not exceed 600% (6 logical CPUs available)" "${temp_dir}/quota.err"
+
+RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" set-cpu-limit 175
 
 grep -Fq "CPUQuota=175%" "${unit_path}"
 grep -Fxq "175" "${runner_dir}/.cpu-quota"
 grep -Fq -- "--user set-property --runtime actions.runner.example-org.ubuntu-runner-1.service CPUQuota=175%" "${systemctl_log}"
+
+printf 'ubuntu-runner-1\t%s\n' "${runner_dir}" > "${registry_path}"
+if RUNNER_SERVICE_MANAGER_OVERRIDE=systemd-user RUNNER_REGISTRY_PATH="${registry_path}" RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${ROOT_DIR}/manage-runners.sh" set-cpu-limit ubuntu-runner-1 601 >"${temp_dir}/manage-quota.out" 2>"${temp_dir}/manage-quota.err"; then
+  echo "expected manage-runners.sh to reject a CPU quota above the available capacity" >&2
+  exit 1
+fi
+grep -Fq "between 1% and 600% (6 logical CPUs available)" "${temp_dir}/manage-quota.err"

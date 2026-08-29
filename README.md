@@ -17,7 +17,10 @@ tools are never committed.
 - One isolated directory and user service per runner (systemd or launchd);
   runner binaries are copy-on-write clones of a shared image where the
   filesystem supports it (XFS/Btrfs reflinks, APFS clonefiles)
-- A persistent, dashboard-configurable CPU quota per runner (200% by default)
+- A persistent, dashboard-configurable CPU quota per runner (50% of the
+  host's available logical CPU capacity by default)
+- Background CPU scheduling for Linux runners, allowing interactive services
+  to take priority automatically when the host is under contention
 - Pinned Node.js `24.19.0` LTS, pnpm `11.20.0`, Wrangler, Pulumi, and AWS CLI
   tooling installed once per host under `host-tools/` and shared by every
   runner, along with a shared Actions tool cache, pnpm store, and npm cache;
@@ -352,24 +355,32 @@ Useful direct commands are:
 
 ### Configure runner CPU limits
 
-Runners default to a `200%` CPU quota, which allows at most two logical CPUs per
-runner. Linux applies the quota to the full systemd service cgroup. macOS uses
-a pinned `cpulimit` build that monitors the listener and its descendants. In
-both cases, a workflow and every process it launches share the same limit.
+Runners default to 50% of the logical CPU capacity available to the host
+process. CPU quotas use `100%` per logical CPU, so a host with eight available
+logical CPUs has an `800%` ceiling and a `400%` default per runner. Linux
+applies the quota to the full systemd service cgroup. macOS uses a pinned
+`cpulimit` build that monitors the listener and its descendants. In both cases,
+a workflow and every process it launches share the same limit.
 
-In the dashboard, select a runner and press `c` to view or change its limit.
-The change is persisted in the runner directory for future starts. Linux
-applies it live; macOS applies it at the next service restart so an in-progress
-job is never interrupted. The equivalent command is:
+Runner services are assigned to systemd's `background.slice`, whose lower CPU
+weight lets services in `app.slice`—including an interactive T3 Code
+service—take CPU time first when the host is busy. This is contention-aware:
+runners can still use otherwise-idle CPU up to their configured quota.
+
+In the dashboard, select a runner and press `c` to view or change its limit up
+to the host's full available capacity. The change is persisted in the runner
+directory for future starts. Linux applies it live; macOS applies it at the
+next service restart so an in-progress job is never interrupted. The
+equivalent command is:
 
 ```bash
 ./manage-runners.sh set-cpu-limit macos-build-1 200
 ```
 
 CPU quota values are whole-number percentages (`100%` is one logical CPU,
-`200%` is two). On macOS, the value cannot exceed the host's logical CPU count.
-The macOS limiter follows the runner's process tree; a workflow that explicitly
-detaches and reparents a process can escape that best-effort cap.
+`200%` is two) and cannot exceed the available logical CPU count multiplied by
+100. The macOS limiter follows the runner's process tree; a workflow that
+explicitly detaches and reparents a process can escape that best-effort cap.
 
 After setup, confirm each runner is idle/online in GitHub settings and run a
 representative workflow for every GitHub target.

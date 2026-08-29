@@ -1,11 +1,42 @@
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const RUNNER_SELECTION_EVENTS = ["select item", "select"];
 export const DEFAULT_AUTO_REFRESH_INTERVAL_MS = 5000;
 export const DEFAULT_GITHUB_RUNNER_SCOPE = "organization";
-export const DEFAULT_CPU_QUOTA_PERCENT = 200;
+export const DEFAULT_CPU_CAPACITY_PERCENT = 50;
+
+export function getMaxCpuQuotaPercent(availableCpuCount = os.availableParallelism()) {
+  const maxPercent = availableCpuCount * 100;
+
+  if (
+    !Number.isSafeInteger(availableCpuCount) ||
+    availableCpuCount < 1 ||
+    !Number.isSafeInteger(maxPercent)
+  ) {
+    return 100;
+  }
+
+  return maxPercent;
+}
+
+export function getDefaultCpuQuotaPercent(
+  availableCpuCount = os.availableParallelism(),
+  capacityPercent = DEFAULT_CPU_CAPACITY_PERCENT
+) {
+  const maxPercent = getMaxCpuQuotaPercent(availableCpuCount);
+
+  if (!Number.isSafeInteger(capacityPercent) || capacityPercent < 1 || capacityPercent > 100) {
+    capacityPercent = DEFAULT_CPU_CAPACITY_PERCENT;
+  }
+
+  return Math.max(1, Math.floor(maxPercent * capacityPercent / 100));
+}
+
+export const MAX_CPU_QUOTA_PERCENT = getMaxCpuQuotaPercent();
+export const DEFAULT_CPU_QUOTA_PERCENT = getDefaultCpuQuotaPercent();
 const RUNNER_NAVIGATION_BINDINGS = [
   { keys: ["up", "k"], delta: -1 },
   { keys: ["down", "j"], delta: 1 }
@@ -122,7 +153,7 @@ export function buildManageRunnersArgs(action, payload = {}) {
   }
 }
 
-export function parseCpuQuotaPercent(value) {
+export function parseCpuQuotaPercent(value, maxPercent = MAX_CPU_QUOTA_PERCENT) {
   const normalized = String(value ?? "").trim();
 
   if (!/^\d+$/.test(normalized)) {
@@ -130,7 +161,7 @@ export function parseCpuQuotaPercent(value) {
   }
 
   const percent = Number(normalized);
-  if (!Number.isSafeInteger(percent) || percent < 1 || percent > 100000) {
+  if (!Number.isSafeInteger(percent) || percent < 1 || percent > maxPercent) {
     return null;
   }
 
@@ -390,12 +421,13 @@ export async function readRunnerMetadata(directory) {
   let serviceStatusOutput = "";
   let serviceName = "";
   let servicePid = null;
-  let cpuQuotaPercent = process.platform === "linux"
+  const supportsCpuQuota = process.platform === "linux" || process.platform === "darwin";
+  let cpuQuotaPercent = supportsCpuQuota
     ? parseCpuQuotaPercent(process.env.RUNNER_DEFAULT_CPU_QUOTA_PERCENT) ??
       DEFAULT_CPU_QUOTA_PERCENT
     : null;
 
-  if (process.platform === "linux" && await fileExists(cpuQuotaPath)) {
+  if (supportsCpuQuota && await fileExists(cpuQuotaPath)) {
     try {
       cpuQuotaPercent = parseCpuQuotaPercent(await fs.readFile(cpuQuotaPath, "utf8")) ??
         DEFAULT_CPU_QUOTA_PERCENT;

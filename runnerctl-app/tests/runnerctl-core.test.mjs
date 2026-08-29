@@ -11,6 +11,9 @@ import {
   classifyGitHubRunnerTargetUrl,
   DEFAULT_CPU_QUOTA_PERCENT,
   DEFAULT_GITHUB_RUNNER_SCOPE,
+  getDefaultCpuQuotaPercent,
+  getMaxCpuQuotaPercent,
+  MAX_CPU_QUOTA_PERCENT,
   parseRegistry,
   getActionDefinitions,
   getGitHubRunnerTargetUrlExample,
@@ -209,10 +212,18 @@ test("buildManageRunnersArgs routes scripted actions to the shell helper", () =>
   ]);
 });
 
-test("CPU quota percentages accept multi-core limits", () => {
-  assert.equal(DEFAULT_CPU_QUOTA_PERCENT, 200);
-  assert.equal(parseCpuQuotaPercent("200"), 200);
-  assert.equal(parseCpuQuotaPercent(" 175\n"), 175);
+test("CPU quota percentages use the available logical CPU count as their maximum", () => {
+  assert.equal(getMaxCpuQuotaPercent(1), 100);
+  assert.equal(getMaxCpuQuotaPercent(8), 800);
+  assert.equal(getMaxCpuQuotaPercent(0), 100);
+  assert.equal(getDefaultCpuQuotaPercent(1), 50);
+  assert.equal(getDefaultCpuQuotaPercent(8), 400);
+  assert.equal(getDefaultCpuQuotaPercent(8, 75), 600);
+  assert.equal(DEFAULT_CPU_QUOTA_PERCENT, MAX_CPU_QUOTA_PERCENT * 0.5);
+  assert.equal(parseCpuQuotaPercent("100"), 100);
+  assert.equal(parseCpuQuotaPercent(" 175\n", 200), 175);
+  assert.equal(parseCpuQuotaPercent("800", 800), 800);
+  assert.equal(parseCpuQuotaPercent("801", 800), null);
   assert.equal(parseCpuQuotaPercent("0"), null);
   assert.equal(parseCpuQuotaPercent("2.5"), null);
   assert.equal(parseCpuQuotaPercent("unlimited"), null);

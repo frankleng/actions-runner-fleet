@@ -19,6 +19,7 @@ pkill_stub="${temp_dir}/pkill"
 pgrep_log="${temp_dir}/pgrep.log"
 pkill_log="${temp_dir}/pkill.log"
 process_state="${temp_dir}/process.state"
+expected_default_cpu_quota="$(( $(sysctl -n hw.ncpu) * 50 ))"
 trap 'rm -rf "${temp_dir}"' EXIT
 
 mkdir -p "${runner_dir}/bin" "${runner_dir}/externals/node20/bin" "${temp_user_home}"
@@ -103,7 +104,7 @@ grep -q "${runner_dir}/home/Library/Logs/actions.runner.example-org.smoke-runner
 grep -q '\.env' "${runner_dir}/runsvc.sh"
 grep -q '\.path' "${runner_dir}/runsvc.sh"
 grep -q -- '--include-children' "${runner_dir}/runsvc.sh"
-[ "$(cat "${runner_dir}/.cpu-quota")" = "200" ]
+[ "$(cat "${runner_dir}/.cpu-quota")" = "${expected_default_cpu_quota}" ]
 
 status_output="$(
   cd "${runner_dir}"
@@ -112,7 +113,7 @@ status_output="$(
   RUNNER_LAUNCHCTL_BIN="${launchctl_stub}" \
   ./svc.sh status
 )"
-grep -Fq "CPU limit: 200%" <<< "${status_output}"
+grep -Fq "CPU limit: ${expected_default_cpu_quota}%" <<< "${status_output}"
 
 (
   cd "${runner_dir}"

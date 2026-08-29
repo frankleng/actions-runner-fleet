@@ -13,7 +13,6 @@ RUNNER_LAUNCHD_USER="${RUNNER_LAUNCHD_USER:-${USER:-$(id -un)}}"
 RUNNER_LOG_RETENTION_DAYS="${RUNNER_LOG_RETENTION_DAYS:-7}"
 RUNNER_LOG_ROTATE_MAX_BYTES="${RUNNER_LOG_ROTATE_MAX_BYTES:-52428800}"
 CPU_QUOTA_PATH="${RUNNER_ROOT}/.cpu-quota"
-DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-200}"
 
 read_runner_json_value() {
   local key="$1"
@@ -65,6 +64,39 @@ failed() {
   exit 1
 }
 
+detect_available_cpu_count() {
+  local cpu_count=""
+
+  cpu_count="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  cpu_count="${cpu_count//[[:space:]]/}"
+  case "${cpu_count}" in
+    ''|*[!0-9]*|0) cpu_count="" ;;
+  esac
+
+  if [ -z "${cpu_count}" ]; then
+    cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    cpu_count="${cpu_count//[[:space:]]/}"
+  fi
+  case "${cpu_count}" in
+    ''|*[!0-9]*|0) cpu_count="" ;;
+  esac
+
+  if [ -z "${cpu_count}" ]; then
+    cpu_count="$(nproc 2>/dev/null || true)"
+    cpu_count="${cpu_count//[[:space:]]/}"
+  fi
+  case "${cpu_count}" in
+    ''|*[!0-9]*|0) failed "could not determine the number of available logical CPUs" ;;
+  esac
+
+  printf '%s\n' "${cpu_count}"
+}
+
+AVAILABLE_CPU_COUNT="$(detect_available_cpu_count)"
+MAX_CPU_QUOTA_PERCENT="$((AVAILABLE_CPU_COUNT * 100))"
+CALCULATED_DEFAULT_CPU_QUOTA_PERCENT="$((MAX_CPU_QUOTA_PERCENT * 50 / 100))"
+DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-${CALCULATED_DEFAULT_CPU_QUOTA_PERCENT}}"
+
 require_non_negative_integer() {
   local value_name="$1"
   local value="$2"
@@ -78,13 +110,11 @@ require_non_negative_integer() {
 
 validate_cpu_quota_percent() {
   local value="$1"
-  local maximum_percent
 
   require_non_negative_integer "CPU quota" "${value}"
   [ "${value}" -ge 1 ] || failed "CPU quota must be at least 1%"
-  maximum_percent="$(( $(sysctl -n hw.ncpu) * 100 ))"
-  [ "${value}" -le "${maximum_percent}" ] ||
-    failed "CPU quota must not exceed ${maximum_percent}% on this Mac"
+  [ "${value}" -le "${MAX_CPU_QUOTA_PERCENT}" ] ||
+    failed "CPU quota must not exceed ${MAX_CPU_QUOTA_PERCENT}% on this Mac"
 }
 
 read_cpu_quota_percent() {
