@@ -78,7 +78,8 @@ TOOLS_DIR="${ROOT_DIR}/tools"
 HOST_TOOLS_DIR="${RUNNER_HOST_TOOLS_DIR:-${SCRIPT_DIR}/host-tools}"
 LOCAL_BIN_DIR="${TOOLS_DIR}/bin"
 PNPM_GLOBAL_DIR="${TOOLS_DIR}/pnpm-global"
-PNPM_HOME="${PNPM_GLOBAL_DIR}/bin"
+PNPM_HOME="${PNPM_GLOBAL_DIR}"
+PNPM_BIN_DIR="${PNPM_HOME}/bin"
 COREPACK_HOME="${HOST_TOOLS_DIR}/corepack"
 PNPM_TOOLS_DIR="${HOST_TOOLS_DIR}/pnpm-tools"
 PNPM_TOOLS_BIN_DIR="${PNPM_TOOLS_DIR}/bin"
@@ -171,7 +172,9 @@ build_runner_path() {
   local entry
 
   ambient_path="$(sanitize_path "${current_path}")"
-  for entry in "${LOCAL_BIN_DIR}" "${PNPM_HOME}" "${NODE_BIN_DIR}"; do
+  # pnpm 10 uses PNPM_HOME itself for global shims; pnpm 11+ uses
+  # PNPM_HOME/bin. Match pnpm/setup by exposing both locations.
+  for entry in "${LOCAL_BIN_DIR}" "${PNPM_HOME}" "${PNPM_BIN_DIR}" "${NODE_BIN_DIR}"; do
     runner_path="$(append_unique_path_entry "${runner_path}" "${entry}")"
   done
 
@@ -222,12 +225,35 @@ write_npmrc() {
 
   {
     if [ -f "${npmrc_path}" ]; then
-      grep -v -e '^store-dir=' -e '^cache=' "${npmrc_path}" || true
+      grep -v \
+        -e '^store-dir=' \
+        -e '^cache=' \
+        -e '^global-bin-dir=' \
+        -e '^global-dir=' \
+        -e '^prefix=' \
+        "${npmrc_path}" || true
     fi
     printf 'store-dir=%s\n' "${PNPM_STORE_DIR}"
     printf 'cache=%s\n' "${NPM_CACHE_DIR}"
   } > "${temp_npmrc_path}"
   mv "${temp_npmrc_path}" "${npmrc_path}"
+}
+
+sanitize_pnpm_global_config() {
+  local config_path="${RUNNER_HOME}/.config/pnpm/config.yaml"
+  local temp_config_path="${config_path}.tmp"
+
+  if [ ! -f "${config_path}" ]; then
+    return 0
+  fi
+
+  # PNPM_HOME owns the global layout. Remove old explicit path settings so a
+  # prior `pnpm config set --global` cannot override the provisioned home/bin
+  # relationship. Preserve every unrelated global setting.
+  grep -Ev \
+    '^(global-bin-dir|global-dir|globalBinDir|globalDir|prefix):([[:space:]]|$)' \
+    "${config_path}" > "${temp_config_path}" || true
+  mv "${temp_config_path}" "${config_path}"
 }
 
 write_env_files() {
@@ -240,7 +266,7 @@ write_env_files() {
     "${RUNNER_TMP}" \
     "${RUNNER_TEMP}" \
     "${LOCAL_BIN_DIR}" \
-    "${PNPM_HOME}"
+    "${PNPM_BIN_DIR}"
 
   ensure_exec_wrapper "${PNPM_TOOLS_BIN_DIR}/wrangler" "${LOCAL_BIN_DIR}/wrangler"
   env_file_lines > "${env_path}.tmp"
@@ -248,6 +274,7 @@ write_env_files() {
   mv "${env_path}.tmp" "${env_path}"
   mv "${path_path}.tmp" "${path_path}"
   write_npmrc
+  sanitize_pnpm_global_config
 }
 
 ensure_directory() {
@@ -324,11 +351,11 @@ install_node() {
 install_pnpm() {
   local installed_version=""
 
-  if [ -x "${PNPM_HOME}/pnpm" ]; then
+  if [ -x "${PNPM_BIN_DIR}/pnpm" ]; then
     installed_version="$(
       COREPACK_HOME="${COREPACK_HOME}" \
-      PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" \
-        "${PNPM_HOME}/pnpm" --version 2>/dev/null || true
+      PATH="${LOCAL_BIN_DIR}:${PNPM_BIN_DIR}:${NODE_BIN_DIR}:${PATH}" \
+        "${PNPM_BIN_DIR}/pnpm" --version 2>/dev/null || true
     )"
   fi
   if [ "${installed_version}" = "${PNPM_VERSION}" ]; then
@@ -339,16 +366,16 @@ install_pnpm() {
     return 0
   fi
 
-  mkdir -p "${PNPM_HOME}" "${COREPACK_HOME}"
+  mkdir -p "${PNPM_BIN_DIR}" "${COREPACK_HOME}"
   COREPACK_HOME="${COREPACK_HOME}" PATH="${NODE_BIN_DIR}:${PATH}" \
     "${NODE_BIN_DIR}/corepack" install --global "pnpm@${PNPM_VERSION}"
   COREPACK_HOME="${COREPACK_HOME}" PATH="${NODE_BIN_DIR}:${PATH}" \
-    "${NODE_BIN_DIR}/corepack" enable --install-directory "${PNPM_HOME}" pnpm
+    "${NODE_BIN_DIR}/corepack" enable --install-directory "${PNPM_BIN_DIR}" pnpm
 
   installed_version="$(
     COREPACK_HOME="${COREPACK_HOME}" \
-    PATH="${LOCAL_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" \
-      "${PNPM_HOME}/pnpm" --version
+    PATH="${LOCAL_BIN_DIR}:${PNPM_BIN_DIR}:${NODE_BIN_DIR}:${PATH}" \
+      "${PNPM_BIN_DIR}/pnpm" --version
   )"
   [ "${installed_version}" = "${PNPM_VERSION}" ] || {
     echo "pnpm ${PNPM_VERSION} verification failed: ${installed_version}" >&2
@@ -360,7 +387,7 @@ install_wrangler() {
   local version_output=""
 
   if [ -x "${PNPM_TOOLS_BIN_DIR}/wrangler" ]; then
-    version_output="$(PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" "${PNPM_TOOLS_BIN_DIR}/wrangler" --version 2>/dev/null || true)"
+    version_output="$(PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_BIN_DIR}:${NODE_BIN_DIR}:${PATH}" "${PNPM_TOOLS_BIN_DIR}/wrangler" --version 2>/dev/null || true)"
   fi
 
   if [ "${version_output}" != "${WRANGLER_VERSION}" ]; then
@@ -370,14 +397,14 @@ install_wrangler() {
 
     mkdir -p "${PNPM_TOOLS_BIN_DIR}" "${PNPM_STORE_DIR}"
     COREPACK_HOME="${COREPACK_HOME}" PNPM_HOME="${PNPM_HOME}" \
-    PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" \
-      "${PNPM_HOME}/pnpm" add --global \
+    PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_BIN_DIR}:${NODE_BIN_DIR}:${PATH}" \
+      "${PNPM_BIN_DIR}/pnpm" add --global \
         --global-dir "${PNPM_TOOLS_DIR}" \
         --global-bin-dir "${PNPM_TOOLS_BIN_DIR}" \
         --store-dir "${PNPM_STORE_DIR}" \
         "wrangler@${WRANGLER_VERSION}"
 
-    version_output="$(PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_HOME}:${NODE_BIN_DIR}:${PATH}" "${PNPM_TOOLS_BIN_DIR}/wrangler" --version)"
+    version_output="$(PATH="${PNPM_TOOLS_BIN_DIR}:${PNPM_BIN_DIR}:${NODE_BIN_DIR}:${PATH}" "${PNPM_TOOLS_BIN_DIR}/wrangler" --version)"
     [ "${version_output}" = "${WRANGLER_VERSION}" ] || {
       echo "Wrangler ${WRANGLER_VERSION} verification failed: ${version_output}" >&2
       exit 1
@@ -592,7 +619,7 @@ ensure_directory "${RUNNER_TMP}"
 ensure_directory "${RUNNER_TEMP}"
 ensure_directory "${RUNNER_TOOL_CACHE}"
 ensure_directory "${LOCAL_BIN_DIR}"
-ensure_directory "${PNPM_HOME}"
+ensure_directory "${PNPM_BIN_DIR}"
 ensure_directory "${COREPACK_HOME}"
 ensure_directory "${PNPM_TOOLS_BIN_DIR}"
 ensure_directory "${PNPM_STORE_DIR}"
