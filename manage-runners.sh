@@ -176,6 +176,7 @@ require_overlay() {
   for overlay_file in \
     "${OVERLAY_DIR}/env.sh" \
     "${OVERLAY_DIR}/runsvc.sh" \
+    "${OVERLAY_DIR}/runner-job-temp.sh" \
     "${OVERLAY_DIR}/svc.sh"; do
     if [ ! -f "${overlay_file}" ]; then
       echo "managed runner overlay file is missing: ${overlay_file}" >&2
@@ -188,7 +189,7 @@ copy_overlay() {
   local runner_dir="$1"
 
   require_overlay
-  mkdir -p "${runner_dir}/bin"
+  mkdir -p "${runner_dir}/bin" "${runner_dir}/job-hooks"
   printf '%s\n' "${ROOT_DIR}" > "${runner_dir}/.kit-root"
   cp "${OVERLAY_DIR}/env.sh" "${runner_dir}/env.sh"
   if [ "${RUNNER_SERVICE_MANAGER}" = "systemd-user" ]; then
@@ -197,6 +198,9 @@ copy_overlay() {
     cp "${OVERLAY_DIR}/svc.sh" "${runner_dir}/svc.sh"
   fi
   cp "${OVERLAY_DIR}/runsvc.sh" "${runner_dir}/bin/runsvc.sh"
+  cp "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-started.sh"
+  cp "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
+  chmod u+x "${runner_dir}/job-hooks/runner-job-started.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
   cp "${OVERLAY_DIR}/bin/actions.runner.plist.template" "${runner_dir}/bin/actions.runner.plist.template"
   cp "${OVERLAY_DIR}/bin/actions.runner.service.template" "${runner_dir}/bin/actions.runner.service.template"
   chmod u+x "${runner_dir}/env.sh" "${runner_dir}/svc.sh" "${runner_dir}/bin/runsvc.sh"

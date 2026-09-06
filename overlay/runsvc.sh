@@ -156,8 +156,34 @@ start_macos_cpu_limiter() {
   CPULIMIT_MONITOR_PID=$!
 }
 
+ambient_started_hook="${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}"
+ambient_completed_hook="${ACTIONS_RUNNER_HOOK_JOB_COMPLETED:-}"
 load_env_file
 load_path_file
+
+# Keep job scratch files off the host /tmp filesystem. GitHub invokes these
+# hooks synchronously, so cleanup never runs in the middle of a job.
+runner_root="$(pwd -P)"
+export TMPDIR="${runner_root}/tmp/managed-job"
+export TMP="${TMPDIR}" TEMP="${TMPDIR}"
+if [ -L "${runner_root}/tmp" ] || [ -L "${TMPDIR}" ]; then
+  echo "Runner temporary directory must not be a symlink" >&2
+  exit 1
+fi
+mkdir -p "${TMPDIR}"
+chmod 700 "${TMPDIR}"
+if [ -n "${ambient_started_hook}" ] && [ ! "${ambient_started_hook}" -ef "${runner_root}/job-hooks/runner-job-started.sh" ]; then
+  export RUNNER_PREVIOUS_JOB_STARTED_HOOK="${ambient_started_hook}"
+elif [ ! "${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}" -ef "${runner_root}/job-hooks/runner-job-started.sh" ]; then
+  export RUNNER_PREVIOUS_JOB_STARTED_HOOK="${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}"
+fi
+if [ -n "${ambient_completed_hook}" ] && [ ! "${ambient_completed_hook}" -ef "${runner_root}/job-hooks/runner-job-completed.sh" ]; then
+  export RUNNER_PREVIOUS_JOB_COMPLETED_HOOK="${ambient_completed_hook}"
+elif [ ! "${ACTIONS_RUNNER_HOOK_JOB_COMPLETED:-}" -ef "${runner_root}/job-hooks/runner-job-completed.sh" ]; then
+  export RUNNER_PREVIOUS_JOB_COMPLETED_HOOK="${ACTIONS_RUNNER_HOOK_JOB_COMPLETED:-}"
+fi
+export ACTIONS_RUNNER_HOOK_JOB_STARTED="${runner_root}/job-hooks/runner-job-started.sh"
+export ACTIONS_RUNNER_HOOK_JOB_COMPLETED="${runner_root}/job-hooks/runner-job-completed.sh"
 prepare_macos_cpu_limiter
 start_log_pruner
 

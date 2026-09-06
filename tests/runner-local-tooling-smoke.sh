@@ -53,7 +53,7 @@ env_output="$(run_provision --dry-run --print-env)"
 manifest_output="$(run_provision --dry-run --print-manifest)"
 
 printf '%s\n' "${env_output}" | grep -q "HOME=${temp_dir}/home"
-printf '%s\n' "${env_output}" | grep -q "TMPDIR=${temp_dir}/tmp"
+printf '%s\n' "${env_output}" | grep -q "TMPDIR=${temp_dir}/tmp/managed-job"
 printf '%s\n' "${env_output}" | grep -q "RUNNER_TEMP=${temp_dir}/_work/_temp"
 printf '%s\n' "${env_output}" | grep -q "RUNNER_TOOL_CACHE=${tool_cache_dir}"
 printf '%s\n' "${env_output}" | grep -q "PNPM_HOME=${temp_dir}/tools/pnpm-global"
@@ -72,7 +72,7 @@ fi
 unset HOME TMPDIR RUNNER_TEMP RUNNER_TOOL_CACHE PNPM_HOME COREPACK_HOME PULUMI_HOME
 eval "${env_output}"
 [[ "${HOME}" == "${temp_dir}/home" ]]
-[[ "${TMPDIR}" == "${temp_dir}/tmp" ]]
+[[ "${TMPDIR}" == "${temp_dir}/tmp/managed-job" ]]
 [[ "${RUNNER_TEMP}" == "${temp_dir}/_work/_temp" ]]
 [[ "${RUNNER_TOOL_CACHE}" == "${tool_cache_dir}" ]]
 [[ "${PNPM_HOME}" == "${temp_dir}/tools/pnpm-global" ]]
@@ -87,7 +87,13 @@ printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PULUMI_VERSION=3.143.0
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_AWS_VERSION=2.36.11"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_CPULIMIT_VERSION=0.2"
 
+mkdir -p "${temp_dir}/job-hooks"
+cp "${ROOT_DIR}/overlay/runner-job-temp.sh" "${temp_dir}/job-hooks/runner-job-started.sh"
+cp "${ROOT_DIR}/overlay/runner-job-temp.sh" "${temp_dir}/job-hooks/runner-job-completed.sh"
+printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=/custom/start.sh\nACTIONS_RUNNER_HOOK_JOB_COMPLETED=/custom/end.sh\n' > "${temp_dir}/.env"
 run_provision --write-env
+grep -qx 'RUNNER_PREVIOUS_JOB_STARTED_HOOK=/custom/start.sh' "${temp_dir}/.env"
+grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=${temp_dir}/job-hooks/runner-job-started.sh" "${temp_dir}/.env"
 [ -f "${temp_dir}/.env" ]
 [ -f "${temp_dir}/.path" ]
 [ -x "${temp_dir}/tools/bin/wrangler" ]
@@ -123,6 +129,8 @@ printf 'store-dir=/somewhere/stale\ncache=/somewhere/stale\nglobal-bin-dir=/some
 mkdir -p "${temp_dir}/home/.config/pnpm"
 printf 'global-bin-dir: /somewhere/wrong/bin\nglobalDir: /somewhere/wrong/global\nprefix: /somewhere/wrong\nverify-store-integrity: true\n' > "${temp_dir}/home/.config/pnpm/config.yaml"
 run_provision --write-env
+grep -qx 'RUNNER_PREVIOUS_JOB_STARTED_HOOK=/custom/start.sh' "${temp_dir}/.env"
+grep -qx 'RUNNER_PREVIOUS_JOB_COMPLETED_HOOK=/custom/end.sh' "${temp_dir}/.env"
 grep -qx "store-dir=${pnpm_store_dir}" "${temp_dir}/home/.npmrc"
 grep -qx "cache=${host_tools_dir}/npm-cache" "${temp_dir}/home/.npmrc"
 grep -qx "registry=https://registry.example.com" "${temp_dir}/home/.npmrc"

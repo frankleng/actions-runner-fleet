@@ -98,7 +98,7 @@ plist_path="${temp_user_home}/Library/LaunchAgents/actions.runner.example-org.sm
 grep -q "<key>HOME</key>" "${plist_path}"
 grep -q "<string>${runner_dir}/home</string>" "${plist_path}"
 grep -q "<key>TMPDIR</key>" "${plist_path}"
-grep -q "<string>${runner_dir}/tmp</string>" "${plist_path}"
+grep -q "<string>${runner_dir}/tmp/managed-job</string>" "${plist_path}"
 grep -q "${runner_dir}/home/Library/Logs/actions.runner.example-org.smoke-runner/stdout.log" "${plist_path}"
 grep -q "${runner_dir}/home/Library/Logs/actions.runner.example-org.smoke-runner/stderr.log" "${plist_path}"
 grep -q '\.env' "${runner_dir}/runsvc.sh"

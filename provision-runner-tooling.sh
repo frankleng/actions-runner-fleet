@@ -201,13 +201,50 @@ EOF
 env_file_lines() {
   printf 'LANG=%q\n' "${LANG:-en_US.UTF-8}"
   printf 'HOME=%q\n' "${RUNNER_HOME}"
-  printf 'TMPDIR=%q\n' "${RUNNER_TMP}"
+  printf 'TMPDIR=%q\n' "${RUNNER_TMP}/managed-job"
+  printf 'TMP=%q\n' "${RUNNER_TMP}/managed-job"
+  printf 'TEMP=%q\n' "${RUNNER_TMP}/managed-job"
   printf 'RUNNER_TEMP=%q\n' "${RUNNER_TEMP}"
   printf 'RUNNER_TOOL_CACHE=%q\n' "${RUNNER_TOOL_CACHE}"
   printf 'PNPM_HOME=%q\n' "${PNPM_HOME}"
   printf 'COREPACK_HOME=%q\n' "${COREPACK_HOME}"
   printf 'PULUMI_HOME=%q\n' "${PULUMI_HOME}"
+  if [ -f "${ROOT_DIR}/job-hooks/runner-job-started.sh" ]; then
+    job_hook_env_lines
+  fi
 }
+
+job_hook_env_lines() (
+  # Preserve custom hooks across repeated provisioning without chaining our
+  # wrappers to themselves. The .env file already uses trusted shell syntax.
+  if [ -f "${ROOT_DIR}/.env" ]; then
+    while IFS= read -r line; do
+      case "${line}" in
+        ACTIONS_RUNNER_HOOK_JOB_STARTED=*|ACTIONS_RUNNER_HOOK_JOB_COMPLETED=*|RUNNER_PREVIOUS_JOB_STARTED_HOOK=*|RUNNER_PREVIOUS_JOB_COMPLETED_HOOK=*)
+          eval "${line}"
+          ;;
+      esac
+    done < "${ROOT_DIR}/.env"
+  fi
+  for phase in STARTED COMPLETED; do
+    hook_var="ACTIONS_RUNNER_HOOK_JOB_${phase}"
+    previous_var="RUNNER_PREVIOUS_JOB_${phase}_HOOK"
+    if [ "${phase}" = STARTED ]; then suffix=started; else suffix=completed; fi
+    managed_hook="${ROOT_DIR}/job-hooks/runner-job-${suffix}.sh"
+    previous_hook="${!hook_var:-}"
+    if [ "${previous_hook}" = "${managed_hook}" ] || [ "${previous_hook}" -ef "${managed_hook}" ]; then
+      previous_hook="${!previous_var:-}"
+    fi
+    if [ -n "${previous_hook}" ]; then
+      printf '%s=%q\n' "${previous_var}" "${previous_hook}"
+    else
+      # Runner.Listener reads .env as key=value after a stock launcher update;
+      # shell-quoted empty strings would become a literal two-quote hook path.
+      printf '%s=\n' "${previous_var}"
+    fi
+    printf '%s=%q\n' "${hook_var}" "${managed_hook}"
+  done
+)
 
 print_env() {
   local current_path="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
@@ -264,6 +301,7 @@ write_env_files() {
   mkdir -p \
     "${RUNNER_HOME}/Library/Logs" \
     "${RUNNER_TMP}" \
+    "${RUNNER_TMP}/managed-job" \
     "${RUNNER_TEMP}" \
     "${LOCAL_BIN_DIR}" \
     "${PNPM_BIN_DIR}"

@@ -353,6 +353,29 @@ Useful direct commands are:
 ./manage-runners.sh reconcile-all
 ```
 
+### Automatic job temporary cleanup
+
+Managed services set `TMPDIR`, `TMP`, and `TEMP` to the runner's
+`tmp/managed-job` directory, keeping tools that honor these variables off
+the host `/tmp` filesystem. Synchronous job hooks empty this directory before
+and after each job, including hidden files and leftovers from interrupted
+jobs. Existing job hooks run after the initial cleanup and before the final
+cleanup. Cleanup refuses symlinked roots and does not cross filesystems.
+Mounted or unremovable entries produce warnings instead of failing jobs.
+Background processes must finish within their job; scratch files are removed
+even if a job leaves a daemon running. To remove a previously chained custom
+hook, clear its `RUNNER_PREVIOUS_JOB_STARTED_HOOK` or
+`RUNNER_PREVIOUS_JOB_COMPLETED_HOOK` entry in the runner's `.env` and restart
+the service. Hook paths and environment settings persist across runner upgrades.
+
+Apply updates to existing runners with `./manage-runners.sh reconcile-all`,
+which stops, updates, and starts each runner in turn. Run this when jobs are
+idle because reconciliation restarts services.
+The cleanup owns only `tmp/managed-job`; it does not remove old host `/tmp`
+files, other runner temporary files, or shared caches. Tools that hard-code
+`/tmp` must be configured separately. A single job can still exhaust storage
+before it finishes; this prevents accumulation across jobs.
+
 ### Configure runner CPU limits
 
 Runners default to 50% of the logical CPU capacity available to the host
