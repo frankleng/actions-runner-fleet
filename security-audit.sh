@@ -15,7 +15,7 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
 
 tracked_path_violation="$(
   git ls-files |
-    grep -E -m 1 '(^|/)(\.credentials[^/]*|\.runner[^/]*|\.env|\.path|fleet\.tsv|runners\.tsv|_work|_diag|host-tools|dist)(/|$)|\.(p12|pfx|pem|key|mobileprovision|tar\.gz|pkg)$' ||
+    grep -E -m 1 '(^|/)(\.credentials[^/]*|\.runner[^/]*|\.env|\.path|fleet\.tsv|runners\.tsv|autoscale\.json|\.autoscale[^/]*|_work|_diag|host-tools|dist)(/|$)|\.(p12|pfx|pem|key|mobileprovision|tar\.gz|pkg)$' ||
     true
 )"
 [ -z "${tracked_path_violation}" ] ||
@@ -39,6 +39,13 @@ if [ -n "${HOME:-}" ] && [ -d "${HOME}" ]; then
     printf 'source-machine home path found in:\n%s\n' "${home_path_hit_files}" >&2
     exit 1
   }
+fi
+
+if git ls-files --stage | awk '$1 == "120000" { found=1 } END { exit !found }'; then
+  fail "public source must not contain symlinks to local files"
+fi
+if git grep --cached -I -l -F "${SCRIPT_DIR}/" -- . >/dev/null 2>&1; then
+  fail "source-machine checkout path is embedded in tracked files"
 fi
 
 echo "security audit passed: no tracked runner state, credential files, private-key formats, known token formats, or source-home paths"

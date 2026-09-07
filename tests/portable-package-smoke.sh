@@ -8,7 +8,11 @@ BUILD_SCRIPT="${ROOT_DIR}/build-portable-package.sh"
 PACKAGE_NAME="actions-runner-fleet-kit-${RUNNER_PLATFORM}-${RUNNER_VERSION}"
 
 temp_dir="$(mktemp -d)"
-trap 'rm -rf "${temp_dir}"' EXIT
+extra_source="$(mktemp "${ROOT_DIR}/overlay/private-package-test.XXXXXX")"
+extra_dependency="$(mktemp "${ROOT_DIR}/runnerctl-app/node_modules/private-package-test.XXXXXX")"
+trap 'rm -rf "${temp_dir}"; rm -f "${extra_source}" "${extra_dependency}"' EXIT
+printf 'private local configuration\n' > "${extra_source}"
+printf 'private dependency configuration\n' > "${extra_dependency}"
 
 fleet_path="${temp_dir}/fleet.tsv"
 output_dir="${temp_dir}/dist"
@@ -37,11 +41,14 @@ mkdir -p "${extract_dir}"
 tar -xzf "${package_path}" -C "${extract_dir}"
 package_root="${extract_dir}/${PACKAGE_NAME}"
 
+[ ! -e "${package_root}/overlay/$(basename "${extra_source}")" ]
+[ ! -e "${package_root}/runnerctl-app/node_modules/$(basename "${extra_dependency}")" ]
 [ -f "${package_root}/runners.tsv" ]
 [ ! -s "${package_root}/runners.tsv" ]
 [ -f "${package_root}/fleet.tsv" ]
 [ -f "${package_root}/fleet.example.tsv" ]
 [ -f "${package_root}/CLAUDE.md" ]
+[ -f "${package_root}/overlay/autoscale-worker.mjs" ]
 [ -f "${package_root}/runner-target.sh" ]
 [ -f "${package_root}/patches/cpulimit-0.2-macos.patch" ]
 [ -f "${package_root}/docs/images/runnerctl-dashboard-demo.png" ]
@@ -125,3 +132,17 @@ if RUNNER_FLEET_PATH="${credential_fleet}" \
   exit 1
 fi
 grep -q "potential credential format" "${temp_dir}/credential.err"
+
+# A public build must use placeholders even when a private fleet.tsv exists.
+/bin/bash "${BUILD_SCRIPT}" "${temp_dir}/public-dist"
+public_root="${temp_dir}/public-extract"
+mkdir -p "${public_root}"
+tar -xzf "${temp_dir}/public-dist/${PACKAGE_NAME}.tar.gz" -C "${public_root}" \
+  "${PACKAGE_NAME}/fleet.tsv" "${PACKAGE_NAME}/autoscale.example.json"
+cmp "${ROOT_DIR}/fleet.example.tsv" "${public_root}/${PACKAGE_NAME}/fleet.tsv"
+cmp "${ROOT_DIR}/autoscale.example.json" "${public_root}/${PACKAGE_NAME}/autoscale.example.json"
+if tar -tzf "${temp_dir}/public-dist/${PACKAGE_NAME}.tar.gz" | \
+  grep -E '/(autoscale\.json|\.autoscale[^/]*)(/|$)' >/dev/null; then
+  echo "public package contains private autoscaler configuration or state"
+  exit 1
+fi

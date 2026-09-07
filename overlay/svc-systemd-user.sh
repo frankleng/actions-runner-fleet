@@ -3,7 +3,14 @@
 set -euo pipefail
 
 RUNNER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "${RUNNER_ROOT}" in
+  *[!a-zA-Z0-9_./:@+-]*) echo "Unsupported service path: whitespace or shell/XML special characters" >&2; exit 1 ;;
+esac
 RUNNER_METADATA_PATH="${RUNNER_ROOT}/.runner"
+# Slot identity survives the ephemeral runner's automatic deregistration.
+if [ -f "${RUNNER_ROOT}/.autoscale-slot.json" ]; then
+  RUNNER_METADATA_PATH="${RUNNER_ROOT}/.autoscale-slot.json"
+fi
 SVC_CMD="${1:-status}"
 SYSTEMCTL_BIN="${RUNNER_SYSTEMCTL_BIN:-systemctl}"
 LOGINCTL_BIN="${RUNNER_LOGINCTL_BIN:-loginctl}"
@@ -89,6 +96,10 @@ read_cpu_quota_percent() {
     value="$(tr -d '[:space:]' < "${CPU_QUOTA_PATH}")"
   fi
 
+  if [ "${value}" -gt "${MAX_CPU_QUOTA_PERCENT}" ] 2>/dev/null; then
+    echo "Saved CPU quota exceeds current CPU capacity; using the host ceiling" >&2
+    value="${MAX_CPU_QUOTA_PERCENT}"
+  fi
   validate_cpu_quota_percent "${value}"
   printf '%s\n' "${value}"
 }
@@ -105,6 +116,9 @@ render_service_unit() {
   local cpu_quota_percent
 
   [ -f "${TEMPLATE_PATH}" ] || fail "service template missing: ${TEMPLATE_PATH}"
+  case "${RUNNER_NAME}:${RUNNER_ROOT}" in
+    *[!a-zA-Z0-9_./:@+-]*) fail "Unsupported service identity or path" ;;
+  esac
   cpu_quota_percent="$(read_cpu_quota_percent)"
   mkdir -p "${UNIT_DIR}"
   sed \
@@ -166,6 +180,11 @@ status_service() {
   echo
   if "${SYSTEMCTL_BIN}" --user is-active --quiet "${UNIT_NAME}"; then
     pid="$("${SYSTEMCTL_BIN}" --user show -p MainPID --value "${UNIT_NAME}")"
+    local control_group
+    control_group="$("${SYSTEMCTL_BIN}" --user show -p ControlGroup --value "${UNIT_NAME}")"
+    if [[ "${control_group}" == /* ]] && [ -r "/sys/fs/cgroup${control_group}/cpu.max" ]; then
+      printf 'Live CPU quota: %s\n' "$(cat "/sys/fs/cgroup${control_group}/cpu.max")"
+    fi
     echo "Started:"
     printf '%s 0 %s\n' "${pid}" "${SVC_NAME}"
   else
@@ -182,7 +201,9 @@ set_cpu_limit() {
 
   if [ -f "${UNIT_PATH}" ]; then
     render_service_unit
-    "${SYSTEMCTL_BIN}" --user daemon-reload
+    if [ "${2:-}" != "--defer-reload" ]; then
+      "${SYSTEMCTL_BIN}" --user daemon-reload
+    fi
     apply_live_cpu_quota "${cpu_quota_percent}"
   fi
 
@@ -194,7 +215,7 @@ case "${SVC_CMD}" in
   start) [ -f "${UNIT_PATH}" ] || install_service; "${SYSTEMCTL_BIN}" --user start "${UNIT_NAME}"; status_service ;;
   stop) "${SYSTEMCTL_BIN}" --user stop "${UNIT_NAME}" 2>/dev/null || true; status_service ;;
   status) status_service ;;
-  set-cpu-limit) set_cpu_limit "${2:-}" ;;
+  set-cpu-limit) set_cpu_limit "${2:-}" "${3:-}" ;;
   uninstall) "${SYSTEMCTL_BIN}" --user disable --now "${UNIT_NAME}" 2>/dev/null || true; rm -f "${UNIT_PATH}" "${CONFIG_PATH}"; "${SYSTEMCTL_BIN}" --user daemon-reload ;;
   prune-logs)
     find "${RUNNER_ROOT}/_diag" -type f -mtime "+${RUNNER_LOG_RETENTION_DAYS:-7}" -delete 2>/dev/null || true

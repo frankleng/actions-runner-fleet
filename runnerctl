@@ -12,15 +12,21 @@ fi
 
 NODE_BIN="${RUNNERCTL_NODE_BIN:-}"
 
-if [ -z "${NODE_BIN}" ] && command -v node >/dev/null 2>&1; then
-  NODE_BIN="$(command -v node)"
+node_is_supported() {
+  [ -x "$1" ] && "$1" -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)' >/dev/null 2>&1
+}
+if [ -n "${NODE_BIN}" ] && ! node_is_supported "${NODE_BIN}"; then
+  echo "RUNNERCTL_NODE_BIN must select Node.js 24 or newer" >&2
+  exit 1
 fi
-
 if [ -z "${NODE_BIN}" ]; then
   NODE_BIN="${SCRIPT_DIR}/host-tools/node24/bin/node"
+  if ! node_is_supported "${NODE_BIN}" && command -v node >/dev/null 2>&1 && node_is_supported "$(command -v node)"; then
+    NODE_BIN="$(command -v node)"
+  fi
 fi
 
-if [ ! -x "${NODE_BIN}" ]; then
+if ! node_is_supported "${NODE_BIN}"; then
   ARCHIVE_PATH="${RUNNER_ARCHIVE_PATH:-${SCRIPT_DIR}/${RUNNER_ARCHIVE_BASENAME}}"
   if [ ! -f "${ARCHIVE_PATH}" ]; then
     echo "Node.js is unavailable and the bundled runner archive was not found: ${ARCHIVE_PATH}" >&2
@@ -34,6 +40,11 @@ if [ ! -x "${NODE_BIN}" ]; then
   mkdir -p "$(dirname "${NODE_BIN}")"
   mv "${TEMP_DIR}/externals/node24/bin/node" "${NODE_BIN}"
   chmod u+x "${NODE_BIN}"
+fi
+
+if [ "${1:-}" = "autoscale" ]; then
+  shift
+  exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-autoscale.mjs" "$@"
 fi
 
 METRICS_SOURCE="${SCRIPT_DIR}/runnerctl-app/native/runnerctl-procstats.c"

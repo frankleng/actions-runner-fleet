@@ -3,7 +3,14 @@
 set -euo pipefail
 
 RUNNER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "${RUNNER_ROOT}" in
+  *[!a-zA-Z0-9_./:@+-]*) echo "Unsupported service path: whitespace or shell/XML special characters" >&2; exit 1 ;;
+esac
 RUNNER_METADATA_PATH="${RUNNER_ROOT}/.runner"
+# Slot identity survives the ephemeral runner's automatic deregistration.
+if [ -f "${RUNNER_ROOT}/.autoscale-slot.json" ]; then
+  RUNNER_METADATA_PATH="${RUNNER_ROOT}/.autoscale-slot.json"
+fi
 SVC_CMD="${1:-status}"
 RUNNER_LAUNCHCTL_BIN="${RUNNER_LAUNCHCTL_BIN:-launchctl}"
 RUNNER_PGREP_BIN="${RUNNER_PGREP_BIN:-pgrep}"
@@ -124,6 +131,10 @@ read_cpu_quota_percent() {
     value="$(tr -d '[:space:]' < "${CPU_QUOTA_PATH}")"
   fi
 
+  if [ "${value}" -gt "${MAX_CPU_QUOTA_PERCENT}" ] 2>/dev/null; then
+    echo "Saved CPU quota exceeds current CPU capacity; using the host ceiling" >&2
+    value="${MAX_CPU_QUOTA_PERCENT}"
+  fi
   validate_cpu_quota_percent "${value}"
   printf '%s\n' "${value}"
 }
@@ -207,6 +218,10 @@ render_plist() {
     failed "service template not found at ${TEMPLATE_PATH}"
   fi
 
+  local value
+  for value in "${PLIST_PATH}" "${SVC_NAME}" "${RUNNER_LAUNCHD_USER}" "${RUNNER_ROOT}" "${HOME}" "${TMPDIR}" "${RUNNER_TEMP}" "${RUNNER_TOOL_CACHE}" "${PNPM_HOME}" "${COREPACK_HOME}" "${PULUMI_HOME}" "${PATH}"; do
+    case "${value}" in *[!a-zA-Z0-9_./:@+-]*) failed "Unsupported runtime path for service template" ;; esac
+  done
   mkdir -p "${LAUNCH_PATH}" "${RUNNER_LOG_DIR}"
 
   sed \
@@ -258,7 +273,7 @@ status() {
 
   status_out="$(
     "${RUNNER_LAUNCHCTL_BIN}" list 2>/dev/null |
-      awk -v service_name="${SVC_NAME}" '$3 == service_name { print }' ||
+      awk -v service_name="${SVC_NAME}" '$3 == service_name && $1 ~ /^[0-9]+$/ && $1 > 0 { print }' ||
       true
   )"
   if [ -n "${status_out}" ]; then
@@ -276,7 +291,7 @@ set_cpu_limit() {
 
   validate_cpu_quota_percent "${cpu_quota_percent}"
   persist_cpu_quota_percent "${cpu_quota_percent}"
-  echo "CPU limit for ${RUNNER_NAME}: ${cpu_quota_percent}% (applies after the next service restart)"
+  echo "CPU limit for ${RUNNER_NAME}: ${cpu_quota_percent}% (running wrappers reload within one second)"
 }
 
 start() {
@@ -285,7 +300,14 @@ start() {
   fi
 
   echo "starting ${SVC_NAME}"
-  "${RUNNER_LAUNCHCTL_BIN}" load -w "${PLIST_PATH}" || failed "failed to load ${PLIST_PATH}"
+  local domain="gui/$(id -u)"
+  "${RUNNER_LAUNCHCTL_BIN}" enable "${domain}/${SVC_NAME}" || failed "failed to enable service"
+  if "${RUNNER_LAUNCHCTL_BIN}" list | awk -v name="${SVC_NAME}" '$3 == name { found=1 } END { exit !found }'; then
+    # No -k: never kill an already running listener.
+    "${RUNNER_LAUNCHCTL_BIN}" kickstart "${domain}/${SVC_NAME}" || failed "failed to start loaded service"
+  else
+    "${RUNNER_LAUNCHCTL_BIN}" bootstrap "${domain}" "${PLIST_PATH}" || failed "failed to load service"
+  fi
   status
 }
 

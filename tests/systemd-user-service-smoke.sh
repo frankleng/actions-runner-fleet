@@ -96,3 +96,9 @@ if RUNNER_SERVICE_MANAGER_OVERRIDE=systemd-user RUNNER_REGISTRY_PATH="${registry
   exit 1
 fi
 grep -Fq "between 1% and 600% (6 logical CPUs available)" "${temp_dir}/manage-quota.err"
+
+# Downsizing the host must not make a saved, formerly valid quota hide service status.
+printf '999999\n' > "${runner_dir}/.cpu-quota"
+resized_status="$(RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" status 2>"${temp_dir}/resize.err")"
+printf '%s\n' "${resized_status}" | grep -q 'CPU limit: 600%'
+grep -q 'host ceiling' "${temp_dir}/resize.err"

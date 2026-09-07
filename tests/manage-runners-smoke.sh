@@ -43,7 +43,9 @@ state_path="${RUNNER_TEST_LAUNCHCTL_STATE:?}"
 command="${1:-}"
 shift || true
 case "${command}" in
-  load)
+  enable|kickstart) exit 0 ;;
+  load|bootstrap)
+    if [ "${command}" = bootstrap ]; then shift; fi
     if [ "${1:-}" = "-w" ]; then
       shift
     fi

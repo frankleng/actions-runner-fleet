@@ -11,6 +11,12 @@ credentials**. Runner registration tokens, generated runner credentials,
 workspaces, logs, caches, environment snapshots, keychains, and downloaded
 tools are never committed.
 
+Autoscaling is the default deployment path. After preparing the kit, edit the
+ignored `autoscale.json` for your account and run `./runnerctl autoscale --prepare`.
+Slot setup enables and starts the background controller automatically. It starts
+at boot on Linux (with login lingering) or login on macOS. See
+[automatic scaling](#automatic-runner-and-cpu-scaling) for configuration.
+
 ## What gets installed
 
 - GitHub Actions Runner `2.336.0` for Linux x64 or macOS arm64, verified by SHA-256
@@ -93,8 +99,10 @@ Replace `YOUR_GITHUB_OWNER` with the GitHub user or organization that owns the
 private repository.
 
 `prepare.sh` verifies the host, downloads the pinned official runner archive,
-checks its SHA-256, installs the dashboard dependency, and creates an ignored
-`fleet.tsv` from `fleet.example.tsv`.
+checks its SHA-256, installs the dashboard dependency, and creates ignored
+`fleet.tsv` and `autoscale.json` examples. Edit `autoscale.json` and run
+`./runnerctl autoscale --prepare` to start the default autoscaled deployment.
+The registration instructions below also support manually managed persistent fleets.
 
 ## Choose the GitHub registration scope
 
@@ -132,7 +140,7 @@ because workflows from forks of a public repository can run untrusted code on
 the runner machine. See
 [GitHub's self-hosted runner setup guide](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners).
 
-## Configure your fleet
+## Configure a manually managed persistent fleet
 
 Edit `fleet.tsv`. It is tab-delimited with three columns:
 
@@ -392,8 +400,8 @@ runners can still use otherwise-idle CPU up to their configured quota.
 
 In the dashboard, select a runner and press `c` to view or change its limit up
 to the host's full available capacity. The change is persisted in the runner
-directory for future starts. Linux applies it live; macOS applies it at the
-next service restart so an in-progress job is never interrupted. The
+directory for future starts. Linux applies it live; updated macOS wrappers reload the limiter within one
+second without restarting the listener. The
 equivalent command is:
 
 ```bash
@@ -422,6 +430,181 @@ For unattended setup, pass an explicit target URL and
 `RUNNER_REGISTRATION_TOKEN`. Use `--replace-existing` only when deliberately
 moving a same-name runner.
 
+## Automatic runner and CPU scaling
+
+`runnerctl autoscale` manages a pool of **ephemeral runner slots** on Linux or
+macOS. Each slot has its own provisioned directory and user service. The
+controller obtains a fresh GitHub registration when capacity is needed. The
+runner accepts one job, finishes it, deregisters itself, and exits. Its local
+service then parks until the controller supplies another fresh registration.
+Scaling down means withholding replacement registrations; **the controller
+never stops or signals a listener to reduce capacity**.
+
+After `./prepare.sh`, copy the public template into ignored local configuration:
+
+```bash
+test -f autoscale.json || cp autoscale.example.json autoscale.json
+chmod 600 autoscale.json
+```
+
+Edit `target`, `repositories`, `labels`, and `runnerGroupId` to match
+your account. Slot names are generated from hardware capacity by default;
+you can supply a `runners` list to use specific **new runner names**. The controller refuses
+existing persistent runners and never converts, deregisters, or stops them.
+For a personal repository, use `"scope": "repository"` and
+`"target": "YOUR_USER/YOUR_REPOSITORY"`. For an organization, use
+`"scope": "organization"` and `"target": "YOUR_ORGANIZATION"`. The template
+uses Linux x64 labels; change them to your workflow's labels on macOS.
+`runnerGroupId` must be the numeric GitHub runner group ID for the target;
+confirm it in your GitHub configuration rather than assuming the example ID.
+Every slot in a pool uses the same labels and group.
+
+For an existing machine, `baselineRunners` can list already registered
+persistent runners in its local registry. Their active count and busy jobs
+count toward the same total limits, and they share the CPU budget. They are
+never started, stopped, converted, or deregistered by the controller. For
+example, six baseline runners plus ten ephemeral slots provide a total range
+of 6–16 without interrupting the existing fleet. The baseline count cannot
+exceed `minRunners`; `runners` contains only the additional ephemeral slots.
+New deployments use an empty baseline list.
+
+Prepare the local slots and enable the background autoscaler:
+
+```bash
+./runnerctl autoscale --prepare
+```
+
+This clones the downloaded runner image, provisions shared tooling and local
+job hooks, and installs each slot's user service. Once preparation completes, it enables
+and starts the background controller, which registers listeners as needed.
+Use `--prepare --no-enable` for preparation without activation. Existing matching slots are
+left alone, so setup can resume after provisioning additional names. A failed
+local provisioning step may require `./runnerctl --cli install-service NAME`
+to complete installation. Run the controller as the user that owns these
+services. Keep the kit and runner software up to date between generations;
+automatic in-job runner updates are disabled for this pool.
+
+Authenticate `gh` for `github.com`, or provide a token through the
+`RUNNER_AUTOSCALE_TOKEN` environment variable using your secret manager.
+Explicit `--dry-run` preview needs **Actions: read** on every selected repository and
+**Self-hosted runners: read** for an organization pool, or **Administration:
+read** for a repository pool. Default autoscaling needs **Self-hosted runners:
+write** or **Administration: write**, respectively, to generate ephemeral
+registrations. Organization approval/SSO policies still apply. Short-lived
+registration tokens alone cannot monitor queues or create JIT configurations.
+
+```bash
+./runnerctl autoscale --prepare          # Prepare and enable background autoscaling (default)
+./runnerctl autoscale --dry-run          # Preview one poll without changes
+./runnerctl autoscale --dry-run --watch  # Continuously preview
+./runnerctl autoscale                   # Apply continuously in the foreground
+./runnerctl autoscale --once            # Apply one poll
+./runnerctl autoscale --enable          # Enable/start background autoscaling
+./runnerctl autoscale --disable         # Disable controller; current jobs finish
+```
+
+Use `--config /path/to/private-config.json` for configuration outside the
+checkout. Setup installs a systemd user service on Linux or a launchd agent
+on macOS. It uses that user's `gh` credential store; tokens are never copied
+into the generated service definition. A token provided only in a foreground
+shell is not inherited by the installed background service. Do not run a
+second foreground controller while the background controller is enabled.
+Keep tokens out of command lines, service unit files, and configuration files.
+Only one preparing/applying controller can run per checkout. Do not manage
+the same slots from multiple checkouts. Avoid manual service stops or
+`reconcile-all` while jobs are running; those are administrative operations,
+not part of the autoscaler's retirement path.
+
+Only explicitly listed repositories are polled. No organization-wide
+repository discovery occurs. Every selected repository must have access to
+the configured runner group. Enterprise-scoped runners and GitHub Enterprise
+Server are not supported by this controller yet.
+
+The template derives capacity from the host. The maximum is the smaller of
+one runner per two logical CPUs and one runner per 4 GiB of usable memory,
+reserving the larger of 2 GiB or 20% of total RAM for the host. A minimum of
+one runner is allowed on small machines. The warm minimum is one quarter of
+that maximum (rounded down, at least one). These are sizing heuristics;
+explicit numeric bounds remain available for workloads with different needs.
+Existing baseline runners raise the effective minimum because they are never
+stopped by the autoscaler. An explicit slot list caps automatic capacity at
+the number of available slots. Omit `runners` to generate enough
+`ci-ephemeral-N` slot names automatically during preparation.
+Demand is busy pool members plus matching queued jobs, accounting for
+already-idle listeners. The controller inspects jobs in active workflow runs,
+including workflows with another job already running. All requested labels
+must match the pool. Counts remain estimates: GitHub's jobs API does not
+expose all runner-group and dependency eligibility information, and other
+hosts can claim queued jobs first.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `minRunners` / `maxRunners` | `auto` / `auto` | Derived from CPU and RAM; numeric values override sizing |
+| `intervalSeconds` | 60 | Delay between polls; minimum 15 seconds |
+| `cooldownSeconds` | 120 | Delay between capacity increases; replacements up to granted capacity can start each poll |
+| `lowLoad` / `highLoad` | 0.6 / 1.0 | One-minute load average divided by available logical CPUs |
+| `minFreeMemoryPercent` | 10 | Block growth and reduce CPU budget below this available-memory level |
+| `cpuBudgetPercent` | 80 | Normal pool CPU budget as a percentage of host CPU capacity |
+| `pressureCpuBudgetPercent` | 30 | Pool CPU budget under host pressure |
+| `minCpuQuotaPercent` / `maxCpuQuotaPercent` | 25 / 800 | Per-runner quota bounds; 100% means one logical CPU |
+
+Under pressure, the controller divides the reduced CPU budget among active
+listeners. It restores the normal budget and permits growth below the low
+load threshold when memory is available. Between thresholds, it retains the
+previous pressure state. The minimum count remains a floor under pressure.
+A minimum per-runner quota can make the total exceed the pool budget; these
+are policy targets, not an aggregate cgroup limit. On a 16-CPU host with 16
+active listeners, the defaults allow each 80% of one CPU normally and 30%
+under pressure.
+
+Retirement happens at job completion, not on a timer. A runner already
+listening for its first job remains available until it gets and finishes that
+job, even if demand falls meanwhile. It is never killed based on an idle
+snapshot. Parked services are small local supervisors with no job listener or
+active GitHub registration. Minimum capacity is replenished at the next
+successful poll, so a short gap after simultaneous completions is expected.
+
+Linux CPU quotas cover service processes and their children; Docker
+daemon-owned containers require their own resource limits. macOS uses the
+kit's existing process CPU limiter, which is best effort. Load average includes
+waiting work, and free-memory measurements are conservative. Tune thresholds
+after observing your host. Polling costs grow with repositories and active
+runs.
+
+The controller reads local handoff, in-flight, and completion state to track
+slot lifecycles. A missing or stale GitHub runner row never authorizes process
+termination. Local host monitoring and CPU adjustments run before GitHub requests and continue
+even when GitHub authentication or queue monitoring fails. API failures leave
+runner counts alone; local
+operation failures can leave earlier operations in that poll applied. Failed
+listeners are parked as blocked and their consumed credentials are never
+replayed, including after a supervisor restart. An ambiguous registration
+request leaves a reservation requiring local recovery; definite HTTP
+rejections permit a fresh attempt on a later poll. Inspect local `_diag` logs and lifecycle files,
+confirm no job/listener remains, and resolve any orphan GitHub registration
+before removing failed-generation state. Never remove an in-flight file or
+worker lock while its process is alive.
+
+Output contains aggregate counts and host load only. It omits account,
+repository, runner, and job names, credentials, and raw error responses. JIT
+credentials are validated for target, name, ephemeral mode, and allowed file
+paths, then handed to the local service through owner-only files. Neither the
+controller's token nor JIT credentials appear in listener arguments or the
+service environment. `autoscale.json` and `.autoscale*` state are ignored by
+Git and rejected by the security audit and package builder. The public package
+contains only the example configuration and program source. Slots reuse
+local tooling/workspaces; ephemeral registration does not make a new VM or
+create a security boundary between jobs sharing an OS account.
+
+Ctrl-C exits the controller while current jobs finish normally. It leaves
+current quotas and parked services in place. The service restarts after controller failures. Kernel-owned locks release
+automatically when their controller or worker exits. Interrupted generations
+remain protected against credential replay.
+
+API references: [workflow runs](https://docs.github.com/en/rest/actions/workflow-runs),
+[workflow jobs](https://docs.github.com/en/rest/actions/workflow-jobs), and
+[JIT runner configuration](https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-an-organization).
+
 ## Security model
 
 The root `.gitignore` ignores everything by default and allowlists only source
@@ -429,7 +612,7 @@ files. In particular, Git never tracks:
 
 - `.credentials`, `.credentials_rsaparams`, `.runner`, `.env`, or `.path`
 - `.runners/`, including every default runner installation
-- `runners.tsv` or the local `fleet.tsv`
+- `runners.tsv`, the local `fleet.tsv`, `autoscale.json`, or `.autoscale*` lifecycle files
 - `_work`, `_diag`, downloaded tools, runner binaries, or archives
 - Signing certificates, provisioning profiles, private keys, or packages
 
@@ -452,16 +635,17 @@ Always register fresh runners on the destination machine.
 
 ## Build a transfer archive
 
-After `./prepare.sh` and after customizing `fleet.tsv`:
+After `./prepare.sh`, build a public distributable with placeholder configuration:
 
 ```bash
 ./build-portable-package.sh
 ```
 
-For a generic distributable that contains the placeholder manifest:
+For a private host migration, explicitly include your local fleet manifest.
+This archive contains your target URLs and runner names; keep it private:
 
 ```bash
-RUNNER_FLEET_PATH='./fleet.example.tsv' \
+RUNNER_FLEET_PATH='./fleet.tsv' \
   ./build-portable-package.sh
 ```
 
@@ -506,3 +690,22 @@ pnpm --dir runnerctl-app test
   prefix to a larger volume before registration.
 - **Apple build commands missing:** install/select full Xcode, accept its
   license, and install CocoaPods before running Apple build workflows.
+
+Autoscaling recovery and portability notes:
+
+- Config changes are validated each poll. Invalid edits keep the last valid settings and produce an aggregate diagnostic. To provision additional slots, run `./runnerctl autoscale --disable`, edit the config, then `./runnerctl autoscale --prepare`. Disabling the controller does not stop runner services.
+- One unavailable slot reserves capacity conservatively and receives no commands; healthy slots keep CPU control and can accept fresh registrations. HTTP registration rejections (400, 401, 403, 404, 422, 429) release their reservation for retry. Network failures, conflicts, and ambiguous server outcomes remain blocked for inspection.
+- Current controllers and workers use kernel-owned loopback TCP locks, released automatically after a crash. Locks serve no protocol and contain no credentials. A deterministic port collision fails closed with a lock diagnostic. Legacy live PID locks are honored during upgrades. An interrupted generation remains blocked even after its lock is recovered; never replay its credentials.
+- CPU quotas include idle listeners because any listener can accept work between polls. Dividing only by a stale busy count could exceed the host budget. Linux quota updates are batched for service-manager reloads. Available memory comes from Linux `MemAvailable` or macOS `memory_pressure -Q`; unavailable metrics conservatively block growth. macOS controller logs are bounded to approximately 1 MiB between polls.
+- Use Node.js 24 or newer. The launcher prefers its bundled runtime and validates an explicit override. For a proxy, configure `HTTPS_PROXY`/`NO_PROXY` and `NODE_USE_ENV_PROXY=1` in the controller's private service environment (or foreground shell). These settings are not copied into the generated public service template; provisioning inherits only the explicit proxy/certificate variables, not GitHub tokens. Keep proxy credentials in an owner-only service environment file, outside Git.
+- Public packages copy an explicit source allowlist and install dependencies in clean staging with `pnpm --frozen-lockfile --ignore-scripts`. Building requires pnpm and registry access or a populated package cache. Local dependency trees and unrelated files under source directories are excluded. New public source files must be added explicitly to `.gitignore` and, when shipped, the packaging allowlist.
+- Supported targets are Linux x64 and Apple-silicon macOS, not arbitrary operating systems. macOS runtime changes require native validation on a Mac. Updating a worker script on disk takes effect when its parked supervisor is safely restarted; never restart a service that may own a job merely to deploy an update.
+
+Final review recovery details:
+
+- `--prepare` saves generated runner names into the private configuration before provisioning. Subsequent hardware changes adjust bounds while retaining every managed slot. To add capacity after a resize, disable the controller, add new slot names, and rerun preparation. Bare monitoring requires preparation first when no explicit slot list exists.
+- A local start or handoff failure quarantines that slot for the controller process lifetime and allows later healthy slots to start. Repair the local service, inspect ambiguous lifecycle state, and restart only the controller to retry. Registration API failures retain their separate ambiguity rules.
+- A reboot can interrupt even an idle ephemeral listener. Its registration may remain offline at GitHub and the local slot stays blocked. Inspect the slot's private diagnostics, confirm no listener/job remains, resolve the orphan registration, and only then remove failed-generation state before restarting that slot. Never reuse its consumed credentials.
+- Runner service templates require kit, runner, and runtime paths without whitespace or shell/XML special characters. Use a simple path such as `/srv/runner-fleet` or `$HOME/runner-fleet`; unsupported paths are rejected before service provisioning. Controller-only paths are escaped independently.
+
+macOS services target the logged-in user’s launchd GUI domain. A headless SSH session without a GUI login is not sufficient for starting these agents. Template updates require a safe service reload after its generation finishes; `kickstart` alone does not reload a changed plist.

@@ -23,7 +23,7 @@ Usage:
   ./prepare.sh --check
 
 Downloads and verifies the pinned GitHub Actions runner, installs the dashboard
-dependency, and creates an ignored fleet.tsv from fleet.example.tsv.
+dependency, and creates ignored fleet.tsv and autoscale.json examples.
 EOF
 }
 
@@ -151,5 +151,10 @@ if [ ! -f "${FLEET_PATH}" ]; then
 fi
 
 echo
+if [ ! -f "${SCRIPT_DIR}/autoscale.json" ]; then
+  (umask 077; cp "${SCRIPT_DIR}/autoscale.example.json" "${SCRIPT_DIR}/autoscale.json")
+  chmod 600 "${SCRIPT_DIR}/autoscale.json"
+fi
 echo "preparation complete"
-echo "next: edit ${FLEET_PATH}, then run ./restore-fleet.sh --check"
+echo "next: edit autoscale.json for your account, then run ./runnerctl autoscale --prepare"
+echo "autoscaling is enabled automatically after slot preparation"

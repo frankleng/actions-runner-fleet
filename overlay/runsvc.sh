@@ -97,6 +97,10 @@ read_cpu_quota_percent() {
     exit 1
   }
 
+  if [ "$(uname -s)" = Darwin ]; then
+    local maximum_percent="$(( $(sysctl -n hw.ncpu) * 100 ))"
+    if [ "${cpu_quota_percent}" -gt "${maximum_percent}" ]; then cpu_quota_percent="${maximum_percent}"; fi
+  fi
   printf '%s\n' "${cpu_quota_percent}"
 }
 
@@ -127,26 +131,23 @@ prepare_macos_cpu_limiter() {
 start_macos_cpu_limiter() {
   [ -n "${MACOS_CPU_QUOTA_PERCENT}" ] || return 0
 
-  "${RUNNER_CPULIMIT_BIN}" \
-    --limit "${MACOS_CPU_QUOTA_PERCENT}" \
-    --include-children \
-    --pid "${PID}" &
-  CPULIMIT_PID=$!
-  sleep 0.1
-  if ! process_is_active "${CPULIMIT_PID}"; then
-    echo "macOS CPU limiter failed to attach; stopping the runner listener" >&2
-    kill -INT "${PID}" 2>/dev/null || true
-    wait "${PID}" 2>/dev/null || true
-    wait "${CPULIMIT_PID}" 2>/dev/null || true
-    PID=""
-    CPULIMIT_PID=""
-    return 1
-  fi
-
   (
+    trap 'if [ -n "${CPULIMIT_PID}" ]; then kill "${CPULIMIT_PID}" 2>/dev/null || true; wait "${CPULIMIT_PID}" 2>/dev/null || true; fi' EXIT
+    trap 'exit 0' TERM INT
     while process_is_active "${PID}"; do
+      next_quota="$(read_cpu_quota_percent)" || next_quota="${MACOS_CPU_QUOTA_PERCENT}"
+      if [ -z "${CPULIMIT_PID}" ] || [ "${next_quota}" != "${MACOS_CPU_QUOTA_PERCENT}" ]; then
+        if [ -n "${CPULIMIT_PID}" ]; then
+          kill "${CPULIMIT_PID}" 2>/dev/null || true
+          wait "${CPULIMIT_PID}" 2>/dev/null || true
+        fi
+        MACOS_CPU_QUOTA_PERCENT="${next_quota}"
+        "${RUNNER_CPULIMIT_BIN}" --limit "${MACOS_CPU_QUOTA_PERCENT}" --include-children --pid "${PID}" &
+        CPULIMIT_PID=$!
+        sleep 0.1
+      fi
       if ! process_is_active "${CPULIMIT_PID}"; then
-        echo "macOS CPU limiter exited while the runner listener was active; stopping the listener" >&2
+        echo "macOS CPU limiter failed; stopping the listener" >&2
         kill -INT "${PID}" 2>/dev/null || true
         exit 1
       fi
@@ -189,7 +190,11 @@ start_log_pruner
 
 nodever="node20"
 
-./externals/${nodever}/bin/node ./bin/RunnerService.js &
+if [ -f .autoscale-slot.json ]; then
+  ./externals/node24/bin/node ./bin/autoscale-worker.mjs &
+else
+  ./externals/${nodever}/bin/node ./bin/RunnerService.js &
+fi
 PID=$!
 start_macos_cpu_limiter
 

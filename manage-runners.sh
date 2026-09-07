@@ -18,6 +18,13 @@ RUNNER_STOP_GRACE_SECONDS="${RUNNER_STOP_GRACE_SECONDS:-2}"
 RUNNER_LABELS="${RUNNER_LABELS:-}"
 RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-0}"
 
+validate_service_path() {
+  case "$1" in
+    *[!a-zA-Z0-9_./:@+-]*) echo "Unsupported service path: use simple paths without whitespace or shell/XML special characters" >&2; exit 1 ;;
+  esac
+}
+validate_service_path "${ROOT_DIR}"
+
 detect_available_cpu_count() {
   local cpu_count=""
   local nproc_bin="${RUNNER_NPROC_BIN:-nproc}"
@@ -69,6 +76,7 @@ Usage:
   ./${SELF_NAME} track <name> <runner_dir>
   ./${SELF_NAME} reconcile <name>
   ./${SELF_NAME} reconcile-all
+  ./${SELF_NAME} prepare-autoscale <name> <target_url>
   ./${SELF_NAME} register <name> <token> <target_url> [runner_dir]
   ./${SELF_NAME} install-service <name>
   ./${SELF_NAME} start <name>
@@ -188,6 +196,7 @@ require_overlay() {
 copy_overlay() {
   local runner_dir="$1"
 
+  validate_service_path "${runner_dir}"
   require_overlay
   mkdir -p "${runner_dir}/bin" "${runner_dir}/job-hooks"
   printf '%s\n' "${ROOT_DIR}" > "${runner_dir}/.kit-root"
@@ -198,6 +207,8 @@ copy_overlay() {
     cp "${OVERLAY_DIR}/svc.sh" "${runner_dir}/svc.sh"
   fi
   cp "${OVERLAY_DIR}/runsvc.sh" "${runner_dir}/bin/runsvc.sh"
+  cp "${OVERLAY_DIR}/autoscale-lock.mjs" "${runner_dir}/bin/autoscale-lock.mjs"
+  cp "${OVERLAY_DIR}/autoscale-worker.mjs" "${runner_dir}/bin/autoscale-worker.mjs"
   cp "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-started.sh"
   cp "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
   chmod u+x "${runner_dir}/job-hooks/runner-job-started.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
@@ -236,7 +247,7 @@ reconcile_runner_dir() {
     exit 1
   fi
 
-  if [ ! -f "${runner_dir}/.runner" ]; then
+  if [ ! -f "${runner_dir}/.runner" ] && [ ! -f "${runner_dir}/.autoscale-slot.json" ]; then
     echo "runner metadata not found in ${runner_dir}/.runner" >&2
     exit 1
   fi
@@ -401,11 +412,33 @@ clone_runner_image() {
   cp -Rp "${IMAGE_DIR}/." "${runner_dir}/"
 }
 
+# Provision a new, unregistered slot. Never convert or replace an existing runner.
+prepare_autoscale_slot() {
+  local name="$1" url="$2" runner_dir
+  [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "invalid slot name" >&2; exit 1; }
+  local scope
+  scope="$(github_runner_scope_from_url "${url}")"
+  [ "${scope}" != "enterprise" ] || { echo "autoscaling does not support enterprise scope" >&2; exit 1; }
+  ensure_registry
+  [ -z "$(runner_dir_for_name "${name}")" ] || { echo "slot name is already tracked" >&2; exit 1; }
+  runner_dir="$(default_runner_dir "${name}")"
+  [ ! -e "${runner_dir}" ] || { echo "slot directory already exists" >&2; exit 1; }
+  validate_service_path "${runner_dir}"
+  ensure_runner_image
+  clone_runner_image "${runner_dir}"
+  chmod 700 "${runner_dir}"
+  (umask 077; printf '{"agentName":"%s","gitHubUrl":"%s","version":1}\n' "${name}" "${url}" > "${runner_dir}/.autoscale-slot.json")
+  track_runner "${name}" "${runner_dir}"
+  reconcile_runner_dir "${runner_dir}"
+  touch "${runner_dir}/.autoscale-prepared"
+}
+
 register_runner() {
   local name="$1"
   local token="$2"
   local url="${3:-${DEFAULT_URL}}"
   local runner_dir="${4:-$(default_runner_dir "${name}")}"
+  validate_service_path "${runner_dir}"
 
   case "${RUNNER_NO_DEFAULT_LABELS}" in
     0) ;;
@@ -446,6 +479,7 @@ register_runner() {
     exit 1
   fi
 
+  validate_service_path "${runner_dir}"
   ensure_runner_image
   clone_runner_image "${runner_dir}"
 
@@ -566,6 +600,10 @@ case "${1:-help}" in
       exit 1
     fi
     reconcile_all_runners
+    ;;
+  prepare-autoscale)
+    [ "$#" -eq 3 ] || { usage; exit 1; }
+    prepare_autoscale_slot "$2" "$3"
     ;;
   register)
     if [ "$#" -lt 3 ] || [ "$#" -gt 5 ]; then

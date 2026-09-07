@@ -1,0 +1,25 @@
+{
+  "scope": "organization",
+  "target": "YOUR_ORGANIZATION",
+  "repositories": [
+    "YOUR_ORGANIZATION/YOUR_REPOSITORY"
+  ],
+  "minRunners": "auto",
+  "maxRunners": "auto",
+  "intervalSeconds": 60,
+  "cooldownSeconds": 120,
+  "lowLoad": 0.6,
+  "highLoad": 1,
+  "minFreeMemoryPercent": 10,
+  "cpuBudgetPercent": 80,
+  "pressureCpuBudgetPercent": 30,
+  "minCpuQuotaPercent": 25,
+  "maxCpuQuotaPercent": 800,
+  "labels": [
+    "self-hosted",
+    "Linux",
+    "X64"
+  ],
+  "runnerGroupId": 1,
+  "baselineRunners": []
+}

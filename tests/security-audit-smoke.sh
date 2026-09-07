@@ -22,6 +22,23 @@ chmod +x "${temp_dir}/security-audit.sh"
   git add security-audit.sh source.txt
   ./security-audit.sh >/dev/null
 
+  printf '%s\n' '{}' > autoscale.json
+  git add autoscale.json
+  if ./security-audit.sh >audit.err 2>&1; then
+    echo "expected security audit to reject local autoscaler configuration"
+    exit 1
+  fi
+  grep -Fq "machine-local or credential-bearing path" audit.err
+  git rm --cached -q autoscale.json
+  printf '%s\n' '{}' > .autoscale-inflight.json
+  git add .autoscale-inflight.json
+  if ./security-audit.sh >audit.err 2>&1; then
+    echo "expected security audit to reject ephemeral credentials"
+    exit 1
+  fi
+  grep -Fq "machine-local or credential-bearing path" audit.err
+  git rm --cached -q .autoscale-inflight.json
+
   {
     printf '%s\n' "# intentionally fake credential-shaped test data"
     printf '%s%s\n' 'github_pat_' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'

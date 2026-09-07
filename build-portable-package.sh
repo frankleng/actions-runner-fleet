@@ -7,7 +7,7 @@ source "${ROOT_DIR}/platform.sh"
 OUTPUT_DIR="${1:-${ROOT_DIR}/dist}"
 RUNNER_ARCHIVE_NAME="${RUNNER_ARCHIVE_BASENAME}"
 RUNNER_ARCHIVE_PATH="${ROOT_DIR}/${RUNNER_ARCHIVE_NAME}"
-FLEET_SOURCE_PATH="${RUNNER_FLEET_PATH:-${ROOT_DIR}/fleet.tsv}"
+FLEET_SOURCE_PATH="${RUNNER_FLEET_PATH:-${ROOT_DIR}/fleet.example.tsv}"
 PACKAGE_NAME="actions-runner-fleet-kit-${RUNNER_PLATFORM}-${RUNNER_VERSION}"
 PACKAGE_PATH="${OUTPUT_DIR}/${PACKAGE_NAME}.tar.gz"
 CHECKSUM_PATH="${PACKAGE_PATH}.sha256"
@@ -48,17 +48,42 @@ cp "${ROOT_DIR}/docs/images/runnerctl-dashboard-demo.png" \
 cp "${ROOT_DIR}/docs/images/runnerctl-stats-demo.png" \
   "${package_root}/docs/images/runnerctl-stats-demo.png"
 cp "${FLEET_SOURCE_PATH}" "${package_root}/fleet.tsv"
+cp "${ROOT_DIR}/autoscale.example.json" "${package_root}/autoscale.example.json"
 cp "${ROOT_DIR}/fleet.example.tsv" "${package_root}/fleet.example.tsv"
 cp "${RUNNER_ARCHIVE_PATH}" "${package_root}/${RUNNER_ARCHIVE_NAME}"
-cp -R "${ROOT_DIR}/overlay" "${package_root}/overlay"
-cp -R "${ROOT_DIR}/runnerctl-app/bin" "${package_root}/runnerctl-app/bin"
-cp -R "${ROOT_DIR}/runnerctl-app/lib" "${package_root}/runnerctl-app/lib"
-cp -R "${ROOT_DIR}/runnerctl-app/native" "${package_root}/runnerctl-app/native"
-if [ -d "${ROOT_DIR}/runnerctl-app/node_modules" ]; then
-  cp -R "${ROOT_DIR}/runnerctl-app/node_modules" "${package_root}/runnerctl-app/node_modules"
-fi
+# Deliberate file allowlist: never sweep source directories or local dependencies.
+while IFS= read -r source_file; do
+  [ ! -L "${ROOT_DIR}/${source_file}" ] || fail "source symlinks are not portable"
+  mkdir -p "${package_root}/$(dirname "${source_file}")"
+  cp "${ROOT_DIR}/${source_file}" "${package_root}/${source_file}"
+done <<'PUBLIC_FILES'
+overlay/autoscale-lock.mjs
+overlay/autoscale-worker.mjs
+overlay/bin/actions.runner.plist.template
+overlay/bin/actions.runner.service.template
+overlay/env.sh
+overlay/runner-job-temp.sh
+overlay/runsvc.sh
+overlay/svc-systemd-user.sh
+overlay/svc.sh
+runnerctl-app/bin/runnerctl-autoscale.mjs
+runnerctl-app/bin/runnerctl-dashboard.mjs
+runnerctl-app/bin/runnerctl-stats.mjs
+runnerctl-app/lib/runnerctl-autoscale-service.mjs
+runnerctl-app/lib/runnerctl-autoscale.mjs
+runnerctl-app/lib/runnerctl-core.mjs
+runnerctl-app/lib/runnerctl-metrics.mjs
+runnerctl-app/lib/runnerctl-stats.mjs
+runnerctl-app/lib/runnerctl-table.mjs
+runnerctl-app/native/runnerctl-procstats.c
+PUBLIC_FILES
 cp "${ROOT_DIR}/runnerctl-app/package.json" "${package_root}/runnerctl-app/package.json"
 cp "${ROOT_DIR}/runnerctl-app/pnpm-lock.yaml" "${package_root}/runnerctl-app/pnpm-lock.yaml"
+
+# Install from the lock in an empty staging tree; local node_modules is never copied.
+pnpm --dir "${package_root}/runnerctl-app" install --prod --frozen-lockfile --ignore-scripts >/dev/null
+# pnpm's local store metadata contains build-host paths and is unnecessary at runtime.
+rm -f "${package_root}/runnerctl-app/node_modules/.modules.yaml" "${package_root}/runnerctl-app/node_modules/.pnpm-workspace-state-v1.json"
 
 : > "${package_root}/runners.tsv"
 printf '%s\n' "${RUNNER_VERSION}" > "${package_root}/VERSION"
@@ -77,7 +102,7 @@ chmod u+x \
 
 if find "${package_root}" \
   \( -name '.credentials*' -o -name '.runner*' -o -name '.service' -o \
-     -name '.env' -o -name '.path' -o -name '_work' -o -name '_diag' \) \
+     -name '.autoscale*' -o -name 'autoscale.json' -o -name '.env' -o -name '.path' -o -name '_work' -o -name '_diag' \) \
   -print | grep -q .; then
   fail "package staging contains live runner state"
 fi
@@ -100,7 +125,7 @@ COPYFILE_DISABLE=1 tar -czf "${PACKAGE_PATH}" -C "${temp_dir}" "${PACKAGE_NAME}"
 
 archive_listing="$(tar -tzf "${PACKAGE_PATH}")"
 if printf '%s\n' "${archive_listing}" |
-  grep -E '/(\.credentials[^/]*|\.runner[^/]*|\.service|\.env|\.path|_work|_diag)(/|$)' >/dev/null; then
+  grep -E '/(\.credentials[^/]*|\.runner[^/]*|\.service|\.autoscale[^/]*|autoscale\.json|\.env|\.path|_work|_diag)(/|$)' >/dev/null; then
   fail "built archive contains live runner state"
 fi
 
