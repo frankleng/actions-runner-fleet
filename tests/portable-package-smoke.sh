@@ -60,6 +60,7 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 
 for script_path in \
   "${package_root}/bootstrap.sh" \
+  "${package_root}/configure-host-temp.sh" \
   "${package_root}/restore-fleet.sh" \
   "${package_root}/manage-runners.sh" \
   "${package_root}/provision-runner-tooling.sh" \

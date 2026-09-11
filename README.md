@@ -361,6 +361,30 @@ Useful direct commands are:
 ./manage-runners.sh reconcile-all
 ```
 
+### Disk-backed host temporary storage (Linux)
+
+Before running builds, check the host's `/tmp` filesystem:
+
+```bash
+./configure-host-temp.sh --check
+sudo ./configure-host-temp.sh --apply
+```
+
+Run `--apply` only when the check reports memory-backed storage. It masks
+the vendor systemd `tmp.mount`, making `/tmp` use the underlying root disk
+after the next reboot. It prints the root disk's available space; reserve
+enough for build scratch and caches. A tmpfs size limit is not reserved RAM,
+but files stored there compete with builds for RAM and swap.
+
+The command leaves the active mount and running services intact. Schedule
+the reboot after jobs and other host workloads can stop, and copy any needed
+temporary files to persistent storage first: existing tmpfs contents disappear
+on reboot. Afterwards, rerun `--check` to confirm the backing filesystem.
+Repeated application is safe. Hosts with an explicit `/tmp` entry in
+`/etc/fstab`, a symlinked `/tmp`, or a memory-backed root require separate
+configuration; the command refuses to change them. It does not rewrite a
+local administrator's `tmp.mount` unit.
+
 ### Automatic job temporary cleanup
 
 Managed services set `TMPDIR`, `TMP`, and `TEMP` to the runner's
@@ -381,7 +405,7 @@ which stops, updates, and starts each runner in turn. Run this when jobs are
 idle because reconciliation restarts services.
 The cleanup owns only `tmp/managed-job`; it does not remove old host `/tmp`
 files, other runner temporary files, or shared caches. Tools that hard-code
-`/tmp` must be configured separately. A single job can still exhaust storage
+`/tmp` use the host storage configured above. A single job can still exhaust storage
 before it finishes; this prevents accumulation across jobs.
 
 ### Configure runner CPU limits

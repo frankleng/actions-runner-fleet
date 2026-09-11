@@ -17,6 +17,7 @@
 !autoscale.example.json
 !bootstrap.sh
 !build-portable-package.sh
+!configure-host-temp.sh
 !docs/images/runnerctl-dashboard-demo.png
 !docs/images/runnerctl-stats-demo.png
 !fleet.example.tsv
@@ -60,6 +61,7 @@
 !security_best_practices_report.md
 !tests/autoscale-prepare-smoke.sh
 !tests/bootstrap-smoke.sh
+!tests/host-temp-smoke.sh
 !tests/manage-runners-smoke.sh
 !tests/portable-package-smoke.sh
 !tests/restore-fleet-smoke.sh

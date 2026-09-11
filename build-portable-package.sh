@@ -34,6 +34,7 @@ mkdir -p "${package_root}/runnerctl-app" "${package_root}/patches" "${OUTPUT_DIR
 mkdir -p "${package_root}/docs/images"
 
 cp "${ROOT_DIR}/bootstrap.sh" "${package_root}/bootstrap.sh"
+cp "${ROOT_DIR}/configure-host-temp.sh" "${package_root}/configure-host-temp.sh"
 cp "${ROOT_DIR}/restore-fleet.sh" "${package_root}/restore-fleet.sh"
 cp "${ROOT_DIR}/manage-runners.sh" "${package_root}/manage-runners.sh"
 cp "${ROOT_DIR}/provision-runner-tooling.sh" "${package_root}/provision-runner-tooling.sh"
@@ -89,6 +90,7 @@ rm -f "${package_root}/runnerctl-app/node_modules/.modules.yaml" "${package_root
 printf '%s\n' "${RUNNER_VERSION}" > "${package_root}/VERSION"
 chmod u+x \
   "${package_root}/bootstrap.sh" \
+  "${package_root}/configure-host-temp.sh" \
   "${package_root}/restore-fleet.sh" \
   "${package_root}/manage-runners.sh" \
   "${package_root}/provision-runner-tooling.sh" \
