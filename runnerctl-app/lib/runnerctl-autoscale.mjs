@@ -64,7 +64,14 @@ export function githubClient(token, fetchImpl = fetch) {
   if (!token || /[\r\n]/.test(token)) throw new AutoscaleError('GitHub authentication unavailable');
   const list = async function (endpoint, key) {
     if (!/^\/(repos|orgs)\/[A-Za-z0-9_./?=&-]+$/.test(endpoint)) throw new AutoscaleError('Invalid API endpoint');
-    const all = [];
+    // Lists shift while runners register and retire; restart a torn read rather than drop the poll.
+    for (let attempt = 1; ; attempt++) {
+      try { return await listOnce(endpoint, key); }
+      catch (error) { if (!error.inconsistent || attempt >= 3) throw error; }
+    }
+  };
+  const listOnce = async function (endpoint, key) {
+    const all = new Map();
     for (let page = 1; page <= 100; page++) {
       let response;
       try {
@@ -77,11 +84,12 @@ export function githubClient(token, fetchImpl = fetch) {
       let data;
       try { data = await response.json(); } catch { throw new AutoscaleError('Invalid GitHub response'); }
       if (!Array.isArray(data[key]) || !Number.isSafeInteger(data.total_count) || data.total_count < 0) throw new AutoscaleError('Invalid GitHub response');
-      all.push(...data[key]);
+      // Items shifted across a page boundary appear twice; keep one copy per id.
+      for (const item of data[key]) all.set(Number.isSafeInteger(item?.id) ? item.id : Symbol(), item);
       // Filtered run searches have a 1,000-result ceiling. Never treat a truncated queue as empty.
       if (key === 'workflow_runs' && data.total_count >= 1000) throw new AutoscaleError('GitHub run search limit reached');
-      if (all.length >= data.total_count) return all;
-      if (data[key].length === 0) throw new AutoscaleError('Incomplete GitHub response');
+      if (all.size >= data.total_count) return [...all.values()];
+      if (data[key].length === 0) throw Object.assign(new AutoscaleError('Incomplete GitHub response'), { inconsistent: true });
     }
     throw new AutoscaleError('GitHub pagination limit reached');
   };
@@ -210,12 +218,12 @@ export function plan(c, { runners, queued }, local, host, state, now) {
   // Local lifecycle files are authoritative. A missing/stale GitHub row never means it is safe to stop a process.
   const active = runners.filter(r => local.get(r.name).active);
   const busy = runners.filter(r => r.busy).length;
-  const { free } = cpuPolicy(c, active.length, host, state);
   let desired = Math.max(c.minRunners, Math.min(c.maxRunners, busy + queued));
-  if (!free && desired > active.length) desired = Math.max(c.minRunners, active.length);
-  const cooled = state.lastScale === undefined || now - state.lastScale >= c.cooldownSeconds * 1000;
-  state.grantedTarget = Math.min(desired, state.grantedTarget ?? c.minRunners);
-  const target = cooled ? desired : Math.min(desired, Math.max(c.minRunners, active.length, state.grantedTarget));
+  // Runner jobs raise host load themselves, so only latched pressure (not "not idle") blocks growth.
+  const { pressure } = cpuPolicy(c, active.length, host, state);
+  if (pressure && desired > active.length) desired = Math.max(c.minRunners, active.length);
+  // Ephemeral listeners are consumed per job; delaying growth only leaves queued jobs waiting.
+  const target = desired;
   const start = runners.filter(r => !r.unavailable && !local.get(r.name).unavailable && !local.get(r.name).active && local.get(r.name).phase === 'ready' && !r.registered)
     .slice(0, Math.max(0, target - active.length));
   const count = Math.max(1, active.length + start.length);

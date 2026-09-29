@@ -308,10 +308,33 @@ test('definite registration rejection permits retry; ambiguous responses do not'
     });
   }
 });
-test('cooldown allows replacement at previously granted capacity', () => {
+test('a recent scale-up does not delay growth for newly queued jobs', () => {
   const f = fixture(10, 10, 6);
-  const p = plan(f.c, f.data, f.local, f.host, { lastScale: 0, grantedTarget: 16 }, 1000);
+  const p = plan(f.c, f.data, f.local, f.host, { lastScale: 0, grantedTarget: 10 }, 1000);
   assert.equal(p.start.length, 6);
+});
+test('load between thresholds without latched pressure still permits growth', () => {
+  const f = fixture(10, 10, 3);
+  const p = plan(f.c, f.data, f.local, { ...f.host, load: 0.83 }, {}, 0);
+  assert.equal(p.pressure, false);
+  assert.equal(p.start.length, 3);
+});
+test('torn paginated reads are retried and deduplicated instead of failing the poll', async () => {
+  const row = id => ({ id, name: `runner-${id}` });
+  const pages = [
+    { total_count: 150, runners: Array.from({ length: 100 }, (_, i) => row(i + 1)) },
+    { total_count: 150, runners: [] },
+    { total_count: 150, runners: Array.from({ length: 100 }, (_, i) => row(i + 1)) },
+    { total_count: 150, runners: Array.from({ length: 51 }, (_, i) => row(i + 100)) }
+  ];
+  const api = githubClient('test-token', async () => ({ ok: true, json: async () => pages.shift() }));
+  const result = await api('/orgs/example-org/actions/runners', 'runners');
+  assert.equal(result.length, 150);
+  assert.equal(new Set(result.map(r => r.id)).size, 150);
+  const empty = () => ({ ok: true, json: async () => ({ total_count: 5, runners: [] }) });
+  let calls = 0;
+  await assert.rejects(githubClient('test-token', async () => (calls++, empty()))('/orgs/example-org/actions/runners', 'runners'), /Incomplete/);
+  assert.equal(calls, 3);
 });
 test('unavailable slots reserve capacity and cannot start', () => {
   const f = fixture(6, 6, 20);

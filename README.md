@@ -509,7 +509,13 @@ services. Keep the kit and runner software up to date between generations;
 automatic in-job runner updates are disabled for this pool.
 
 Authenticate `gh` for `github.com`, or provide a token through the
-`RUNNER_AUTOSCALE_TOKEN` environment variable using your secret manager.
+`RUNNER_AUTOSCALE_TOKEN` environment variable using your secret manager. For
+unattended hosts, prefer a token file: `.autoscale-token` in the kit root, or
+the path in `RUNNER_AUTOSCALE_TOKEN_FILE`. It must be a regular file owned by
+the controller user with mode `0600`. `gh` may store its token in a desktop
+keyring that stays locked after reboots or keyring restarts until someone logs
+in; the controller keeps using the last token it read from `gh`, but a restarted
+controller cannot read a locked keyring.
 Explicit `--dry-run` preview needs **Actions: read** on every selected repository and
 **Self-hosted runners: read** for an organization pool, or **Administration:
 read** for a repository pool. Default autoscaling needs **Self-hosted runners:
@@ -565,7 +571,7 @@ hosts can claim queued jobs first.
 | --- | --- | --- |
 | `minRunners` / `maxRunners` | `auto` / `auto` | Derived from CPU and RAM; numeric values override sizing |
 | `intervalSeconds` | 60 | Delay between polls; minimum 15 seconds |
-| `cooldownSeconds` | 120 | Delay between capacity increases; replacements up to granted capacity can start each poll |
+| `cooldownSeconds` | 120 | Accepted for compatibility; ignored. Ephemeral listeners are consumed per job, so growth is never delayed |
 | `lowLoad` / `highLoad` | 0.6 / 1.0 | One-minute load average divided by available logical CPUs |
 | `minFreeMemoryPercent` | 10 | Block growth and reduce CPU budget below this available-memory level |
 | `cpuBudgetPercent` | 80 | Normal pool CPU budget as a percentage of host CPU capacity |
@@ -573,9 +579,10 @@ hosts can claim queued jobs first.
 | `minCpuQuotaPercent` / `maxCpuQuotaPercent` | 25 / 800 | Per-runner quota bounds; 100% means one logical CPU |
 
 Under pressure, the controller divides the reduced CPU budget among active
-listeners. It restores the normal budget and permits growth below the low
-load threshold when memory is available. Between thresholds, it retains the
-previous pressure state. The minimum count remains a floor under pressure.
+listeners and blocks growth. It leaves pressure, restoring the normal budget
+and growth, below the low load threshold when memory is available. Between
+thresholds, it retains the previous pressure state, so a host that was not
+under pressure keeps growing. The minimum count remains a floor under pressure.
 A minimum per-runner quota can make the total exceed the pool budget; these
 are policy targets, not an aggregate cgroup limit. On a 16-CPU host with 16
 active listeners, the defaults allow each 80% of one CPU normally and 30%

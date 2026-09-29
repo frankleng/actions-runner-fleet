@@ -148,12 +148,23 @@ async function publishGeneration(c, name, slot, api) {
   await fs.unlink(file('.autoscale-request.tmp'));
   await fs.unlink(file('.autoscale-reservation.json'));
 }
+let cachedToken;
 async function token() {
   if (process.env.RUNNER_AUTOSCALE_TOKEN) return process.env.RUNNER_AUTOSCALE_TOKEN;
+  const tokenFile = process.env.RUNNER_AUTOSCALE_TOKEN_FILE || path.join(root, '.autoscale-token');
+  const stat = await fs.stat(tokenFile).catch(() => null);
+  if (stat) {
+    if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077)) throw new AutoscaleError('Token file must be a regular file owned by this user with mode 0600');
+    const value = (await fs.readFile(tokenFile, 'utf8')).trim();
+    if (value) return value;
+  }
   try {
     const { stdout } = await exec('gh', ['auth', 'token', '--hostname', 'github.com'], { timeout: 15000, maxBuffer: 65536 });
-    return stdout.trim();
-  } catch { throw new AutoscaleError('Set RUNNER_AUTOSCALE_TOKEN or authenticate gh for github.com'); }
+    if (stdout.trim()) return (cachedToken = stdout.trim());
+  } catch {}
+  // gh reads a desktop keyring that locks when its daemon restarts; keep polling with the last good token.
+  if (cachedToken) return cachedToken;
+  throw new AutoscaleError('Set RUNNER_AUTOSCALE_TOKEN, RUNNER_AUTOSCALE_TOKEN_FILE, or authenticate gh for github.com');
 }
 process.on('SIGTERM', () => { quitting = true; sleeper?.abort(); });
 process.on('SIGINT', () => { quitting = true; sleeper?.abort(); });
