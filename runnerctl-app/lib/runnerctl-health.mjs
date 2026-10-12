@@ -7,7 +7,7 @@ export const DEFAULT_THRESHOLD_MS = 30 * 60 * 1000;
 /**
  * facts: [{ name, kind: 'persistent'|'ephemeral', org, unitActive, unitUnrendered,
  *   phase, reservedSince, github: 'online'|'offline'|'missing'|'unknown' }]
- * autoscaler: { configured, active }
+ * autoscaler: { configured, active, org }
  */
 export function findProblems(facts, autoscaler) {
   const problems = [];
@@ -24,7 +24,7 @@ export function findProblems(facts, autoscaler) {
       add('runner-unregistered', f.name, f.org, 'persistent runner has no GitHub registration');
     }
   }
-  if (autoscaler.configured && !autoscaler.active) add('autoscaler-down', 'runnerctl-autoscale', null, 'autoscale controller service is not active');
+  if (autoscaler.configured && !autoscaler.active) add('autoscaler-down', 'runnerctl-autoscale', autoscaler.org ?? null, 'autoscale controller service is not active');
   return problems;
 }
 
@@ -58,6 +58,14 @@ export function planAlert(previous, problems, now, thresholdMs = DEFAULT_THRESHO
         overdue: now - firstSeen[key] >= thresholdMs, new: fresh.some(f => f.key === key) })),
     },
   };
+}
+
+/** Problems grouped by GitHub org; each org is a separate incident. */
+export const UNKNOWN_ORG = 'unknown';
+export function groupByOrg(problems) {
+  const groups = {};
+  for (const p of problems) (groups[p.org ?? UNKNOWN_ORG] ??= []).push(p);
+  return groups;
 }
 
 /** GitHub REST path for a runner registered at a repository or organization URL. */

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseRegistry } from '../lib/runnerctl-core.mjs';
-import { findProblems, planAlert, githubRunnerPath, renderAlertMarkdown, DEFAULT_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
+import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, DEFAULT_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -83,7 +83,7 @@ async function deliver(targets, payload) {
     const response = await fetch(`https://api.github.com/repos/${targets.repo}/dispatches`, { method: 'POST',
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28',
         'Content-Type': 'application/json' },
-      body: JSON.stringify({ event_type: 'runner-health', client_payload: { host: payload.host, action: payload.action,
+      body: JSON.stringify({ event_type: 'runner-health', client_payload: { host: payload.host, org: payload.org, action: payload.action,
         title: payload.title, body: payload.markdown } }), redirect: 'error', signal: AbortSignal.timeout(30000) });
     if (!response.ok) throw new Error(`Alert dispatch failed (HTTP ${response.status})`);
   }
@@ -120,7 +120,9 @@ async function gatherFacts() {
     facts.push(fact);
   }
   const autoscaleUnit = `runnerctl-autoscale-${createHash('sha256').update(root).digest('hex').slice(0, 12)}.service`;
-  const autoscaler = { configured: await exists(path.join(unitDir, autoscaleUnit)), active: await unitActive(autoscaleUnit) };
+  const autoscaleConfig = await readJson(path.join(root, 'autoscale.json')).catch(() => null);
+  const autoscaler = { configured: await exists(path.join(unitDir, autoscaleUnit)), active: await unitActive(autoscaleUnit),
+    org: autoscaleConfig?.target?.split('/')[0] ?? null };
   return { facts, autoscaler, githubChecked: !!token };
 }
 
@@ -172,25 +174,43 @@ try {
   if (args.includes('--uninstall')) { await uninstall(); process.exit(0); }
   const { facts, autoscaler, githubChecked } = await gatherFacts();
   const problems = findProblems(facts, autoscaler);
-  const previous = await readJson(statePath, {});
-  const { state, alert, resolved } = planAlert(previous, problems, Date.now(), thresholdMs);
-  const report = { runners: facts.length, problems: problems.length, alerting: !!alert, resolved: !!resolved, githubChecked };
+  // One incident per org, so each org's issue opens and closes on its own.
+  const raw = await readJson(statePath, {});
+  const previousByOrg = raw.orgs ?? {};
+  const groups = groupByOrg(problems);
+  const now = Date.now();
+  const plans = {};
+  for (const org of new Set([...Object.keys(previousByOrg), ...Object.keys(groups)])) {
+    plans[org] = planAlert(previousByOrg[org], groups[org] ?? [], now, thresholdMs);
+  }
+  const report = { runners: facts.length, problems: problems.length, githubChecked,
+    alerting: Object.keys(plans).filter(o => plans[o].alert), resolved: Object.keys(plans).filter(o => plans[o].resolved) };
   if (dryRun) {
-    console.log(JSON.stringify({ ...report, details: problems.map(({ key, ...p }) => ({ ...p, firstSeen: state.firstSeen[key] && new Date(state.firstSeen[key]).toISOString() })) }, null, 2));
+    console.log(JSON.stringify({ ...report, details: problems.map(({ key, ...p }) => ({ ...p,
+      firstSeen: new Date(plans[p.org ?? 'unknown'].state.firstSeen[key]).toISOString() })) }, null, 2));
     process.exit(0);
   }
-  // Deliver before saving state: a failed delivery is retried on the next run.
   const host = os.hostname();
-  if (alert) {
-    await deliver(await deliveryTargets(), { action: 'open', host, kit: root, ...alert,
-      title: `Runner fleet on ${host}: ${alert.summary}`, markdown: renderAlertMarkdown({ host, kit: root, ...alert }) });
-  } else if (resolved) {
-    const summary = 'All runners healthy again';
-    await deliver(await deliveryTargets(), { action: 'resolve', host, kit: root, summary, problems: [],
-      title: `Runner fleet on ${host}: ${summary}`, markdown: `**${summary}** as of ${new Date().toISOString()}.` });
+  const saved = { orgs: { ...previousByOrg } };
+  let failure;
+  for (const [org, { state, alert, resolved }] of Object.entries(plans)) {
+    try {
+      if (alert) {
+        await deliver(await deliveryTargets(), { action: 'open', host, org, kit: root, ...alert,
+          title: `[${org}] Runner fleet on ${host}: ${alert.summary}`, markdown: renderAlertMarkdown({ host, kit: root, ...alert }) });
+      } else if (resolved) {
+        const summary = `All ${org} runners healthy again`;
+        await deliver(await deliveryTargets(), { action: 'resolve', host, org, kit: root, summary, problems: [],
+          title: `[${org}] Runner fleet on ${host}: ${summary}`, markdown: `**${summary}** as of ${new Date().toISOString()}.` });
+      }
+      // Save only after delivery: a failed delivery is retried on the next run.
+      if (state.alerted.length || Object.keys(state.firstSeen).length) saved.orgs[org] = state;
+      else delete saved.orgs[org];
+    } catch (error) { failure ??= error; }
   }
-  await fs.writeFile(`${statePath}.tmp`, JSON.stringify(state), { mode: 0o600 });
+  await fs.writeFile(`${statePath}.tmp`, JSON.stringify(saved), { mode: 0o600 });
   await fs.rename(`${statePath}.tmp`, statePath);
+  if (failure) throw failure;
   console.log(JSON.stringify(report));
 } catch (error) {
   console.error(error instanceof Error ? error.message : 'Health check failed');

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { findProblems, planAlert, githubRunnerPath, renderAlertMarkdown } from '../lib/runnerctl-health.mjs';
+import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown } from '../lib/runnerctl-health.mjs';
 
 const MIN = 60000;
 const healthy = { name: 'ci-1', kind: 'ephemeral', org: 'example-org', unitActive: true, unitUnrendered: false, phase: 'ready' };
@@ -66,4 +66,24 @@ test('alert markdown escapes table cells and suggests checks only for overdue pr
   assert.ok(md.includes('🆕 `slot-reserved`'));
   assert.ok(md.includes('.runners/ci-1/.autoscale-reservation.json'));
   assert.ok(!md.includes("status 'actions.runner.*ci-2.service'"));
+});
+
+test('problems group by org, including the autoscaler, so each org is its own incident', () => {
+  const problems = findProblems([
+    { ...healthy, name: 't-1', org: 'titledock', unitActive: false },
+    { name: 'f-1', kind: 'persistent', org: 'founderationhq', unitActive: true, github: 'offline' },
+    { ...healthy, name: 'x-1', org: null, phase: 'blocked' },
+  ], { configured: true, active: false, org: 'titledock' });
+  const groups = groupByOrg(problems);
+  assert.deepEqual(Object.keys(groups).sort(), ['founderationhq', 'titledock', 'unknown']);
+  assert.deepEqual(groups.titledock.map(p => p.kind), ['service-down', 'autoscaler-down']);
+  // One org recovering resolves only that org.
+  let t = planAlert({}, groups.titledock, 0, 0);
+  let f = planAlert({}, groups.founderationhq, 0, 0);
+  assert.ok(t.alert && f.alert);
+  t = planAlert(t.state, [], MIN, 0);
+  f = planAlert(f.state, groups.founderationhq, MIN, 0);
+  assert.equal(t.resolved, true);
+  assert.equal(f.resolved, undefined);
+  assert.equal(f.alert, null);
 });

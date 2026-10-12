@@ -662,7 +662,9 @@ lives in the private `.health-state.json`. Configure one or both targets:
 - **GitHub issues (recommended).** Put `OWNER/REPO` in `.health-github-repo` (or
   `RUNNER_HEALTH_GITHUB_REPO`). The check sends a `repository_dispatch` with event
   `runner-health` and `client_payload` `{ host, action: open|resolve, title, body }`.
-  A workflow in that repo should open, comment on, and close one issue per host.
+  The payload also carries `org`: each GitHub org is a separate incident with its own
+  state, so a workflow in that repo should open, comment on, and close one issue per
+  org and host (for example labelled `org:<org>`).
   Open the issues from the workflow (as `github-actions[bot]`), not from the host:
   GitHub never notifies you about your own actions, so self-opened issues send no
   email. Run that workflow on GitHub-hosted runners, because the fleet may be the
