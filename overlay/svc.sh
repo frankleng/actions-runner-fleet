@@ -52,6 +52,22 @@ RUNNER_NAME="$(read_runner_json_value "agentName")"
 GITHUB_URL="$(read_runner_json_value "gitHubUrl")"
 RUNNER_OWNER="${GITHUB_URL%/}"
 RUNNER_OWNER="${RUNNER_OWNER##*/}"
+# GitHub's runner self-update swaps bin/ for upstream files, whose service
+# template uses placeholders this script does not fill and whose runsvc.sh lacks
+# the kit's wrapper. Prefer the kit's own copies while the kit is on disk.
+KIT_OVERLAY_DIR=""
+if [ -f "${RUNNER_ROOT}/.kit-root" ]; then
+  KIT_OVERLAY_DIR="$(cat "${RUNNER_ROOT}/.kit-root")/overlay"
+fi
+
+kit_or_runner_file() {
+  if [ -n "${KIT_OVERLAY_DIR}" ] && [ -f "${KIT_OVERLAY_DIR}/$1" ]; then
+    printf '%s\n' "${KIT_OVERLAY_DIR}/$1"
+  else
+    printf '%s\n' "${RUNNER_ROOT}/$2"
+  fi
+}
+
 SVC_NAME="actions.runner.${RUNNER_OWNER}.${RUNNER_NAME}"
 SVC_NAME="${SVC_NAME// /_}"
 RUNNER_HOME="${RUNNER_ROOT}/home"
@@ -59,7 +75,8 @@ RUNNER_LOG_DIR="${RUNNER_HOME}/Library/Logs/${SVC_NAME}"
 LAUNCHD_USER_HOME="${RUNNER_LAUNCHD_USER_HOME:-$(default_launchd_user_home)}"
 LAUNCH_PATH="${RUNNER_LAUNCH_PATH:-${LAUNCHD_USER_HOME}/Library/LaunchAgents}"
 PLIST_PATH="${LAUNCH_PATH}/${SVC_NAME}.plist"
-TEMPLATE_PATH="${RUNNER_ROOT}/bin/actions.runner.plist.template"
+TEMPLATE_PATH="$(kit_or_runner_file bin/actions.runner.plist.template bin/actions.runner.plist.template)"
+RUNSVC_SOURCE_PATH="$(kit_or_runner_file runsvc.sh bin/runsvc.sh)"
 TEMP_PATH="${RUNNER_ROOT}/bin/actions.runner.plist.temp"
 CONFIG_PATH="${RUNNER_ROOT}/.service"
 RUNTIME_PATH_FILE="${RUNNER_ROOT}/.path"
@@ -239,14 +256,20 @@ render_plist() {
     -e "s#{{StdoutPath}}#${RUNNER_LOG_DIR}/stdout.log#g" \
     -e "s#{{StderrPath}}#${RUNNER_LOG_DIR}/stderr.log#g" \
     "${TEMPLATE_PATH}" > "${TEMP_PATH}" || failed "failed to render plist"
+  if grep -q '{{' "${TEMP_PATH}"; then
+    rm -f "${TEMP_PATH}"
+    failed "service template ${TEMPLATE_PATH} left unrendered placeholders; run ./manage-runners.sh reconcile ${RUNNER_NAME}"
+  fi
   mv "${TEMP_PATH}" "${PLIST_PATH}" || failed "failed to write plist"
 }
 
 sync_runtime_files() {
   load_runtime_environment
   render_plist
-  cp "${RUNNER_ROOT}/bin/runsvc.sh" "${RUNNER_ROOT}/runsvc.sh" || failed "failed to copy runsvc.sh"
-  chmod u+x "${RUNNER_ROOT}/runsvc.sh" || failed "failed to chmod runsvc.sh"
+  # Replace by rename: a running listener's bash reads runsvc.sh incrementally.
+  cp "${RUNSVC_SOURCE_PATH}" "${RUNNER_ROOT}/runsvc.sh.tmp" || failed "failed to copy runsvc.sh"
+  chmod u+x "${RUNNER_ROOT}/runsvc.sh.tmp" || failed "failed to chmod runsvc.sh"
+  mv "${RUNNER_ROOT}/runsvc.sh.tmp" "${RUNNER_ROOT}/runsvc.sh" || failed "failed to install runsvc.sh"
   printf '%s\n' "${PLIST_PATH}" > "${CONFIG_PATH}" || failed "failed to write ${CONFIG_PATH}"
 }
 

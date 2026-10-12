@@ -188,6 +188,20 @@ export ACTIONS_RUNNER_HOOK_JOB_COMPLETED="${runner_root}/job-hooks/runner-job-co
 prepare_macos_cpu_limiter
 start_log_pruner
 
+# A runner self-update replaces bin/ and drops the kit's autoscale scripts.
+restore_kit_bin_files() {
+  local kit_overlay kit_file
+
+  [ -f .kit-root ] || return 0
+  kit_overlay="$(cat .kit-root)/overlay"
+  for kit_file in autoscale-lock.mjs autoscale-worker.mjs; do
+    if [ ! -f "bin/${kit_file}" ] && [ -f "${kit_overlay}/${kit_file}" ]; then
+      cp "${kit_overlay}/${kit_file}" "bin/${kit_file}"
+    fi
+  done
+}
+
+restore_kit_bin_files
 nodever="node20"
 
 if [ -f .autoscale-slot.json ]; then

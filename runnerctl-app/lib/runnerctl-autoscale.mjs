@@ -111,7 +111,33 @@ export function githubClient(token, fetchImpl = fetch) {
     try { return decodeJit(c, name, await response.json()); }
     catch { throw new AutoscaleError('Invalid ephemeral registration response'); }
   };
+  list.remove = async (c, id) => {
+    if (!Number.isSafeInteger(id) || id < 1) throw new AutoscaleError('Invalid runner id');
+    let response;
+    try {
+      response = await fetchImpl(`https://api.github.com${runnerEndpoint(c)}/${id}`, {
+        method: 'DELETE', headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28' }, redirect: 'error', signal: AbortSignal.timeout(15000)
+      });
+    } catch { throw new AutoscaleError('GitHub runner removal failed'); }
+    // Already gone is the outcome we wanted.
+    if (!response.ok && response.status !== 404) throw new AutoscaleError(`GitHub runner removal failed (HTTP ${response.status})`);
+  };
   return list;
+}
+
+// An ambiguous registration POST (for example HTTP 500) may or may not have
+// created a runner. Its credentials were never received, so such a runner can
+// never come online: an offline idle match is an inert orphan, and no match
+// after a grace period for GitHub's list to catch up means nothing was created.
+export const RESERVATION_GRACE_MS = 10 * 60 * 1000;
+export function reservationDecision(name, remote, ageMs, graceMs = RESERVATION_GRACE_MS) {
+  const matches = remote.filter(r => r?.name === name);
+  if (matches.length === 0) return { action: ageMs >= graceMs ? 'clear' : 'wait' };
+  const [r] = matches;
+  if (matches.length === 1 && Number.isSafeInteger(r.id) && r.status === 'offline' && r.busy === false) return { action: 'delete', id: r.id };
+  // Online, busy, or duplicated: something else holds this name. Stay blocked.
+  return { action: 'keep' };
 }
 
 export function runnerEndpoint(c) {

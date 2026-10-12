@@ -102,3 +102,39 @@ printf '999999\n' > "${runner_dir}/.cpu-quota"
 resized_status="$(RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" status 2>"${temp_dir}/resize.err")"
 printf '%s\n' "${resized_status}" | grep -q 'CPU limit: 600%'
 grep -q 'host ceiling' "${temp_dir}/resize.err"
+
+# A runner self-update replaces bin/ with upstream files. The upstream service
+# template uses {{Description}} and {{User}}; rendering it produced units that
+# failed at boot with status 217/USER. Simulate that update.
+printf '175\n' > "${runner_dir}/.cpu-quota"
+cat > "${runner_dir}/bin/actions.runner.service.template" <<'UPSTREAM'
+[Unit]
+Description={{Description}}
+
+[Service]
+ExecStart={{RunnerRoot}}/runsvc.sh
+User={{User}}
+
+[Install]
+WantedBy=multi-user.target
+UPSTREAM
+printf '#!/bin/bash\necho upstream runsvc\n' > "${runner_dir}/bin/runsvc.sh"
+cp "${unit_path}" "${temp_dir}/unit.before"
+
+# Without the kit on disk, refuse to overwrite a working unit with a broken one.
+if RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" set-cpu-limit 150 >"${temp_dir}/upstream.out" 2>"${temp_dir}/upstream.err"; then
+  echo "expected rendering an upstream template to fail" >&2
+  exit 1
+fi
+grep -Fq "unrendered placeholders" "${temp_dir}/upstream.err"
+cmp -s "${unit_path}" "${temp_dir}/unit.before"
+
+# With the kit recorded in .kit-root, render from the kit's template instead.
+printf '%s\n' "${ROOT_DIR}" > "${runner_dir}/.kit-root"
+RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" set-cpu-limit 150
+! grep -q '{{' "${unit_path}"
+grep -Fq "Description=GitHub Actions Runner (ubuntu-runner-1)" "${unit_path}"
+grep -Fq "CPUQuota=150%" "${unit_path}"
+RUNNER_LOGINCTL_BIN="${loginctl_stub}" RUNNER_TEST_LOGINCTL_LOG="${loginctl_log}" \
+RUNNER_NPROC_BIN="${nproc_stub}" RUNNER_SYSTEMCTL_BIN="${systemctl_stub}" RUNNER_SYSTEMD_USER_DIR="${unit_dir}" RUNNER_TEST_SYSTEMCTL_LOG="${systemctl_log}" "${runner_dir}/svc.sh" install >/dev/null
+cmp -s "${ROOT_DIR}/overlay/runsvc.sh" "${runner_dir}/runsvc.sh"

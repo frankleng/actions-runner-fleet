@@ -28,10 +28,27 @@ RUNNER_NAME="$(read_runner_json_value agentName)"
 GITHUB_URL="$(read_runner_json_value gitHubUrl)"
 RUNNER_OWNER="${GITHUB_URL%/}"
 RUNNER_OWNER="${RUNNER_OWNER##*/}"
+# GitHub's runner self-update swaps bin/ for upstream files, whose service
+# template uses placeholders this script does not fill and whose runsvc.sh lacks
+# the kit's wrapper. Prefer the kit's own copies while the kit is on disk.
+KIT_OVERLAY_DIR=""
+if [ -f "${RUNNER_ROOT}/.kit-root" ]; then
+  KIT_OVERLAY_DIR="$(cat "${RUNNER_ROOT}/.kit-root")/overlay"
+fi
+
+kit_or_runner_file() {
+  if [ -n "${KIT_OVERLAY_DIR}" ] && [ -f "${KIT_OVERLAY_DIR}/$1" ]; then
+    printf '%s\n' "${KIT_OVERLAY_DIR}/$1"
+  else
+    printf '%s\n' "${RUNNER_ROOT}/$2"
+  fi
+}
+
 SVC_NAME="actions.runner.${RUNNER_OWNER}.${RUNNER_NAME// /_}"
 UNIT_NAME="${SVC_NAME}.service"
 UNIT_PATH="${UNIT_DIR}/${UNIT_NAME}"
-TEMPLATE_PATH="${RUNNER_ROOT}/bin/actions.runner.service.template"
+TEMPLATE_PATH="$(kit_or_runner_file bin/actions.runner.service.template bin/actions.runner.service.template)"
+RUNSVC_SOURCE_PATH="$(kit_or_runner_file runsvc.sh bin/runsvc.sh)"
 CONFIG_PATH="${RUNNER_ROOT}/.service"
 CPU_QUOTA_PATH="${RUNNER_ROOT}/.cpu-quota"
 
@@ -126,6 +143,12 @@ render_service_unit() {
     -e "s#{{RunnerRoot}}#${RUNNER_ROOT}#g" \
     -e "s#{{CPUQuotaPercent}}#${cpu_quota_percent}#g" \
     "${TEMPLATE_PATH}" > "${UNIT_PATH}.tmp"
+  # A unit with leftover placeholders (for example User={{User}}) fails at
+  # every boot with status 217/USER; keep the previous unit instead.
+  if grep -q '{{' "${UNIT_PATH}.tmp"; then
+    rm -f "${UNIT_PATH}.tmp"
+    fail "service template ${TEMPLATE_PATH} left unrendered placeholders; run ./manage-runners.sh reconcile ${RUNNER_NAME}"
+  fi
   mv "${UNIT_PATH}.tmp" "${UNIT_PATH}"
 }
 
@@ -159,8 +182,10 @@ ensure_linger() {
 install_service() {
   ensure_linger
   (cd "${RUNNER_ROOT}" && ./env.sh)
-  cp "${RUNNER_ROOT}/bin/runsvc.sh" "${RUNNER_ROOT}/runsvc.sh"
-  chmod u+x "${RUNNER_ROOT}/runsvc.sh"
+  # Replace by rename: a running listener's bash reads runsvc.sh incrementally.
+  cp "${RUNSVC_SOURCE_PATH}" "${RUNNER_ROOT}/runsvc.sh.tmp"
+  chmod u+x "${RUNNER_ROOT}/runsvc.sh.tmp"
+  mv "${RUNNER_ROOT}/runsvc.sh.tmp" "${RUNNER_ROOT}/runsvc.sh"
   persist_cpu_quota_percent "$(read_cpu_quota_percent)"
   render_service_unit
   printf '%s\n' "${UNIT_PATH}" > "${CONFIG_PATH}"

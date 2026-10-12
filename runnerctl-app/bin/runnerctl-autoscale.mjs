@@ -6,7 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseRegistry, parseServiceStatusOutput } from '../lib/runnerctl-core.mjs';
-import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota } from '../lib/runnerctl-autoscale.mjs';
+import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerEndpoint } from '../lib/runnerctl-autoscale.mjs';
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
 
@@ -117,7 +117,18 @@ async function localRunners(c) {
     const generation = await readJson(path.join(directory, '.autoscale-generation.json'));
     const phase = (await readJson(path.join(directory, '.autoscale-state.json'), { phase: 'ready' })).phase;
     if (!['running', 'ready', 'blocked'].includes(phase)) throw new AutoscaleError('Invalid slot state');
-    if (phase === 'blocked' || await readJson(path.join(directory, '.autoscale-reservation.json'))) throw new AutoscaleError('Slot blocked; inspect its local lifecycle files');
+    if (phase === 'blocked') throw new AutoscaleError('Slot blocked; inspect its local lifecycle files');
+    const reservationPath = path.join(directory, '.autoscale-reservation.json');
+    if (await readJson(reservationPath)) {
+      // Only a reservation with nothing handed to the slot can be resolved automatically.
+      const credentials = await fs.access(path.join(directory, '.credentials')).then(() => true, () => false) ||
+        await fs.access(path.join(directory, '.credentials_rsaparams')).then(() => true, () => false);
+      if (inflight || request || runner || credentials || phase !== 'ready') throw new AutoscaleError('Slot blocked; inspect its local lifecycle files');
+      const { mtimeMs } = await fs.stat(reservationPath);
+      result.set(name, { directory, running: status === 'running', quota, id: generation?.id, active: false, phase,
+        unavailable: true, reservation: { path: reservationPath, createdAt: mtimeMs } });
+      continue;
+    }
     const active = !!inflight || !!request || !!runner || phase === 'running';
     if (active && status === 'stopped') throw new AutoscaleError('Active generation has no running service; manual recovery required');
     if (runner && runner.ephemeral !== true) throw new AutoscaleError('Persistent registration in an ephemeral slot');
@@ -147,6 +158,27 @@ async function publishGeneration(c, name, slot, api) {
   await fs.link(file('.autoscale-request.tmp'), file('.autoscale-request.json'));
   await fs.unlink(file('.autoscale-request.tmp'));
   await fs.unlink(file('.autoscale-reservation.json'));
+}
+async function resolveReservations(c, api, local) {
+  const reserved = [...local.values()].filter(slot => slot.reservation);
+  if (!reserved.length) return;
+  const remote = await api(runnerEndpoint(c), 'runners');
+  let resolved = 0;
+  for (const [name, slot] of local) {
+    if (!slot.reservation || quitting) continue;
+    const decision = reservationDecision(name, remote, Date.now() - slot.reservation.createdAt);
+    if (decision.action === 'wait' || decision.action === 'keep') continue;
+    try {
+      if (decision.action === 'delete') await api.remove(c, decision.id);
+      await fs.unlink(slot.reservation.path);
+    } catch { continue; }
+    slot.unavailable = false;
+    delete slot.reservation;
+    resolved++;
+  }
+  const pending = reserved.length - resolved;
+  if (resolved) console.error(`${resolved} ambiguous registration(s) resolved; slot(s) returned to service`);
+  if (pending) console.error(`${pending} ambiguous registration(s) awaiting resolution`);
 }
 let cachedToken;
 async function token() {
@@ -265,6 +297,10 @@ try {
           pressure: policy.pressure, cpuQuotaPercent: policy.quota };
         // Local CPU control is complete before any authentication or GitHub calls.
         const api = githubClient(await token());
+        if (apply && !quitting) {
+          await resolveReservations(c, api, local);
+          unavailable = [...local.values()].filter(r => r.unavailable).length;
+        }
         const data = await snapshot(c, api, local);
         const remoteUnavailable = data.runners.filter(r => r.unavailable).length;
         if (remoteUnavailable) console.error(`${remoteUnavailable} remote slot identity check(s) failed; affected slots will not receive registrations`);

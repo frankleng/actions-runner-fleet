@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds } from '../lib/runnerctl-autoscale.mjs';
+import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds, reservationDecision, RESERVATION_GRACE_MS } from '../lib/runnerctl-autoscale.mjs';
 
 const config = (extra = {}) => validateConfig({ scope: 'organization', target: 'example-org',
   minRunners: 6, maxRunners: 16, labels: ['self-hosted', 'Linux', 'X64'], runnerGroupId: 1, repositories: ['example-org/example-repo'], runners: Array.from({ length: 16 }, (_, i) => `runner-${i + 1}`), ...extra });
@@ -185,13 +185,17 @@ fi
       globalThis.fetch = async (url, options) => {
         if (process.env.AUTOSCALE_TEST_FAIL_API) return { ok: false, status: 403 };
         if (options.headers.Authorization !== 'Bearer private-test-value') throw new Error('auth missing');
+        if (options.method === 'DELETE') {
+          await appendFile(${JSON.stringify(join(root, 'operations'))}, 'delete ' + url.split('/').pop() + '\\n');
+          return { ok: true, status: 204 };
+        }
         if (options.method === 'POST') {
           await appendFile(${JSON.stringify(join(root, 'operations'))}, 'register\\n');
           if (process.env.AUTOSCALE_TEST_FAIL_POST) throw new Error('private-server-error');
           return { ok: true, json: async () => (${JSON.stringify(jitResponse())}) };
         }
-        const runners = [1].map(i => ({ id: i, name: 'runner-' + i, status: i === 1 ? 'online' : 'offline', busy: i === 1, labels: [{ name: 'self-hosted' }] }));
-        const data = url.includes('/actions/runners') ? { runners, total_count: 1 } :
+        const runners = (process.env.AUTOSCALE_TEST_ORPHAN ? [1, 2] : [1]).map(i => ({ id: i, name: 'runner-' + i, status: i === 1 ? 'online' : 'offline', busy: i === 1, labels: [{ name: 'self-hosted' }] }));
+        const data = url.includes('/actions/runners') ? { runners, total_count: runners.length } :
           url.includes('/jobs?') ? { jobs: [{ id: 1, status: 'queued', labels: ['self-hosted'] }], total_count: 1 } :
           { workflow_runs: url.includes('status=queued') ? [{ id: 1 }] : [], total_count: url.includes('status=queued') ? 1 : 0 };
         return { ok: true, json: async () => data };
@@ -256,7 +260,32 @@ fi
     assert.equal(JSON.parse(blocked.stdout).unavailable, 1);
     assert.equal((await readFile(join(root, 'operations'), 'utf8')).split('register').length, operations.split('register').length); // No retry of an ambiguous creation.
     assert.ok(!operations.split('\n').includes('stop'));
-    await rm(join(root, 'runner-2/.autoscale-reservation.json'));
+    // After the grace period with no matching GitHub runner, the reservation resolves and the slot serves again.
+    const reservation = join(root, 'runner-2/.autoscale-reservation.json');
+    const { utimes } = await import('node:fs/promises');
+    const expired = new Date(Date.now() - 2 * RESERVATION_GRACE_MS);
+    await utimes(reservation, expired, expired);
+    const resolved = await exec(process.execPath, [...args, '--apply', '--once'], { env });
+    assert.equal(JSON.parse(resolved.stdout).unavailable, 0);
+    assert.equal(JSON.parse(resolved.stdout).started, 1);
+    assert.ok(resolved.stderr.includes('1 ambiguous registration(s) resolved'));
+    await assert.rejects(access(reservation));
+    await rm(join(root, 'runner-2/.autoscale-request.json'));
+    await rm(join(root, 'runner-2/.autoscale-generation.json'));
+    // An offline orphan left by the ambiguous POST is deleted at once; it can never come online.
+    await writeFile(reservation, '{}');
+    const orphan = await exec(process.execPath, [...args, '--apply', '--once'], { env: { ...env, AUTOSCALE_TEST_ORPHAN: '1' } });
+    assert.ok(orphan.stderr.includes('1 ambiguous registration(s) resolved'));
+    assert.ok((await readFile(join(root, 'operations'), 'utf8')).split('\n').includes('delete 2'));
+    await assert.rejects(access(reservation));
+    // A reservation beside handed-off credentials is never touched.
+    await writeFile(reservation, '{}');
+    await writeFile(join(root, 'runner-2/.credentials'), '{}');
+    const guarded = await exec(process.execPath, [...args, '--apply', '--once'], { env: { ...env, AUTOSCALE_TEST_ORPHAN: '1' } });
+    assert.equal(JSON.parse(guarded.stdout).unavailable, 1);
+    await access(reservation);
+    await rm(join(root, 'runner-2/.credentials'));
+    await rm(reservation);
     for (const name of ['runner-1', 'runner-2']) await writeFile(join(root, name, '.cpu-quota'), '1');
     const beforeOutage = await readFile(join(root, 'operations'), 'utf8');
     await assert.rejects(exec(process.execPath, [...args, '--apply', '--once'], { env: { ...env, AUTOSCALE_TEST_FAIL_API: '1' } }), error => {
@@ -379,4 +408,25 @@ test('automatic configuration generates host-sized slots and preserves explicit 
   const baseline = validateConfig({ ...raw, baselineRunners: Array.from({ length: 10 }, (_, i) => `base-${i}`) }, hardware);
   assert.equal(baseline.minRunners, 10);
   assert.equal(baseline.runners.length, 22);
+});
+
+test('ambiguous registrations resolve only when no live runner can hold the name', () => {
+  const offline = { id: 7, name: 'runner-1', status: 'offline', busy: false };
+  assert.deepEqual(reservationDecision('runner-1', [], RESERVATION_GRACE_MS - 1), { action: 'wait' });
+  assert.deepEqual(reservationDecision('runner-1', [{ ...offline, name: 'runner-2' }], RESERVATION_GRACE_MS), { action: 'clear' });
+  assert.deepEqual(reservationDecision('runner-1', [offline], 0), { action: 'delete', id: 7 });
+  for (const remote of [[{ ...offline, status: 'online' }], [{ ...offline, busy: true }], [offline, { ...offline, id: 8 }], [{ ...offline, id: 'x' }]]) {
+    assert.deepEqual(reservationDecision('runner-1', remote, 10 * RESERVATION_GRACE_MS), { action: 'keep' });
+  }
+});
+test('runner removal deletes by id, treats already-gone as success, and fails closed otherwise', async () => {
+  const calls = [];
+  const respond = status => async (url, options) => { calls.push({ url, options }); return { ok: status < 300, status }; };
+  await githubClient('test-credential', respond(204)).remove(config(), 7);
+  assert.equal(calls[0].options.method, 'DELETE');
+  assert.equal(calls[0].url, 'https://api.github.com/orgs/example-org/actions/runners/7');
+  assert.equal(calls[0].options.redirect, 'error');
+  await githubClient('test-credential', respond(404)).remove(config(), 7);
+  await assert.rejects(githubClient('test-credential', respond(500)).remove(config(), 7), /removal failed \(HTTP 500\)/);
+  await assert.rejects(githubClient('test-credential', respond(204)).remove(config(), 0), /Invalid runner id/);
 });
