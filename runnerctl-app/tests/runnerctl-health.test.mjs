@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { findProblems, planAlert, githubRunnerPath } from '../lib/runnerctl-health.mjs';
+import { findProblems, planAlert, githubRunnerPath, renderAlertMarkdown } from '../lib/runnerctl-health.mjs';
 
 const MIN = 60000;
 const healthy = { name: 'ci-1', kind: 'ephemeral', org: 'example-org', unitActive: true, unitUnrendered: false, phase: 'ready' };
@@ -42,7 +42,9 @@ test('alerts only after the threshold, once per incident, and again for new prob
   r = planAlert(r.state, ab, 130 * MIN, 30 * MIN);
   assert.deepEqual(r.alert.problems.map(p => [p.runner, p.new]), [['a', false], ['b', true]]);
   r = planAlert(r.state, [], 140 * MIN, 30 * MIN);
-  assert.deepEqual(r.state, { firstSeen: {}, alerted: [] }); // Recovery resets.
+  assert.deepEqual(r.state, { firstSeen: {}, alerted: [] }); // Recovery resets...
+  assert.equal(r.resolved, true); // ...and closes the incident once.
+  assert.equal(planAlert(r.state, [], 145 * MIN, 30 * MIN).resolved, undefined);
   r = planAlert(r.state, a, 140 * MIN, 30 * MIN);
   assert.equal(r.alert, null); // A recurrence starts a fresh clock.
 });
@@ -53,4 +55,15 @@ test('runner API paths support organization and repository scopes only', () => {
   for (const [url, id] of [['https://github.com/enterprises/e/x/y', 7], ['https://evil.invalid/org', 7], ['https://github.com/org', 0], [undefined, 7]]) {
     assert.equal(githubRunnerPath(url, id), null);
   }
+});
+
+test('alert markdown escapes table cells and suggests checks only for overdue problems', () => {
+  const md = renderAlertMarkdown({ host: 'h', kit: '/kit', summary: 'S', problems: [
+    { kind: 'slot-reserved', runner: 'ci-1', org: 'o', detail: 'a|b', firstSeen: 'T', overdue: true, new: true },
+    { kind: 'service-down', runner: 'ci-2', org: 'o', detail: 'd', firstSeen: 'T', overdue: false, new: false },
+  ] });
+  assert.ok(md.includes('a\\|b'));
+  assert.ok(md.includes('🆕 `slot-reserved`'));
+  assert.ok(md.includes('.runners/ci-1/.autoscale-reservation.json'));
+  assert.ok(!md.includes("status 'actions.runner.*ci-2.service'"));
 });

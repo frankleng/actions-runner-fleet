@@ -655,13 +655,21 @@ the autoscale controller. It looks for:
 
 A problem alerts only after it has persisted past the threshold (default 30
 minutes; override with `--threshold-minutes`). Each incident alerts once. A new
-overdue problem alerts again, and a fully healthy fleet resets the incident.
-The alert is a JSON `POST` with `host`, `kit`, `summary`, and a `problems`
-list, sent to the URL in `RUNNER_HEALTH_WEBHOOK_URL` or in the private file
-`.health-webhook` (a regular file owned by you, mode `0600`). Point it at
-anything that accepts a webhook, for example a T3 Code scheduled task that
-opens a new agent thread to investigate. If delivery fails, the alert is
-retried on the next run. Incident state lives in the private `.health-state.json`.
+overdue problem alerts again, and a fully healthy fleet sends a resolution and
+resets the incident. Failed deliveries retry on the next run, and incident state
+lives in the private `.health-state.json`. Configure one or both targets:
+
+- **GitHub issues (recommended).** Put `OWNER/REPO` in `.health-github-repo` (or
+  `RUNNER_HEALTH_GITHUB_REPO`). The check sends a `repository_dispatch` with event
+  `runner-health` and `client_payload` `{ host, action: open|resolve, title, body }`.
+  A workflow in that repo should open, comment on, and close one issue per host.
+  Open the issues from the workflow (as `github-actions[bot]`), not from the host:
+  GitHub never notifies you about your own actions, so self-opened issues send no
+  email. Run that workflow on GitHub-hosted runners, because the fleet may be the
+  thing that is broken. Use a private repo; issues name runners and orgs.
+- **Webhook.** A JSON `POST` with `host`, `kit`, `summary`, `problems`, `title`
+  and `markdown`, sent to `RUNNER_HEALTH_WEBHOOK_URL` or the private file
+  `.health-webhook` (a regular file owned by you, mode `0600`).
 
 GitHub status checks reuse the autoscaler's token sources:
 `RUNNER_AUTOSCALE_TOKEN`, `.autoscale-token`, or `gh auth token`. `--install`

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseRegistry } from '../lib/runnerctl-core.mjs';
-import { findProblems, planAlert, githubRunnerPath, DEFAULT_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
+import { findProblems, planAlert, githubRunnerPath, renderAlertMarkdown, DEFAULT_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -15,9 +15,13 @@ const args = process.argv.slice(2);
 if (args.includes('--help')) {
   console.log(`Usage: runnerctl health [--dry-run] [--threshold-minutes N] [--install|--uninstall]
 Checks every registered runner, autoscale slot and the autoscale controller.
-When a problem persists past the threshold (default 30 minutes), POSTs a JSON
-report to the webhook in RUNNER_HEALTH_WEBHOOK_URL or the private file
-.health-webhook (mode 0600). Alerts once per new overdue problem.
+When a problem persists past the threshold (default 30 minutes), alerts once
+per new overdue problem, and again when the fleet recovers:
+- GitHub: a repository_dispatch (event runner-health) to the OWNER/REPO in
+  RUNNER_HEALTH_GITHUB_REPO or .health-github-repo, whose workflow opens and
+  closes issues as github-actions[bot] so you get notified
+- webhook: a JSON POST to RUNNER_HEALTH_WEBHOOK_URL or the private file
+  .health-webhook (mode 0600)
 --dry-run prints the report without saving state or sending anything.
 --install adds a systemd user timer that runs the check every 5 minutes.`);
   process.exit(0);
@@ -63,6 +67,31 @@ async function githubStatus(token, gitHubUrl, id) {
     const body = await response.json();
     return body.status === 'online' ? 'online' : body.status === 'offline' ? 'offline' : 'unknown';
   } catch { return 'unknown'; }
+}
+async function deliveryTargets() {
+  const repo = process.env.RUNNER_HEALTH_GITHUB_REPO ||
+    (await fs.readFile(path.join(root, '.health-github-repo'), 'utf8').catch(() => '')).trim();
+  if (repo && !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(repo)) throw new Error('Invalid alert repository');
+  const webhook = process.env.RUNNER_HEALTH_WEBHOOK_URL || await privateFile(path.join(root, '.health-webhook'));
+  return { repo: repo || null, webhook };
+}
+async function deliver(targets, payload) {
+  if (!targets.repo && !targets.webhook) throw new Error('An alert is due but no alert target is configured (.health-github-repo or .health-webhook)');
+  if (targets.repo) {
+    const token = await githubToken();
+    if (!token) throw new Error('No GitHub token for alert delivery');
+    const response = await fetch(`https://api.github.com/repos/${targets.repo}/dispatches`, { method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json' },
+      body: JSON.stringify({ event_type: 'runner-health', client_payload: { host: payload.host, action: payload.action,
+        title: payload.title, body: payload.markdown } }), redirect: 'error', signal: AbortSignal.timeout(30000) });
+    if (!response.ok) throw new Error(`Alert dispatch failed (HTTP ${response.status})`);
+  }
+  if (targets.webhook) {
+    const response = await fetch(targets.webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload), redirect: 'error', signal: AbortSignal.timeout(30000) });
+    if (!response.ok) throw new Error(`Alert webhook failed (HTTP ${response.status})`);
+  }
 }
 const orgOf = url => /^https:\/\/github\.com\/([^/]+)/.exec(url ?? '')?.[1] ?? null;
 
@@ -144,19 +173,21 @@ try {
   const { facts, autoscaler, githubChecked } = await gatherFacts();
   const problems = findProblems(facts, autoscaler);
   const previous = await readJson(statePath, {});
-  const { state, alert } = planAlert(previous, problems, Date.now(), thresholdMs);
-  const report = { runners: facts.length, problems: problems.length, alerting: !!alert, githubChecked };
+  const { state, alert, resolved } = planAlert(previous, problems, Date.now(), thresholdMs);
+  const report = { runners: facts.length, problems: problems.length, alerting: !!alert, resolved: !!resolved, githubChecked };
   if (dryRun) {
     console.log(JSON.stringify({ ...report, details: problems.map(({ key, ...p }) => ({ ...p, firstSeen: state.firstSeen[key] && new Date(state.firstSeen[key]).toISOString() })) }, null, 2));
     process.exit(0);
   }
+  // Deliver before saving state: a failed delivery is retried on the next run.
+  const host = os.hostname();
   if (alert) {
-    const webhook = process.env.RUNNER_HEALTH_WEBHOOK_URL || await privateFile(path.join(root, '.health-webhook'));
-    if (!webhook) throw new Error('Problems are overdue but no webhook is configured (.health-webhook)');
-    const response = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ host: os.hostname(), kit: root, ...alert }), redirect: 'error', signal: AbortSignal.timeout(30000) });
-    // Keep the previous state on failure so the next run retries the alert.
-    if (!response.ok) throw new Error(`Alert webhook failed (HTTP ${response.status})`);
+    await deliver(await deliveryTargets(), { action: 'open', host, kit: root, ...alert,
+      title: `Runner fleet on ${host}: ${alert.summary}`, markdown: renderAlertMarkdown({ host, kit: root, ...alert }) });
+  } else if (resolved) {
+    const summary = 'All runners healthy again';
+    await deliver(await deliveryTargets(), { action: 'resolve', host, kit: root, summary, problems: [],
+      title: `Runner fleet on ${host}: ${summary}`, markdown: `**${summary}** as of ${new Date().toISOString()}.` });
   }
   await fs.writeFile(`${statePath}.tmp`, JSON.stringify(state), { mode: 0o600 });
   await fs.rename(`${statePath}.tmp`, statePath);

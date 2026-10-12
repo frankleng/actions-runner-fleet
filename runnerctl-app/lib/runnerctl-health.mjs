@@ -42,6 +42,8 @@ export function planAlert(previous, problems, now, thresholdMs = DEFAULT_THRESHO
   const fresh = overdue.filter(p => !alerted.has(p.key));
   for (const p of overdue) alerted.add(p.key);
   const state = { firstSeen, alerted: [...alerted].sort() };
+  // Everything that was alerted on is healthy again: close the incident.
+  if (!problems.length && previous?.alerted?.length) return { state, alert: null, resolved: true };
   if (!fresh.length) return { state, alert: null };
   const counts = {};
   for (const p of overdue) counts[p.kind] = (counts[p.kind] ?? 0) + 1;
@@ -64,4 +66,32 @@ export function githubRunnerPath(gitHubUrl, id) {
   const match = /^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\/([A-Za-z0-9][A-Za-z0-9_.-]*))?\/?$/.exec(gitHubUrl ?? '');
   if (!match) return null;
   return match[2] ? `/repos/${match[1]}/${match[2]}/actions/runners/${id}` : `/orgs/${match[1]}/actions/runners/${id}`;
+}
+
+// What to look at first for each problem kind. Commands are read-only.
+const CHECKS = {
+  'unrendered-unit': runner => [`grep -n '{{' ~/.config/systemd/user/actions.runner.*${runner}.service`, `./manage-runners.sh reconcile ${runner}   # re-renders from the kit template (changes files)`],
+  'service-down': runner => [`systemctl --user status 'actions.runner.*${runner}.service'`, `journalctl --user -u 'actions.runner.*${runner}.service' -n 80 --no-pager`],
+  'slot-blocked': runner => [`cat .runners/${runner}/.autoscale-state.json`, `ls -la .runners/${runner}/   # never print .credentials*, .runner or .autoscale-request/inflight`],
+  'slot-reserved': runner => [`ls -la --time-style=full-iso .runners/${runner}/.autoscale-reservation.json`, `journalctl --user -u 'runnerctl-autoscale-*' -n 100 --no-pager`],
+  'runner-offline': runner => [`systemctl --user status 'actions.runner.*${runner}.service'`, `journalctl --user -u 'actions.runner.*${runner}.service' -n 80 --no-pager`],
+  'runner-unregistered': runner => [`ls -la .runners/${runner}/`, `# re-register with ./bootstrap.sh --replace-existing ${runner}`],
+  'autoscaler-down': () => [`systemctl --user status 'runnerctl-autoscale-*'`, `journalctl --user -u 'runnerctl-autoscale-*' -n 100 --no-pager`],
+};
+const cell = value => String(value ?? '').replaceAll('|', '\\|').replaceAll('\n', ' ');
+
+/** Markdown for an alert, suitable for an issue body. */
+export function renderAlertMarkdown({ host, kit, summary, problems }) {
+  const rows = problems.map(p => `| ${p.new ? '🆕 ' : ''}\`${cell(p.kind)}\` | \`${cell(p.runner)}\` | ${cell(p.org ?? '')} | ${cell(p.firstSeen)} | ${cell(p.detail)} |`);
+  const checks = [];
+  const seen = new Set();
+  for (const p of problems.filter(p => p.overdue)) {
+    const key = `${p.kind}:${p.runner}`;
+    if (seen.has(key) || !CHECKS[p.kind]) continue;
+    seen.add(key);
+    checks.push(`**${p.kind}** on \`${p.runner}\`:`, '```bash', ...CHECKS[p.kind](p.runner), '```');
+  }
+  return [`**${summary}**`, '', `Host \`${host}\`, kit \`${kit}\`.`, '',
+    '| Problem | Runner | Org | First seen (UTC) | Detail |', '|---|---|---|---|---|', ...rows, '',
+    '### Where to look', `Run from \`${kit}\`:`, '', ...checks].join('\n');
 }
