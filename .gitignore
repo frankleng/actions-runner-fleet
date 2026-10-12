@@ -40,10 +40,12 @@
 !runnerctl
 !runnerctl-app/bin/runnerctl-autoscale.mjs
 !runnerctl-app/bin/runnerctl-dashboard.mjs
+!runnerctl-app/bin/runnerctl-health.mjs
 !runnerctl-app/bin/runnerctl-stats.mjs
 !runnerctl-app/lib/runnerctl-autoscale-service.mjs
 !runnerctl-app/lib/runnerctl-autoscale.mjs
 !runnerctl-app/lib/runnerctl-core.mjs
+!runnerctl-app/lib/runnerctl-health.mjs
 !runnerctl-app/lib/runnerctl-metrics.mjs
 !runnerctl-app/lib/runnerctl-stats.mjs
 !runnerctl-app/lib/runnerctl-table.mjs
@@ -54,6 +56,7 @@
 !runnerctl-app/tests/runnerctl-autoscale-worker.test.mjs
 !runnerctl-app/tests/runnerctl-autoscale.test.mjs
 !runnerctl-app/tests/runnerctl-core.test.mjs
+!runnerctl-app/tests/runnerctl-health.test.mjs
 !runnerctl-app/tests/runnerctl-metrics.test.mjs
 !runnerctl-app/tests/runnerctl-stats.test.mjs
 !runnerctl-app/tests/runnerctl-table.test.mjs

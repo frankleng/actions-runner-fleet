@@ -636,6 +636,38 @@ API references: [workflow runs](https://docs.github.com/en/rest/actions/workflow
 [workflow jobs](https://docs.github.com/en/rest/actions/workflow-jobs), and
 [JIT runner configuration](https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-an-organization).
 
+## Health alerts
+
+`runnerctl health` checks every registered runner, every autoscale slot, and
+the autoscale controller. It looks for:
+
+- services that are not active
+- service units with unfilled `{{...}}` placeholders, which fail at boot with `status=217/USER`
+- slots parked as blocked, or holding an unresolved registration reservation
+- persistent runners that are offline or unregistered at GitHub
+- a stopped autoscale controller
+
+```bash
+./runnerctl health --dry-run   # print current problems; send and save nothing
+./runnerctl health --install   # systemd user timer, every 5 minutes (Linux)
+./runnerctl health --uninstall
+```
+
+A problem alerts only after it has persisted past the threshold (default 30
+minutes; override with `--threshold-minutes`). Each incident alerts once. A new
+overdue problem alerts again, and a fully healthy fleet resets the incident.
+The alert is a JSON `POST` with `host`, `kit`, `summary`, and a `problems`
+list, sent to the URL in `RUNNER_HEALTH_WEBHOOK_URL` or in the private file
+`.health-webhook` (a regular file owned by you, mode `0600`). Point it at
+anything that accepts a webhook, for example a T3 Code scheduled task that
+opens a new agent thread to investigate. If delivery fails, the alert is
+retried on the next run. Incident state lives in the private `.health-state.json`.
+
+GitHub status checks reuse the autoscaler's token sources:
+`RUNNER_AUTOSCALE_TOKEN`, `.autoscale-token`, or `gh auth token`. `--install`
+records your current `HOME` and `PATH` in the unit so that `gh` resolves under
+systemd. The JSON output's `githubChecked: false` means no token was available.
+
 ## Security model
 
 The root `.gitignore` ignores everything by default and allowlists only source

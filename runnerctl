@@ -47,6 +47,11 @@ if [ "${1:-}" = "autoscale" ]; then
   exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-autoscale.mjs" "$@"
 fi
 
+if [ "${1:-}" = "health" ]; then
+  shift
+  exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-health.mjs" "$@"
+fi
+
 METRICS_SOURCE="${SCRIPT_DIR}/runnerctl-app/native/runnerctl-procstats.c"
 METRICS_BIN="${RUNNER_PROCSTATS_BIN:-${SCRIPT_DIR}/host-tools/runnerctl-procstats}"
 
