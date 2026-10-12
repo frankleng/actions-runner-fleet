@@ -22,6 +22,9 @@ export function findProblems(facts, autoscaler) {
       add('runner-offline', f.name, f.org, 'persistent runner is offline at GitHub');
     } else if (f.github === 'missing') {
       add('runner-unregistered', f.name, f.org, 'persistent runner has no GitHub registration');
+    } else if (f.github !== 'online') {
+      // A failed check is not a healthy runner: expired tokens and a locked keyring look like this.
+      add('runner-unverified', f.name, f.org, 'could not confirm the runner is online at GitHub (token or API failure)');
     }
   }
   if (autoscaler.configured && !autoscaler.active) add('autoscaler-down', 'runnerctl-autoscale', autoscaler.org ?? null, 'autoscale controller service is not active');
@@ -83,6 +86,7 @@ const CHECKS = {
   'slot-blocked': runner => [`cat .runners/${runner}/.autoscale-state.json`, `ls -la .runners/${runner}/   # never print .credentials*, .runner or .autoscale-request/inflight`],
   'slot-reserved': runner => [`ls -la --time-style=full-iso .runners/${runner}/.autoscale-reservation.json`, `journalctl --user -u 'runnerctl-autoscale-*' -n 100 --no-pager`],
   'runner-offline': runner => [`systemctl --user status 'actions.runner.*${runner}.service'`, `journalctl --user -u 'actions.runner.*${runner}.service' -n 80 --no-pager`],
+  'runner-unverified': () => [`gh auth status   # a locked keyring or expired token hides runner status`, `./runnerctl health --dry-run`],
   'runner-unregistered': runner => [`ls -la .runners/${runner}/`, `# re-register with ./bootstrap.sh --replace-existing ${runner}`],
   'autoscaler-down': () => [`systemctl --user status 'runnerctl-autoscale-*'`, `journalctl --user -u 'runnerctl-autoscale-*' -n 100 --no-pager`],
 };

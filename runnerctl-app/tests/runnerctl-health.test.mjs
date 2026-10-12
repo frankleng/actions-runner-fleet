@@ -20,7 +20,7 @@ test('detects every capacity-removing failure', () => {
     { name: 'unknown', kind: 'persistent', org: 'example-org', unitActive: true, github: 'unknown' },
   ], { configured: true, active: false });
   assert.deepEqual(problems.map(p => p.key), ['unrendered-unit:unrendered', 'service-down:unrendered', 'slot-blocked:blocked',
-    'slot-reserved:reserved', 'runner-offline:offline', 'runner-unregistered:gone', 'autoscaler-down:runnerctl-autoscale']);
+    'slot-reserved:reserved', 'runner-offline:offline', 'runner-unregistered:gone', 'runner-unverified:unknown', 'autoscaler-down:runnerctl-autoscale']);
   // An unconfigured autoscaler is not a problem.
   assert.equal(findProblems([], { configured: false, active: false }).length, 0);
 });

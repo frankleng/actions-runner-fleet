@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseRegistry } from '../lib/runnerctl-core.mjs';
+import { acquireLock } from '../../overlay/autoscale-lock.mjs';
 import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, DEFAULT_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const exec = promisify(execFile);
@@ -169,14 +170,22 @@ async function uninstall() {
   console.log(`Removed ${unitBase}.timer`);
 }
 
+let releaseLock;
 try {
   if (args.includes('--install')) { await install(); process.exit(0); }
   if (args.includes('--uninstall')) { await uninstall(); process.exit(0); }
+  // Overlapping runs (timer plus a manual run) would both send the same alert.
+  if (!dryRun) {
+    try { releaseLock = await acquireLock(root, '.health.lock'); }
+    catch { throw new Error('Another health check is running'); }
+  }
   const { facts, autoscaler, githubChecked } = await gatherFacts();
   const problems = findProblems(facts, autoscaler);
   // One incident per org, so each org's issue opens and closes on its own.
   const raw = await readJson(statePath, {});
-  const previousByOrg = raw.orgs ?? {};
+  const host = os.hostname();
+  // State from another host (a copied or moved kit) must not suppress or resolve this host's incidents.
+  const previousByOrg = raw.host === host ? raw.orgs ?? {} : {};
   const groups = groupByOrg(problems);
   const now = Date.now();
   const plans = {};
@@ -190,8 +199,7 @@ try {
       firstSeen: new Date(plans[p.org ?? 'unknown'].state.firstSeen[key]).toISOString() })) }, null, 2));
     process.exit(0);
   }
-  const host = os.hostname();
-  const saved = { orgs: { ...previousByOrg } };
+  const saved = { host, orgs: { ...previousByOrg } };
   let failure;
   for (const [org, { state, alert, resolved }] of Object.entries(plans)) {
     try {
@@ -212,7 +220,12 @@ try {
   await fs.rename(`${statePath}.tmp`, statePath);
   if (failure) throw failure;
   console.log(JSON.stringify(report));
+  // Exit non-zero so systemd shows the unit failed even when no alert could be sent.
+  if (!githubChecked) { console.error('GitHub token unavailable; runner status unverified'); process.exitCode = 1; }
 } catch (error) {
   console.error(error instanceof Error ? error.message : 'Health check failed');
-  process.exit(1);
+  process.exitCode = 1;
+} finally {
+  // The lock is a listening socket; it must close or the process never exits.
+  await releaseLock?.();
 }
