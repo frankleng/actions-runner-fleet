@@ -1,10 +1,11 @@
 # Actions Runner Fleet
 
-Set up and manage one or more GitHub Actions self-hosted runners on Ubuntu x64
-or an Apple-silicon Mac. The kit supports repository-, organization-, and
+Set up and manage one or more GitHub Actions self-hosted runners on Ubuntu x64,
+an Apple-silicon Mac, or Windows x64. The kit supports repository-, organization-, and
 enterprise-level runners, multiple GitHub targets, systemd user services on
-Linux, launchd services on macOS, a terminal dashboard, and repeatable host
-migration.
+Linux, launchd services on macOS, per-user scheduled tasks on Windows, a
+terminal dashboard, and repeatable host migration. Windows uses PowerShell
+counterparts of the shell scripts; see [Windows hosts](#windows-hosts).
 
 This repository is public, but it is designed to contain **no private
 credentials**. Runner registration tokens, generated runner credentials,
@@ -34,8 +35,9 @@ at boot on Linux (with login lingering) or login on macOS. See
 - A terminal dashboard for status, registration, start, stop, and reconcile
 - Log rotation and cleanup for runner and service diagnostics
 
-Supported hosts are **Ubuntu/Linux x86_64** and **Apple-silicon macOS arm64**.
-Windows, Linux ARM, and Intel Macs are not currently supported.
+Supported hosts are **Ubuntu/Linux x86_64**, **Apple-silicon macOS arm64**,
+and **Windows x64** (see [Windows hosts](#windows-hosts)). Linux ARM, Windows
+ARM, and Intel Macs are not currently supported.
 
 ## Requirements
 
@@ -732,6 +734,75 @@ The builder:
    files, host-downloaded tools, and source-home paths.
 5. Writes a `.tar.gz` and matching `.sha256` under `dist/`.
 
+## Windows hosts
+
+Windows x64 hosts use PowerShell counterparts of the shell scripts. They run
+on the built-in Windows PowerShell 5.1 and need no administrator rights, Git
+Bash, or WSL. In PowerShell, `.\runnerctl` resolves to `runnerctl.ps1`, so the
+`./runnerctl` commands in this README work unchanged.
+
+| Linux/macOS | Windows |
+| --- | --- |
+| `./prepare.sh` | `.\prepare.ps1` |
+| `./manage-runners.sh` | `.\manage-runners.ps1` (same subcommands and `runners.tsv`) |
+| `./provision-runner-tooling.sh` | `.\provision-runner-tooling.ps1 -Root DIR` |
+| `svc.sh` (systemd/launchd) | `svc.ps1`, a scheduled task in `\actions-runner-fleet\` |
+| `runsvc.sh` | `runsvc.ps1` supervisor |
+| `job-hooks/*.sh` | `job-hooks\*.ps1` |
+
+```powershell
+.\prepare.ps1                          # runner zip, Node.js, dashboard dependency
+.\runnerctl autoscale --prepare        # after editing autoscale.json
+.\runnerctl stats
+```
+
+Run scripts with `powershell -ExecutionPolicy Bypass -File SCRIPT` if the
+local execution policy blocks unsigned scripts. Behaviour on Windows:
+
+- **Services** are per-user scheduled tasks that start at logon. They run
+  hidden through `conhost --headless`. Like macOS launchd agents, they need an
+  account that stays logged on; no password is stored. The autoscale
+  controller and the `runnerctl health --install` check (every 5 minutes) are
+  tasks in the same folder.
+- **Supervision** mirrors the systemd unit. `runsvc.ps1` places itself and
+  everything it starts in a kill-on-close job object. It restarts the listener
+  5 seconds after any exit and waits for `update.finished` after a
+  self-update. A stop request reaches the listener as Ctrl+C on its own
+  console; after 30 seconds (`RUNNER_STOP_GRACE_SECONDS`) the supervisor is
+  ended and the job ends every remaining process.
+- **CPU limits** are hard caps on that job object (`100%` = one logical CPU).
+  The supervisor rereads `.cpu-quota` every second, so changes apply without a
+  restart. It publishes the enforced rate, which `svc.ps1 status` reports as
+  `Live CPU quota`; the autoscaler verifies it as it does a cgroup on Linux.
+- **Stats** come from `Win32_Process`. CPU is averaged over each process's
+  lifetime, like `ps`. Disk columns use per-process I/O counters, which also
+  include network and device transfers. Per-process network rates are not
+  available, as on Linux.
+- **Autoscale load** has no load average on Windows. The controller uses the
+  busy fraction of all logical CPUs between polls instead, so `highLoad: 1`
+  means fully saturated. Free memory is Windows' available physical memory.
+- **Private files** replace mode `0600` with an access list. It must allow
+  only this user, SYSTEM, and Administrators. `prepare.ps1` restricts
+  `autoscale.json` and `.runners\`, and each runner directory is restricted
+  when created. Create a token file the same way:
+
+  ```powershell
+  # Restrict the empty file first so the token is never readable by others.
+  New-Item .autoscale-token -ItemType File | Out-Null
+  icacls .autoscale-token /inheritance:r /grant:r "*$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value):F" "*S-1-5-18:F" "*S-1-5-32-544:F"
+  $token = Read-Host 'GitHub token' -AsSecureString
+  [IO.File]::WriteAllText("$PWD\.autoscale-token", [Net.NetworkCredential]::new('', $token).Password)
+  ```
+- **Credentials:** JIT handoffs write the runner's RSA key with DPAPI, which
+  the Windows runner requires. Runner directories are full copies of the
+  runner image, because NTFS has no copy-on-write clones.
+- **Labels:** `prepare.ps1` writes `self-hosted`, `Windows`, `X64` into a new
+  `autoscale.json`.
+
+`bootstrap.sh`, `restore-fleet.sh`, `build-portable-package.sh`,
+`configure-host-temp.sh`, and `security-audit.sh` have no Windows versions yet.
+On Windows, use `manage-runners.ps1 register` or autoscaling instead.
+
 ## Test
 
 ```bash
@@ -741,6 +812,20 @@ done
 pnpm --dir runnerctl-app test
 ./security-audit.sh
 ```
+
+On Windows, run the end-to-end smoke test and the Node tests:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-smoke.ps1
+pnpm --dir runnerctl-app test
+```
+
+The smoke test works on a sandboxed copy of the kit with a fake runner image
+and `example-org` task names; it needs no network access or GitHub
+credentials. It covers registration, the supervisor's restart behavior, live
+CPU caps, graceful stop, the DPAPI-protected JIT handoff, job hooks, and
+kit-level tasks. It then removes its tasks. Node tests that drive the bash
+scripts need Linux or macOS.
 
 ## Troubleshooting
 

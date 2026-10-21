@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseRegistry } from '../lib/runnerctl-core.mjs';
 import { acquireLock } from '../../overlay/autoscale-lock.mjs';
+import { filePrivate, kitTaskCommandLine, POWERSHELL_ARGS, serviceActive, windowsPowerShell, windowsTaskState } from '../lib/runnerctl-platform.mjs';
 import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, DEFAULT_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const exec = promisify(execFile);
@@ -24,7 +25,8 @@ per new overdue problem, and again when the fleet recovers:
 - webhook: a JSON POST to RUNNER_HEALTH_WEBHOOK_URL or the private file
   .health-webhook (mode 0600)
 --dry-run prints the report without saving state or sending anything.
---install adds a systemd user timer that runs the check every 5 minutes.`);
+--install adds a systemd user timer (Linux) or a scheduled task (Windows) that
+runs the check every 5 minutes.`);
   process.exit(0);
 }
 const dryRun = args.includes('--dry-run');
@@ -40,14 +42,14 @@ async function readJson(file, missing = null) {
   try { return JSON.parse((await fs.readFile(file, 'utf8')).replace(/^\uFEFF/, '')); }
   catch (error) { if (error.code === 'ENOENT') return missing; throw error; }
 }
-async function unitActive(unit) {
-  try { return (await exec('systemctl', ['--user', 'is-active', unit])).stdout.trim() === 'active'; }
-  catch { return false; }
-}
+const windows = process.platform === 'win32';
+const kitTask = [...POWERSHELL_ARGS, '-File', path.join(root, 'kit-task.ps1')];
 async function privateFile(file) {
   const stat = await fs.stat(file).catch(() => null);
   if (!stat) return null;
-  if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077)) throw new Error(`${path.basename(file)} must be a regular file owned by this user with mode 0600`);
+  if (!await filePrivate(file, stat)) {
+    throw new Error(`${path.basename(file)} must be a regular file ${windows ? 'readable only by this user' : 'owned by this user with mode 0600'}`);
+  }
   return (await fs.readFile(file, 'utf8')).trim() || null;
 }
 async function githubToken() {
@@ -105,7 +107,7 @@ async function gatherFacts() {
     const unitPath = (await fs.readFile(path.join(directory, '.service'), 'utf8').catch(() => '')).trim();
     const unit = unitPath ? path.basename(unitPath) : null;
     const unitText = unitPath ? await fs.readFile(unitPath, 'utf8').catch(() => '') : '';
-    const fact = { name, kind: slot ? 'ephemeral' : 'persistent', unitActive: unit ? await unitActive(unit) : false,
+    const fact = { name, kind: slot ? 'ephemeral' : 'persistent', unitActive: unit ? await serviceActive(unit) : false,
       unitUnrendered: unitText.includes('{{') };
     if (slot) {
       fact.org = orgOf(slot.gitHubUrl);
@@ -120,15 +122,24 @@ async function gatherFacts() {
     }
     facts.push(fact);
   }
-  const autoscaleUnit = `runnerctl-autoscale-${createHash('sha256').update(root).digest('hex').slice(0, 12)}.service`;
+  // Windows names the controller's scheduled task without the systemd suffix.
+  const autoscaleUnit = `runnerctl-autoscale-${createHash('sha256').update(root).digest('hex').slice(0, 12)}${windows ? '' : '.service'}`;
   const autoscaleConfig = await readJson(path.join(root, 'autoscale.json')).catch(() => null);
-  const autoscaler = { configured: await exists(path.join(unitDir, autoscaleUnit)), active: await unitActive(autoscaleUnit),
+  const configured = windows ? await windowsTaskState(autoscaleUnit) !== null : await exists(path.join(unitDir, autoscaleUnit));
+  const autoscaler = { configured, active: await serviceActive(autoscaleUnit),
     org: autoscaleConfig?.target?.split('/')[0] ?? null };
   return { facts, autoscaler, githubChecked: !!token };
 }
 
 async function install() {
-  if (process.platform !== 'linux') throw new Error('--install supports systemd user services on Linux');
+  if (windows) {
+    const script = fileURLToPath(import.meta.url);
+    await exec(windowsPowerShell(), [...kitTask, 'install', '-Name', unitBase, '-Trigger', 'Every5Minutes',
+      '-LogPath', path.join(root, '.health.log'), '-CommandLine', kitTaskCommandLine([process.execPath, script])], { windowsHide: true });
+    console.log(`Installed scheduled task ${unitBase} (every 5 minutes)`);
+    return;
+  }
+  if (process.platform !== 'linux') throw new Error('--install supports systemd user services on Linux and scheduled tasks on Windows');
   if (/[^a-zA-Z0-9_./:@+-]/.test(root)) throw new Error('Unsupported kit path for a service unit');
   // Same quoting as the autoscale controller: systemd expands specifiers even in quoted strings.
   const envPath = process.env.PATH || '/usr/bin:/bin';
@@ -163,6 +174,11 @@ WantedBy=timers.target
 }
 
 async function uninstall() {
+  if (windows) {
+    await exec(windowsPowerShell(), [...kitTask, 'remove', '-Name', unitBase], { windowsHide: true });
+    console.log(`Removed scheduled task ${unitBase}`);
+    return;
+  }
   await exec('systemctl', ['--user', 'disable', '--now', `${unitBase}.timer`]).catch(() => {});
   await fs.rm(path.join(unitDir, `${unitBase}.timer`), { force: true });
   await fs.rm(path.join(unitDir, `${unitBase}.service`), { force: true });

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 
 import { runCommand } from "./runnerctl-core.mjs";
+import { POWERSHELL_ARGS, windowsPowerShell } from "./runnerctl-platform.mjs";
 
 const DEFAULT_PS_COMMAND = "/bin/ps";
 const DEFAULT_NETTOP_COMMAND = "/usr/bin/nettop";
@@ -136,6 +137,65 @@ export function parseProcStatsOutput(output) {
   return stats;
 }
 
+// One tab-separated row per process: pid, parent pid, CPU seconds, working
+// set bytes, elapsed seconds, creation ticks, I/O read bytes, I/O write bytes,
+// command line.
+export const WINDOWS_PROCESS_SCRIPT = [
+  "$now = [DateTime]::Now",
+  "Get-CimInstance Win32_Process | ForEach-Object {",
+  "  $command = if ($_.CommandLine) { $_.CommandLine } elseif ($_.ExecutablePath) { $_.ExecutablePath } else { $_.Name }",
+  "  $created = if ($_.CreationDate) { $_.CreationDate } else { $now }",
+  "  @($_.ProcessId, $_.ParentProcessId,",
+  "    (([double]$_.KernelModeTime + [double]$_.UserModeTime) / 1e7).ToString([Globalization.CultureInfo]::InvariantCulture), $_.WorkingSetSize,",
+  "    [Math]::Max(0, [Math]::Floor(($now - $created).TotalSeconds)), $created.Ticks,",
+  "    $_.ReadTransferCount, $_.WriteTransferCount, ($command -replace '[\\t\\r\\n]', ' ')) -join [char]9",
+  "}"
+].join("\n");
+
+// Windows reports cumulative CPU time; like ps %cpu, CPU is averaged over the
+// process lifetime. I/O counters include file, device, and network transfers.
+export function parseWindowsProcessList(output) {
+  const processes = [];
+  const stats = new Map();
+
+  for (const line of String(output ?? "").split(/\r?\n/)) {
+    const fields = line.split("\t");
+    if (fields.length < 9) {
+      continue;
+    }
+
+    const [pid, parentPid, cpuSeconds, residentBytes, elapsedSeconds, , diskReadBytes, diskWriteBytes] =
+      fields.slice(0, 8).map(Number);
+    const startToken = fields[5];
+    if (
+      ![pid, parentPid, residentBytes, elapsedSeconds].every(Number.isSafeInteger) ||
+      ![cpuSeconds, diskReadBytes, diskWriteBytes].every((value) => Number.isFinite(value) && value >= 0) ||
+      !/^\d+$/.test(startToken)
+    ) {
+      continue;
+    }
+
+    processes.push({
+      pid,
+      parentPid,
+      cpuPercent: elapsedSeconds > 0 ? (cpuSeconds / elapsedSeconds) * 100 : 0,
+      residentBytes,
+      elapsedSeconds,
+      command: fields.slice(8).join("\t")
+    });
+    stats.set(pid, {
+      pid,
+      startToken,
+      residentBytes,
+      physicalFootprintBytes: residentBytes,
+      diskReadBytes,
+      diskWriteBytes
+    });
+  }
+
+  return { processes, stats };
+}
+
 export function parseNettopRecord(line) {
   const match = String(line ?? "").match(/^.*\.(\d+),(\d+),(\d+),\s*$/);
   if (!match) {
@@ -200,10 +260,15 @@ export function findRunnerProcessIds(runner, processes) {
     rootPids.add(runner.servicePid);
   }
 
-  const directoryPrefix = `${String(runner.directory ?? "").replace(/\/+$/, "")}/`;
-  if (directoryPrefix !== "/") {
+  const directory = String(runner.directory ?? "");
+  // Windows paths compare case-insensitively and may use either separator.
+  const windows = /^[A-Za-z]:[\\/]/.test(directory);
+  const normalize = (value) => windows ? value.replaceAll("/", "\\").toLowerCase() : value;
+  const separator = windows ? "\\" : "/";
+  const directoryPrefix = `${normalize(directory).replace(/[\\/]+$/, "")}${separator}`;
+  if (directoryPrefix !== separator) {
     for (const processInfo of processes) {
-      if (processInfo.command.includes(directoryPrefix)) {
+      if (normalize(processInfo.command).includes(directoryPrefix)) {
         rootPids.add(processInfo.pid);
       }
     }
@@ -456,19 +521,26 @@ export class RunnerMetricsSampler {
   async sample(runners) {
     this.startNetworkMonitor();
 
-    const processResult = await this.run(
-      this.psCommand,
-      ["-ww", "-axo", "pid=,ppid=,%cpu=,rss=,etime=,command="],
-      {
-        env: {
-          ...process.env,
-          LC_ALL: "C"
+    const windows = this.platform === "win32";
+    const processResult = windows
+      ? await this.run(
+        windowsPowerShell(),
+        [...POWERSHELL_ARGS, "-Command", WINDOWS_PROCESS_SCRIPT],
+        { env: process.env }
+      )
+      : await this.run(
+        this.psCommand,
+        ["-ww", "-axo", "pid=,ppid=,%cpu=,rss=,etime=,command="],
+        {
+          env: {
+            ...process.env,
+            LC_ALL: "C"
+          }
         }
-      }
-    );
+      );
 
     if (processResult.code !== 0) {
-      const error = processResult.stderr.trim() || "ps failed";
+      const error = processResult.stderr.trim() || (windows ? "process query failed" : "ps failed");
       return runners.map((runner) => ({
         ...runner,
         metrics: {
@@ -479,7 +551,8 @@ export class RunnerMetricsSampler {
     }
 
     const sampledAtMs = this.now();
-    const processes = parseProcessList(processResult.stdout);
+    const windowsSample = windows ? parseWindowsProcessList(processResult.stdout) : null;
+    const processes = windowsSample ? windowsSample.processes : parseProcessList(processResult.stdout);
     const processIdsByRunner = new Map();
     const allRunnerProcessIds = new Set();
 
@@ -491,7 +564,9 @@ export class RunnerMetricsSampler {
       }
     }
 
-    const procStatsResult = await this.loadProcStats([...allRunnerProcessIds]);
+    const procStatsResult = windowsSample
+      ? { available: true, error: "", stats: windowsSample.stats }
+      : await this.loadProcStats([...allRunnerProcessIds]);
     const activeRunnerKeys = new Set(runners.map((runner) => runner.directory));
 
     for (const key of this.runnerStates.keys()) {

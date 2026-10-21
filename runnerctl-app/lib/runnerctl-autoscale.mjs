@@ -1,6 +1,7 @@
 import os from 'node:os';
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { windowsLoadPerCpu } from './runnerctl-platform.mjs';
 
 // Only these deliberately constructed diagnostics may be printed by the CLI.
 export class AutoscaleError extends Error {}
@@ -211,6 +212,8 @@ export async function snapshot(c, api, local) {
 
 export function hostSample() {
   const cpus = os.availableParallelism();
+  // Windows reports available physical memory directly and has no load average.
+  if (process.platform === 'win32') return { cpus, load: windowsLoadPerCpu(), freeMemoryPercent: os.freemem() / os.totalmem() * 100 };
   let freeMemoryPercent;
   try {
     if (process.platform === 'linux') {

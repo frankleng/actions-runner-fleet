@@ -9,6 +9,7 @@ import { parseRegistry, parseServiceStatusOutput } from '../lib/runnerctl-core.m
 import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerEndpoint } from '../lib/runnerctl-autoscale.mjs';
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
+import { filePrivate, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -56,17 +57,19 @@ if (onceOnly) watch = false;
 // Service scripts must not inherit the controller's GitHub token (or other ambient secrets).
 const serviceEnv = Object.fromEntries(['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG',
   'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_CONFIG_HOME',
-  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS'].filter(k => process.env[k]).map(k => [k, process.env[k]]));
-async function command(file, commandArgs, cwd = root, timeout = 60000) {
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS',
+  ...(process.platform === 'win32' ? WINDOWS_SERVICE_ENV_KEYS : [])].filter(k => process.env[k]).map(k => [k, process.env[k]]));
+async function command(scriptFile, scriptArgs, cwd = root, timeout = 60000) {
+  const { file, args: commandArgs } = scriptCommand(scriptFile, scriptArgs);
   if (timeout === 0) {
     // Provisioners can emit unbounded output; avoid execFile's buffer kill.
     return await new Promise((resolve, reject) => {
-      const child = spawn(file, commandArgs, { cwd, env: serviceEnv, stdio: 'ignore' });
+      const child = spawn(file, commandArgs, { cwd, env: serviceEnv, stdio: 'ignore', windowsHide: true });
       child.once('error', () => reject(new AutoscaleError('Local provisioning failed')));
       child.once('close', code => code === 0 ? resolve({ stdout: '' }) : reject(new AutoscaleError('Local provisioning failed; rerun --prepare to resume')));
     });
   }
-  try { return await exec(file, commandArgs, { cwd, env: serviceEnv, timeout, maxBuffer: 1024 * 1024 }); }
+  try { return await exec(file, commandArgs, { cwd, env: serviceEnv, timeout, maxBuffer: 1024 * 1024, windowsHide: true }); }
   catch { throw new AutoscaleError('Local runner operation failed; inspect the service locally'); }
 }
 let unitsChanged = false;
@@ -106,7 +109,8 @@ async function localRunners(c) {
     if (!['running', 'stopped'].includes(status)) throw new AutoscaleError('Slot service unavailable');
     let quota = Number((await fs.readFile(path.join(directory, '.cpu-quota'), 'utf8')).trim());
     if (!Number.isSafeInteger(quota) || quota < 1) throw new AutoscaleError('Slot CPU quota unavailable');
-    if (process.platform === 'linux' && status === 'running') quota = effectiveQuota(stdout, quota);
+    // Linux reports the cgroup cap and Windows the job object cap; macOS has no live cap to read.
+    if (['linux', 'win32'].includes(process.platform) && status === 'running') quota = effectiveQuota(stdout, quota);
     if (baseline) {
       result.set(name, { directory, running: status === 'running', quota, id: metadata.agentId, active: status === 'running', phase: 'baseline', baseline: true });
       continue;
@@ -186,7 +190,10 @@ async function token() {
   const tokenFile = process.env.RUNNER_AUTOSCALE_TOKEN_FILE || path.join(root, '.autoscale-token');
   const stat = await fs.stat(tokenFile).catch(() => null);
   if (stat) {
-    if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077)) throw new AutoscaleError('Token file must be a regular file owned by this user with mode 0600');
+    if (!await filePrivate(tokenFile, stat)) {
+      throw new AutoscaleError(process.platform === 'win32' ? 'Token file must be a regular file readable only by this user'
+        : 'Token file must be a regular file owned by this user with mode 0600');
+    }
     const value = (await fs.readFile(tokenFile, 'utf8')).trim();
     if (value) return value;
   }

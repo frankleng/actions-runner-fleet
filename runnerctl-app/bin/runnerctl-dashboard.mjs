@@ -32,6 +32,7 @@ import {
   buildRunnerMetricLines,
   RunnerMetricsSampler
 } from "../lib/runnerctl-metrics.mjs";
+import { scriptCommand } from "../lib/runnerctl-platform.mjs";
 import {
   formatRunnerTableHeader,
   formatRunnerTableRow
@@ -355,7 +356,8 @@ async function runRunnerAction(action) {
 
 async function executeManageRunners(action, payload) {
   setBusy(true, `Running ${action}`);
-  const result = await runCommand(MANAGE_RUNNERS_PATH, buildManageRunnersArgs(action, payload), {
+  const manage = scriptCommand(MANAGE_RUNNERS_PATH, buildManageRunnersArgs(action, payload));
+  const result = await runCommand(manage.file, manage.args, {
     cwd: ROOT_DIR,
     env: process.env
   });

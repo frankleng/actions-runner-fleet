@@ -17,6 +17,23 @@ async function state(phase) {
   await fs.writeFile('.autoscale-state.tmp', JSON.stringify({ phase }), { mode: 0o600 });
   await fs.rename('.autoscale-state.tmp', '.autoscale-state.json');
 }
+// The Windows runner reads its RSA key through DPAPI, as written by config.cmd
+// and --jitconfig. The key travels over stdin, never in arguments.
+async function protectForWindows(text) {
+  const script = 'Add-Type -AssemblyName System.Security; ' +
+    '$bytes = [Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()); ' +
+    '[Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($bytes, $null, [Security.Cryptography.DataProtectionScope]::LocalMachine))';
+  const powershell = `${process.env.SystemRoot || 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
+  const protectedKey = await new Promise((resolve, reject) => {
+    const helper = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+    let stdout = '';
+    helper.stdout.on('data', chunk => { stdout += chunk; });
+    helper.once('error', reject);
+    helper.once('close', code => code === 0 && stdout.trim() ? resolve(stdout.trim()) : reject(new Error('Key protection failed')));
+    helper.stdin.end(Buffer.from(text, 'utf8').toString('base64'));
+  });
+  return Buffer.from(protectedKey, 'base64');
+}
 // Even a controller/service shutdown waits for a currently accepted job. The OS
 // may still enforce its own service-stop deadline; autoscale never requests one.
 process.on('SIGINT', () => { stopping = true; });
@@ -39,10 +56,14 @@ try {
     const slot = JSON.parse(await fs.readFile('.autoscale-slot.json', 'utf8'));
     if (metadata.ephemeral !== true || metadata.agentName !== slot.agentName ||
         metadata.gitHubUrl?.replace(/\/+$/, '').toLowerCase() !== slot.gitHubUrl.replace(/\/+$/, '').toLowerCase()) throw new Error('Invalid identity');
-    for (const name of allowed) await fs.writeFile(name, files[name], { mode: 0o600, flag: 'wx' });
+    for (const name of allowed) {
+      const content = process.platform === 'win32' && name === '.credentials_rsaparams' ? await protectForWindows(files[name]) : files[name];
+      await fs.writeFile(name, content, { mode: 0o600, flag: 'wx' });
+    }
     // The runner reads its private config files: no credentials in argv or environment.
     const code = await new Promise(resolve => {
-      child = spawn('./bin/Runner.Listener', ['run', '--startuptype', 'service'], { stdio: 'inherit' });
+      // On Windows the listener shares this hidden console, so a service stop's Ctrl+C reaches both.
+      child = spawn(process.platform === 'win32' ? '.\\bin\\Runner.Listener.exe' : './bin/Runner.Listener', ['run', '--startuptype', 'service'], { stdio: 'inherit' });
       child.once('error', () => resolve(-1));
       child.once('close', (code, signal) => resolve(signal ? -1 : code));
     });

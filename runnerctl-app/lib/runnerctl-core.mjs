@@ -3,6 +3,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { scriptCommand } from "./runnerctl-platform.mjs";
+
 const RUNNER_SELECTION_EVENTS = ["select item", "select"];
 export const DEFAULT_AUTO_REFRESH_INTERVAL_MS = 5000;
 export const DEFAULT_GITHUB_RUNNER_SCOPE = "organization";
@@ -168,13 +170,14 @@ export function parseCpuQuotaPercent(value, maxPercent = MAX_CPU_QUOTA_PERCENT) 
   return percent;
 }
 
-export function defaultRunnerDirectory(rootDir, name) {
+export function defaultRunnerDirectory(rootDir, name, platform = process.platform) {
   const sanitizedName = name
     .replace(/[^A-Za-z0-9._-]+/g, "-")
     .replace(/^-+/, "")
     .replace(/-+$/, "");
+  const separator = platform === "win32" ? "\\" : "/";
 
-  return `${rootDir}/.runners/${sanitizedName}`;
+  return `${rootDir}${separator}.runners${separator}${sanitizedName}`;
 }
 
 export function parseAutoRefreshInterval(value, fallback = DEFAULT_AUTO_REFRESH_INTERVAL_MS) {
@@ -347,7 +350,8 @@ export function runCommand(command, args, options = {}) {
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
     });
 
     let stdout = "";
@@ -421,7 +425,7 @@ export async function readRunnerMetadata(directory) {
   let serviceStatusOutput = "";
   let serviceName = "";
   let servicePid = null;
-  const supportsCpuQuota = process.platform === "linux" || process.platform === "darwin";
+  const supportsCpuQuota = ["linux", "darwin", "win32"].includes(process.platform);
   let cpuQuotaPercent = supportsCpuQuota
     ? parseCpuQuotaPercent(process.env.RUNNER_DEFAULT_CPU_QUOTA_PERCENT) ??
       DEFAULT_CPU_QUOTA_PERCENT
@@ -448,7 +452,8 @@ export async function readRunnerMetadata(directory) {
   }
 
   if (serviceInstalled) {
-    const statusResult = await runCommand("./svc.sh", ["status"], {
+    const svc = scriptCommand("./svc.sh", ["status"]);
+    const statusResult = await runCommand(svc.file, svc.args, {
       cwd: directory,
       env: process.env
     });

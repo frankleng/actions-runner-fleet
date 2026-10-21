@@ -231,7 +231,7 @@ test("CPU quota percentages use the available logical CPU count as their maximum
 
 test("defaultRunnerDirectory derives the auto-created runner path from the current install", () => {
   assert.equal(
-    defaultRunnerDirectory("/Users/example/actions-runner", "mac runner 1"),
+    defaultRunnerDirectory("/Users/example/actions-runner", "mac runner 1", "darwin"),
     "/Users/example/actions-runner/.runners/mac-runner-1"
   );
 });

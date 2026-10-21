@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
+import { kitTaskCommandLine, POWERSHELL_ARGS, windowsPowerShell } from './runnerctl-platform.mjs';
 
 export function controllerService({ root, configPath, node = process.execPath, home = os.homedir(), platform = process.platform, envPath = process.env.PATH || '/usr/bin:/bin' }) {
   const name = `runnerctl-autoscale-${createHash('sha256').update(root).digest('hex').slice(0, 12)}`;
@@ -21,11 +22,22 @@ export function controllerService({ root, configPath, node = process.execPath, h
     name, file: path.join(home, 'Library/LaunchAgents', `${name}.plist`),
     content: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${name}</string><key>ProgramArguments</key><array>${args.map(s => `<string>${xml(s)}</string>`).join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>15</integer><key>EnvironmentVariables</key><dict><key>HOME</key><string>${xml(home)}</string><key>PATH</key><string>${xml(envPath)}</string></dict><key>StandardOutPath</key><string>${xml(path.join(root, '.autoscale-controller.log'))}</string><key>StandardErrorPath</key><string>${xml(path.join(root, '.autoscale-controller.log'))}</string></dict></plist>\n`
   };
+  if (platform === 'win32') {
+    const log = path.join(root, '.autoscale-controller.log');
+    // kit-task.ps1 runs the controller from a logon task inside a kill-on-close job.
+    return { name, file: null, log, task: [...POWERSHELL_ARGS, '-File', path.join(root, 'kit-task.ps1')],
+      install: ['install', '-Name', name, '-Trigger', 'Logon', '-LogPath', log, '-CommandLine', kitTaskCommandLine(args)],
+      remove: ['remove', '-Name', name] };
+  }
   throw new Error('Unsupported service platform');
 }
 
 export async function configureController(options, command, enable = true) {
   const unit = controllerService(options);
+  if (process.platform === 'win32') {
+    await command(windowsPowerShell(), [...unit.task, ...(enable ? unit.install : unit.remove)]);
+    return;
+  }
   if (!enable) {
     if (process.platform === 'linux') await command('systemctl', ['--user', 'disable', '--now', unit.name]);
     else {
@@ -54,8 +66,9 @@ export async function acquireControllerLock(root) {
 }
 
 // Truncate the same inode: launchd retains an open descriptor to this path.
+// kit-task.ps1 on Windows appends line by line, so truncation is safe there too.
 export async function boundControllerLog(root) {
-  if (process.platform !== 'darwin') return;
+  if (!['darwin', 'win32'].includes(process.platform)) return;
   const file = path.join(root, '.autoscale-controller.log');
   const stat = await fs.lstat(file).catch(() => null);
   if (!stat?.isFile() || stat.size <= 1024 * 1024) return;
