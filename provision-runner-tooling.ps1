@@ -17,7 +17,7 @@ $NodeVersion = '24.19.0'
 $PnpmVersion = '11.20.0'
 $WranglerVersion = '4.69.0'
 $PulumiVersion = '3.143.0'
-$AwsVersion = '2.36.11'
+$AwsVersion = '2.36.22'
 
 $Root = [IO.Path]::GetFullPath($Root)
 $ToolsDir = Join-Path $Root 'tools'
@@ -44,7 +44,10 @@ $AwsBinPath = Join-Path $AwsInstallDir 'Amazon\AWSCLIV2\aws.exe'
 $AwsPackageUrl = if ($env:RUNNER_AWS_PACKAGE_URL) { $env:RUNNER_AWS_PACKAGE_URL } else { "https://awscli.amazonaws.com/AWSCLIV2-$AwsVersion.msi" }
 $ManifestPath = Join-Path $ToolsDir 'runner-tooling.env'
 # Installers below prepend tool directories; the runner PATH starts from this.
-$AmbientPath = $env:PATH
+# A shell opened before Git for Windows was installed lacks Git\cmd, so add the
+# saved machine and user PATH as well.
+$AmbientPath = @($env:PATH, [Environment]::GetEnvironmentVariable('PATH', 'Machine'),
+  [Environment]::GetEnvironmentVariable('PATH', 'User')) -join ';'
 
 function Get-ManifestContents {
   @(
@@ -84,6 +87,12 @@ function Get-EnvFileLines {
     "COREPACK_HOME=$CorepackHome"
     "PULUMI_HOME=$PulumiHome"
   )
+  # Git for Windows defaults core.symlinks to false and checks repository
+  # symlinks out as plain files. Environment config survives the temporary
+  # HOME that actions/checkout uses.
+  if (Test-DeveloperMode) {
+    $lines += 'GIT_CONFIG_COUNT=1', 'GIT_CONFIG_KEY_0=core.symlinks', 'GIT_CONFIG_VALUE_0=true'
+  }
   if (Test-Path -LiteralPath (Join-Path $Root 'job-hooks\runner-job-started.ps1')) { $lines += Get-JobHookEnvLines }
   $lines
 }
@@ -132,12 +141,15 @@ function Set-PnpmGlobalConfig {
 }
 
 # A .cmd shim keeps the real launcher path, so pnpm-generated launchers and
-# Pulumi plugins resolve next to their actual install.
+# Pulumi plugins resolve next to their actual install. Git Bash ignores
+# PATHEXT, so `shell: bash` steps need the extensionless sh launcher beside it.
 function Write-CmdShim([string]$Target, [string]$ShimPath) {
   if ($DryRun) { return }
   if (-not (Test-Path -LiteralPath $Target)) { throw "runner tool launcher is missing: $Target" }
   New-Item -ItemType Directory -Force -Path (Split-Path $ShimPath) | Out-Null
   Write-KitText $ShimPath "@`"$Target`" %*`r`n"
+  $shTarget = $Target.Replace('\', '/').Replace("'", "'\''")
+  Write-KitText ($ShimPath -replace '\.cmd$', '') "#!/bin/sh`nexec '$shTarget' `"`$@`"`n"
 }
 
 function Write-EnvFiles {

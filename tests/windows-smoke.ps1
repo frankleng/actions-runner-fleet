@@ -163,6 +163,10 @@ $runner = '{"agentId":7,"agentName":"' + $values['--name'] + '","gitHubUrl":"' +
     Assert-True (Test-Path -LiteralPath (Join-Path $persist $leaf)) "overlay installed $leaf"
   }
   Assert-True ((Read-Text (Join-Path $persist '.env')) -match "(?m)^ACTIONS_RUNNER_HOOK_JOB_STARTED=.*runner-job-started\.ps1`$") '.env points job hooks at the managed wrappers'
+  $wranglerSh = Read-Text (Join-Path $persist 'tools\bin\wrangler')
+  Assert-True ($wranglerSh -match "^#!/bin/sh`nexec '.*/pnpm-tools/bin/wrangler\.cmd' `"\`$@`"`n`$") 'provisioning writes an sh launcher for Git Bash beside each .cmd shim' $wranglerSh
+  $developerMode = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense -eq 1
+  Assert-True (((Read-Text (Join-Path $persist '.env')) -match '(?m)^GIT_CONFIG_KEY_0=core\.symlinks$') -eq $developerMode) '.env enables Git symlinks exactly when Developer Mode is on'
   $result = Invoke-Kit 'manage-runners.ps1' @('set-cpu-limit', 'smoke-persist', '0')
   Assert-True ($result.Code -ne 0) 'CPU quota below 1% is rejected'
   $result = Invoke-Kit 'manage-runners.ps1' @('set-cpu-limit', 'smoke-persist', [string]([Environment]::ProcessorCount * 100 + 1))

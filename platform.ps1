@@ -74,6 +74,14 @@ function Assert-ServicePath([string]$Path) {
   }
 }
 
+# Runner tasks run with a limited token, which never holds the symlink
+# privilege, even for administrators. Developer Mode lets unelevated processes
+# create symlinks; enabling it needs an administrator once per host.
+function Test-DeveloperMode {
+  $key = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -ErrorAction SilentlyContinue
+  [bool]($key -and $key.AllowDevelopmentWithoutDevLicense -eq 1)
+}
+
 function Get-AvailableCpuCount {
   $count = [Environment]::ProcessorCount
   if ($count -lt 1) { throw 'could not determine the number of available logical CPUs' }

@@ -96,6 +96,13 @@ if (-not (Test-Path -LiteralPath $FleetPath)) {
   "created $FleetPath"
 }
 
+if (-not (Test-DeveloperMode)) {
+  ''
+  'note: Developer Mode is off, so jobs cannot create symlinks and Git checks them out as plain files.'
+  '      Enable it once from an elevated PowerShell, then reprovision runners:'
+  "      reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock /t REG_DWORD /f /v AllowDevelopmentWithoutDevLicense /d 1"
+}
+
 ''
 if (-not (Test-Path -LiteralPath $AutoscalePath)) {
   # The public template uses Linux labels; Windows jobs request these instead.

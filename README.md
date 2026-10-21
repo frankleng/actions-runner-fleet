@@ -837,6 +837,18 @@ local execution policy blocks unsigned scripts. Behaviour on Windows:
 - **Credentials:** JIT handoffs write the runner's RSA key with DPAPI, which
   the Windows runner requires. Runner directories are full copies of the
   runner image, because NTFS has no copy-on-write clones.
+- **Symlinks** need Developer Mode. Runner tasks run with a limited token,
+  which lacks the symlink privilege even for administrators, so without it
+  tools such as 7-Zip, Node.js, and Git cannot create symlinks. Enable it once
+  from an elevated PowerShell, then reprovision each runner. Provisioning then
+  sets `core.symlinks=true` through the runner's `.env`:
+
+  ```powershell
+  reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock /t REG_DWORD /f /v AllowDevelopmentWithoutDevLicense /d 1
+  ```
+- **Tool shims:** each tool in `tools\bin` has a `.cmd` shim for PowerShell and
+  cmd, plus an extensionless `sh` launcher. Git Bash ignores PATHEXT, so
+  `shell: bash` steps use the launcher.
 - **Labels:** `prepare.ps1` writes `self-hosted`, `Windows`, `X64` into a new
   `autoscale.json`.
 
