@@ -15,15 +15,17 @@ tools are never committed.
 Autoscaling is the default deployment path. After preparing the kit, edit the
 ignored `autoscale.json` for your account and run `./runnerctl autoscale --prepare`.
 Slot setup enables and starts the background controller automatically. It starts
-at boot on Linux (with login lingering) or login on macOS. See
+at boot on Linux (with login lingering), or at login on macOS and Windows. See
 [automatic scaling](#automatic-runner-and-cpu-scaling) for configuration.
 
 ## What gets installed
 
-- GitHub Actions Runner `2.336.0` for Linux x64 or macOS arm64, verified by SHA-256
-- One isolated directory and user service per runner (systemd or launchd);
-  runner binaries are copy-on-write clones of a shared image where the
-  filesystem supports it (XFS/Btrfs reflinks, APFS clonefiles)
+- GitHub Actions Runner `2.336.0` for Linux x64, macOS arm64, or Windows x64,
+  verified by SHA-256
+- One isolated directory and user service per runner (systemd, launchd, or a
+  per-user scheduled task on Windows); runner binaries are copy-on-write clones
+  of a shared image where the filesystem supports it (XFS/Btrfs reflinks, APFS
+  clonefiles) and full copies on NTFS
 - A persistent, dashboard-configurable CPU quota per runner (50% of the
   host's available logical CPU capacity by default)
 - Background CPU scheduling for Linux runners, allowing interactive services
@@ -41,11 +43,15 @@ ARM, and Intel Macs are not currently supported.
 
 ## Requirements
 
-- Ubuntu/Linux using an `x86_64` shell, or Apple-silicon macOS using `arm64`
+- Ubuntu/Linux using an `x86_64` shell, Apple-silicon macOS using `arm64`, or
+  Windows x64 with the built-in Windows PowerShell 5.1
 - On Linux, a working systemd user manager. Setup enables login lingering
   automatically so runners start at boot; if that is not permitted for the
   account, it warns and the fallback is `sudo loginctl enable-linger "$USER"`
 - On macOS, an account that remains logged in while its launchd agents run
+- On Windows, an account that remains logged on while its scheduled tasks run,
+  and [Git for Windows](https://git-scm.com/download/win), which `gh auth login`
+  and `actions/checkout` need; administrator rights are not required
 - Network access to GitHub, Node.js, the package registry, Pulumi, and AWS download endpoints
 - Node.js and Corepack when building from this source checkout; setup installs pinned pnpm
 - Admin access to each GitHub repository, organization, or enterprise that will
@@ -85,6 +91,9 @@ cd ../actions-runner
 Move or rename the extracted directory **before** registering runners. The
 local registry records absolute runner-directory paths.
 
+There is no Windows release package yet; on Windows, set up from the source
+repository below.
+
 ## Setup from the source repository
 
 Clone the repository and prepare the checkout. The correct runner archive is
@@ -97,10 +106,18 @@ cd actions-runner
 ./prepare.sh
 ```
 
+On Windows, run the same steps in PowerShell with `.\prepare.ps1`:
+
+```powershell
+gh repo clone YOUR_GITHUB_OWNER/actions-runner-fleet actions-runner
+cd actions-runner
+powershell -NoProfile -ExecutionPolicy Bypass -File .\prepare.ps1
+```
+
 Replace `YOUR_GITHUB_OWNER` with the GitHub user or organization that owns the
 private repository.
 
-`prepare.sh` verifies the host, downloads the pinned official runner archive,
+`prepare.sh` (or `prepare.ps1`) verifies the host, downloads the pinned official runner archive,
 checks its SHA-256, installs the dashboard dependency, and creates ignored
 `fleet.tsv` and `autoscale.json` examples. Edit `autoscale.json` and run
 `./runnerctl autoscale --prepare` to start the default autoscaled deployment.
@@ -200,7 +217,8 @@ same scope selected above immediately before setup:
 - Enterprise runner: enterprise **Policies → Actions → Runners → New runner →
   New self-hosted runner**
 
-Select Linux/x64 or macOS/ARM64 to match the host if GitHub asks for a platform.
+Select Linux/x64, macOS/ARM64, or Windows/x64 to match the host if GitHub asks
+for a platform.
 This kit needs only the registration token from that page; do not paste the
 displayed installation commands.
 
@@ -290,8 +308,8 @@ That compatibility override creates paths such as
 `/Volumes/CI/actions-runner-mac-arm64-1`.
 
 Do not move the kit or runner directories after registration. If they must
-move, stop and re-register them so launchd and `runners.tsv` contain the new
-absolute paths.
+move, stop and re-register them so the service definitions and `runners.tsv`
+contain the new absolute paths.
 
 ## Verify and operate runners
 
@@ -331,7 +349,7 @@ so both disk and network rates have two observations. Set
 needed.
 
 The dashboard refreshes every five seconds and attributes resources to each
-runner's launchd service plus its descendant process tree:
+runner's service plus its descendant process tree:
 
 - The runner list shows CPU, resident memory, disk read/write rates, network
   receive/send rates, and service uptime for every tracked runner.
@@ -343,7 +361,7 @@ runner's launchd service plus its descendant process tree:
   starts, then remain cumulative for that dashboard session. Very short-lived
   processes that start and exit entirely between refreshes cannot be counted.
 - Network counters need about 5-10 seconds for the first `nettop` sample and
-  dashboard refresh.
+  dashboard refresh. Per-process network counters are available only on macOS.
 
 Set a different refresh interval in milliseconds, or disable automatic
 refresh:
@@ -416,8 +434,10 @@ Runners default to 50% of the logical CPU capacity available to the host
 process. CPU quotas use `100%` per logical CPU, so a host with eight available
 logical CPUs has an `800%` ceiling and a `400%` default per runner. Linux
 applies the quota to the full systemd service cgroup. macOS uses a pinned
-`cpulimit` build that monitors the listener and its descendants. In both cases,
-a workflow and every process it launches share the same limit.
+`cpulimit` build that monitors the listener and its descendants. Windows
+applies a hard cap to the job object that holds the supervisor and every
+process it starts. In each case, a workflow and every process it launches
+share the same limit.
 
 Runner services are assigned to systemd's `background.slice`, whose lower CPU
 weight lets services in `app.slice`—including an interactive T3 Code
@@ -426,8 +446,8 @@ runners can still use otherwise-idle CPU up to their configured quota.
 
 In the dashboard, select a runner and press `c` to view or change its limit up
 to the host's full available capacity. The change is persisted in the runner
-directory for future starts. Linux applies it live; updated macOS wrappers reload the limiter within one
-second without restarting the listener. The
+directory for future starts. Linux applies it live; macOS and Windows
+supervisors apply it within one second without restarting the listener. The
 equivalent command is:
 
 ```bash
@@ -458,8 +478,8 @@ moving a same-name runner.
 
 ## Automatic runner and CPU scaling
 
-`runnerctl autoscale` manages a pool of **ephemeral runner slots** on Linux or
-macOS. Each slot has its own provisioned directory and user service. The
+`runnerctl autoscale` manages a pool of **ephemeral runner slots** on Linux,
+macOS, or Windows. Each slot has its own provisioned directory and user service. The
 controller obtains a fresh GitHub registration when capacity is needed. The
 runner accepts one job, finishes it, deregisters itself, and exits. Its local
 service then parks until the controller supplies another fresh registration.
@@ -473,6 +493,9 @@ test -f autoscale.json || cp autoscale.example.json autoscale.json
 chmod 600 autoscale.json
 ```
 
+On Windows, `prepare.ps1` creates an owner-only `autoscale.json` with Windows
+labels; edit it in place so it keeps its access list.
+
 Edit `target`, `repositories`, `labels`, and `runnerGroupId` to match
 your account. Slot names are generated from hardware capacity by default;
 you can supply a `runners` list to use specific **new runner names**. The controller refuses
@@ -481,6 +504,7 @@ For a personal repository, use `"scope": "repository"` and
 `"target": "YOUR_USER/YOUR_REPOSITORY"`. For an organization, use
 `"scope": "organization"` and `"target": "YOUR_ORGANIZATION"`. The template
 uses Linux x64 labels; change them to your workflow's labels on macOS.
+`prepare.ps1` writes `self-hosted`, `Windows`, `X64` on Windows.
 `runnerGroupId` must be the numeric GitHub runner group ID for the target;
 confirm it in your GitHub configuration rather than assuming the example ID.
 Every slot in a pool uses the same labels and group.
@@ -514,10 +538,13 @@ Authenticate `gh` for `github.com`, or provide a token through the
 `RUNNER_AUTOSCALE_TOKEN` environment variable using your secret manager. For
 unattended hosts, prefer a token file: `.autoscale-token` in the kit root, or
 the path in `RUNNER_AUTOSCALE_TOKEN_FILE`. It must be a regular file owned by
-the controller user with mode `0600`. `gh` may store its token in a desktop
+the controller user with mode `0600`; on Windows, an owner-only access list
+replaces the mode (see [Windows hosts](#windows-hosts)). `gh` may store its token in a desktop
 keyring that stays locked after reboots or keyring restarts until someone logs
 in; the controller keeps using the last token it read from `gh`, but a restarted
-controller cannot read a locked keyring.
+controller cannot read a locked keyring. An organization pool needs the
+`admin:org` scope; add it with
+`gh auth login -h github.com -s admin:org,repo,workflow,read:org`.
 Explicit `--dry-run` preview needs **Actions: read** on every selected repository and
 **Self-hosted runners: read** for an organization pool, or **Administration:
 read** for a repository pool. Default autoscaling needs **Self-hosted runners:
@@ -536,8 +563,8 @@ registration tokens alone cannot monitor queues or create JIT configurations.
 ```
 
 Use `--config /path/to/private-config.json` for configuration outside the
-checkout. Setup installs a systemd user service on Linux or a launchd agent
-on macOS. It uses that user's `gh` credential store; tokens are never copied
+checkout. Setup installs a systemd user service on Linux, a launchd agent on
+macOS, or a logon scheduled task on Windows. It uses that user's `gh` credential store; tokens are never copied
 into the generated service definition. A token provided only in a foreground
 shell is not inherited by the installed background service. Do not run a
 second foreground controller while the background controller is enabled.
@@ -574,7 +601,7 @@ hosts can claim queued jobs first.
 | `minRunners` / `maxRunners` | `auto` / `auto` | Derived from CPU and RAM; numeric values override sizing |
 | `intervalSeconds` | 60 | Delay between polls; minimum 15 seconds |
 | `cooldownSeconds` | 120 | Accepted for compatibility; ignored. Ephemeral listeners are consumed per job, so growth is never delayed |
-| `lowLoad` / `highLoad` | 0.6 / 1.0 | One-minute load average divided by available logical CPUs |
+| `lowLoad` / `highLoad` | 0.6 / 1.0 | One-minute load average divided by available logical CPUs; on Windows, the busy CPU fraction between polls |
 | `minFreeMemoryPercent` | 10 | Block growth and reduce CPU budget below this available-memory level |
 | `cpuBudgetPercent` | 80 | Normal pool CPU budget as a percentage of host CPU capacity |
 | `pressureCpuBudgetPercent` | 30 | Pool CPU budget under host pressure |
@@ -599,7 +626,8 @@ successful poll, so a short gap after simultaneous completions is expected.
 
 Linux CPU quotas cover service processes and their children; Docker
 daemon-owned containers require their own resource limits. macOS uses the
-kit's existing process CPU limiter, which is best effort. Load average includes
+kit's existing process CPU limiter, which is best effort. Windows job object
+caps cover every process the service starts. Load average includes
 waiting work, and free-memory measurements are conservative. Tune thresholds
 after observing your host. Polling costs grow with repositories and active
 runs.
@@ -651,7 +679,7 @@ the autoscale controller. It looks for:
 
 ```bash
 ./runnerctl health --dry-run   # print current problems; send and save nothing
-./runnerctl health --install   # systemd user timer, every 5 minutes (Linux)
+./runnerctl health --install   # every 5 minutes: systemd user timer (Linux) or scheduled task (Windows)
 ./runnerctl health --uninstall
 ```
 
@@ -673,7 +701,8 @@ lives in the private `.health-state.json`. Configure one or both targets:
   thing that is broken. Use a private repo; issues name runners and orgs.
 - **Webhook.** A JSON `POST` with `host`, `kit`, `summary`, `problems`, `title`
   and `markdown`, sent to `RUNNER_HEALTH_WEBHOOK_URL` or the private file
-  `.health-webhook` (a regular file owned by you, mode `0600`).
+  `.health-webhook` (a regular file owned by you, mode `0600`, or owner-only on
+  Windows).
 
 GitHub status checks reuse the autoscaler's token sources:
 `RUNNER_AUTOSCALE_TOKEN`, `.autoscale-token`, or `gh auth token`. `--install`
@@ -750,11 +779,21 @@ Bash, or WSL. In PowerShell, `.\runnerctl` resolves to `runnerctl.ps1`, so the
 | `runsvc.sh` | `runsvc.ps1` supervisor |
 | `job-hooks/*.sh` | `job-hooks\*.ps1` |
 
+Set up an autoscaled Windows pool:
+
 ```powershell
-.\prepare.ps1                          # runner zip, Node.js, dashboard dependency
-.\runnerctl autoscale --prepare        # after editing autoscale.json
+winget install --id Git.Git -e   # then open a new terminal so PATH includes Git
+gh auth login -h github.com -s admin:org,repo,workflow,read:org
+.\prepare.ps1                     # runner zip, Node.js, dashboard dependency, autoscale.json
+# Edit autoscale.json: target, repositories, runners, runnerGroupId
+.\runnerctl autoscale --dry-run   # read-only check of authentication and queues
+.\runnerctl autoscale --prepare   # provision slots and start the controller task
 .\runnerctl stats
 ```
+
+Windows jobs then use `runs-on: [self-hosted, Windows, X64]`. Find the runner
+group ID with `gh api /orgs/ORGANIZATION/actions/runner-groups`; the Default
+group is usually `1`.
 
 Run scripts with `powershell -ExecutionPolicy Bypass -File SCRIPT` if the
 local execution policy blocks unsigned scripts. Behaviour on Windows:
@@ -783,8 +822,10 @@ local execution policy blocks unsigned scripts. Behaviour on Windows:
   means fully saturated. Free memory is Windows' available physical memory.
 - **Private files** replace mode `0600` with an access list. It must allow
   only this user, SYSTEM, and Administrators. `prepare.ps1` restricts
-  `autoscale.json` and `.runners\`, and each runner directory is restricted
-  when created. Create a token file the same way:
+  `autoscale.json` and `.runners\`, and each runner directory gets a protected
+  owner-only list before the runner is copied in, which removes any existing
+  grants to other accounts. Reconcile refuses a runner directory that other
+  users can read. Create a token file the same way:
 
   ```powershell
   # Restrict the empty file first so the token is never readable by others.
@@ -799,9 +840,10 @@ local execution policy blocks unsigned scripts. Behaviour on Windows:
 - **Labels:** `prepare.ps1` writes `self-hosted`, `Windows`, `X64` into a new
   `autoscale.json`.
 
-`bootstrap.sh`, `restore-fleet.sh`, `build-portable-package.sh`,
-`configure-host-temp.sh`, and `security-audit.sh` have no Windows versions yet.
-On Windows, use `manage-runners.ps1 register` or autoscaling instead.
+`bootstrap.sh`, `restore-fleet.sh`, `build-portable-package.sh`, and
+`configure-host-temp.sh` have no Windows versions yet. On Windows, use
+`manage-runners.ps1 register` or autoscaling instead. `security-audit.sh` runs
+in Git Bash, which Git for Windows installs.
 
 ## Test
 
@@ -822,9 +864,9 @@ pnpm --dir runnerctl-app test
 
 The smoke test works on a sandboxed copy of the kit with a fake runner image
 and `example-org` task names; it needs no network access or GitHub
-credentials. It covers registration, the supervisor's restart behavior, live
-CPU caps, graceful stop, the DPAPI-protected JIT handoff, job hooks, and
-kit-level tasks. It then removes its tasks. Node tests that drive the bash
+credentials. It covers registration, owner-only access lists, the supervisor's
+restart behavior, live CPU caps, graceful stop, the DPAPI-protected JIT
+handoff, job hooks, and kit-level tasks. It then removes its tasks. Node tests that drive the bash
 scripts need Linux or macOS.
 
 ## Troubleshooting
@@ -848,22 +890,34 @@ scripts need Linux or macOS.
   prefix to a larger volume before registration.
 - **Apple build commands missing:** install/select full Xcode, accept its
   license, and install CocoaPods before running Apple build workflows.
+- **Windows: scripts are blocked by execution policy:** run them with
+  `powershell -NoProfile -ExecutionPolicy Bypass -File SCRIPT`.
+- **Windows: `gh auth login` cannot find Git after installing it:** terminals
+  opened before the install keep the old `PATH`, including new tabs of an app
+  that was already running. Restart the terminal app, or reload `PATH` with
+  `$env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')`.
+- **Windows: autoscaling gets HTTP 403 from the runner APIs:** the GitHub token
+  lacks `admin:org`. `gh auth status` lists its scopes; log in again with the
+  command in [Windows hosts](#windows-hosts).
+- **Windows: a runner task is Running but the runner is offline:** inspect
+  `<runner-directory>\_diag\runsvc-supervisor.log`, `runsvc.err.log`, and
+  `Runner_*.log`. Tasks run only while the account is logged on.
 
 Autoscaling recovery and portability notes:
 
 - Config changes are validated each poll. Invalid edits keep the last valid settings and produce an aggregate diagnostic. To provision additional slots, run `./runnerctl autoscale --disable`, edit the config, then `./runnerctl autoscale --prepare`. Disabling the controller does not stop runner services.
 - One unavailable slot reserves capacity conservatively and receives no commands; healthy slots keep CPU control and can accept fresh registrations. HTTP registration rejections (400, 401, 403, 404, 422, 429) release their reservation for retry. Network failures, conflicts, and ambiguous server outcomes remain blocked for inspection.
 - Current controllers and workers use kernel-owned loopback TCP locks, released automatically after a crash. Locks serve no protocol and contain no credentials. A deterministic port collision fails closed with a lock diagnostic. Legacy live PID locks are honored during upgrades. An interrupted generation remains blocked even after its lock is recovered; never replay its credentials.
-- CPU quotas include idle listeners because any listener can accept work between polls. Dividing only by a stale busy count could exceed the host budget. Linux quota updates are batched for service-manager reloads. Available memory comes from Linux `MemAvailable` or macOS `memory_pressure -Q`; unavailable metrics conservatively block growth. macOS controller logs are bounded to approximately 1 MiB between polls.
+- CPU quotas include idle listeners because any listener can accept work between polls. Dividing only by a stale busy count could exceed the host budget. Linux quota updates are batched for service-manager reloads. Available memory comes from Linux `MemAvailable`, macOS `memory_pressure -Q`, or Windows available physical memory; unavailable metrics conservatively block growth. macOS controller logs are bounded to approximately 1 MiB between polls.
 - Use Node.js 24 or newer. The launcher prefers its bundled runtime and validates an explicit override. For a proxy, configure `HTTPS_PROXY`/`NO_PROXY` and `NODE_USE_ENV_PROXY=1` in the controller's private service environment (or foreground shell). These settings are not copied into the generated public service template; provisioning inherits only the explicit proxy/certificate variables, not GitHub tokens. Keep proxy credentials in an owner-only service environment file, outside Git.
 - Public packages copy an explicit source allowlist and install dependencies in clean staging with `pnpm --frozen-lockfile --ignore-scripts`. Building requires pnpm and registry access or a populated package cache. Local dependency trees and unrelated files under source directories are excluded. New public source files must be added explicitly to `.gitignore` and, when shipped, the packaging allowlist.
-- Supported targets are Linux x64 and Apple-silicon macOS, not arbitrary operating systems. macOS runtime changes require native validation on a Mac. Updating a worker script on disk takes effect when its parked supervisor is safely restarted; never restart a service that may own a job merely to deploy an update.
+- Supported targets are Linux x64, Apple-silicon macOS, and Windows x64, not arbitrary operating systems. macOS and Windows runtime changes require native validation on those hosts; on Windows, run `tests\windows-smoke.ps1`. Updating a worker script on disk takes effect when its parked supervisor is safely restarted; never restart a service that may own a job merely to deploy an update.
 
 Final review recovery details:
 
 - `--prepare` saves generated runner names into the private configuration before provisioning. Subsequent hardware changes adjust bounds while retaining every managed slot. To add capacity after a resize, disable the controller, add new slot names, and rerun preparation. Bare monitoring requires preparation first when no explicit slot list exists.
 - A local start or handoff failure quarantines that slot for the controller process lifetime and allows later healthy slots to start. Repair the local service, inspect ambiguous lifecycle state, and restart only the controller to retry. Registration API failures retain their separate ambiguity rules.
 - A reboot can interrupt even an idle ephemeral listener. Its registration may remain offline at GitHub and the local slot stays blocked. Inspect the slot's private diagnostics, confirm no listener/job remains, resolve the orphan registration, and only then remove failed-generation state before restarting that slot. Never reuse its consumed credentials.
-- Runner service templates require kit, runner, and runtime paths without whitespace or shell/XML special characters. Use a simple path such as `/srv/runner-fleet` or `$HOME/runner-fleet`; unsupported paths are rejected before service provisioning. Controller-only paths are escaped independently.
+- Runner service templates require kit, runner, and runtime paths without whitespace or shell/XML special characters. Use a simple path such as `/srv/runner-fleet` or `$HOME/runner-fleet`; unsupported paths are rejected before service provisioning. Controller-only paths are escaped independently. Windows paths may contain spaces but not quotes, percent signs, or other special characters, because scheduled task actions expand `%VARIABLES%`.
 
-macOS services target the logged-in user’s launchd GUI domain. A headless SSH session without a GUI login is not sufficient for starting these agents. Template updates require a safe service reload after its generation finishes; `kickstart` alone does not reload a changed plist.
+macOS services target the logged-in user’s launchd GUI domain. A headless SSH session without a GUI login is not sufficient for starting these agents. Windows scheduled tasks likewise use interactive logon and start when the account logs on. `svc.ps1 stop` and `status` also work from other logon sessions. Template updates require a safe service reload after its generation finishes; `kickstart` alone does not reload a changed plist.
