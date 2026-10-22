@@ -15,12 +15,19 @@ export function hardwareRunnerBounds({ cpus = os.availableParallelism(), memoryB
   const maxRunners = Math.max(1, Math.min(Math.floor(cpus / 2), Math.floor((memoryBytes - reserve) / (4 * GiB))));
   return { minRunners: Math.max(1, Math.floor(maxRunners / 4)), maxRunners };
 }
+// The automatic per-runner CPU floor: an eighth of the host, between one and
+// four CPUs. A job never crawls on a sliver of a CPU, and one runner still
+// cannot take the whole machine.
+export function hardwareMinCpuQuota(cpus = os.availableParallelism()) {
+  if (!Number.isSafeInteger(cpus) || cpus < 1) fail();
+  return Math.min(400, Math.max(100, Math.floor(cpus * 100 / 8)));
+}
 export function validateConfig(raw, hardware) {
   const bounds = hardwareRunnerBounds(hardware);
   const defaults = { minRunners: bounds.minRunners, maxRunners: bounds.maxRunners, intervalSeconds: 60,
     cooldownSeconds: 120, lowLoad: 0.6, highLoad: 1,
     minFreeMemoryPercent: 10, cpuBudgetPercent: 80, pressureCpuBudgetPercent: 30,
-    minCpuQuotaPercent: 25, maxCpuQuotaPercent: 800, pressureQueueGraceSeconds: 60 };
+    minCpuQuotaPercent: hardwareMinCpuQuota(hardware?.cpus), maxCpuQuotaPercent: 800, pressureQueueGraceSeconds: 60 };
   const allowed = new Set([...Object.keys(defaults), 'scope', 'target', 'repositories', 'runners', 'labels', 'runnerGroupId', 'baselineRunners']);
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !allowed.has(k))) fail();
   const c = { ...defaults, baselineRunners: [], ...raw };
@@ -30,6 +37,8 @@ export function validateConfig(raw, hardware) {
     c.maxRunners = Array.isArray(raw.runners) ? Math.min(bounds.maxRunners, raw.runners.length + c.baselineRunners.length) : bounds.maxRunners;
   }
   if (automatic('minRunners')) c.minRunners = Math.max(c.baselineRunners.length, Math.min(bounds.minRunners, Math.max(1, Math.floor(c.maxRunners / 4))));
+  // An explicit lower ceiling wins over the automatic floor.
+  if (automatic('minCpuQuotaPercent')) c.minCpuQuotaPercent = Math.min(defaults.minCpuQuotaPercent, Number.isSafeInteger(c.maxCpuQuotaPercent) ? c.maxCpuQuotaPercent : defaults.minCpuQuotaPercent);
   if (raw.runners === undefined) {
     if (!Number.isSafeInteger(c.maxRunners) || c.maxRunners < 1 || c.maxRunners > 10000) fail();
     c.runners = Array.from({ length: Math.max(0, c.maxRunners - c.baselineRunners.length) }, (_, i) => `ci-ephemeral-${i + 1}`);
@@ -318,6 +327,16 @@ export function cpuPolicy(c, count, host, state) {
   return { pressure: !!state.pressure, free, quota };
 }
 
+// The local CPU step runs before GitHub is read each poll, and alone while
+// reads are paused. It reuses the last poll's working count only while that is
+// recent and never above the slots active now; otherwise every active slot
+// shares the budget, so finished or newly busy runners are never mis-sized for
+// long.
+export function localSharing(c, state, active, now) {
+  const recent = Number.isFinite(state.sharingAt) && now - state.sharingAt <= 3 * c.intervalSeconds * 1000;
+  return Math.max(1, recent ? Math.min(state.sharing, active) : active);
+}
+
 export function plan(c, { runners, queued, queuedAt = [] }, local, host, state, now) {
   if (![host.cpus, host.load, host.freeMemoryPercent].every(Number.isFinite) || host.cpus < 1 || host.load < 0) {
     throw new AutoscaleError('Host metrics unavailable');
@@ -341,8 +360,15 @@ export function plan(c, { runners, queued, queuedAt = [] }, local, host, state, 
   const target = desired;
   const start = runners.filter(r => !r.unavailable && !local.get(r.name).unavailable && !local.get(r.name).active && local.get(r.name).phase === 'ready' && !r.registered)
     .slice(0, Math.max(0, target - active.length));
-  const count = Math.max(1, active.length + start.length);
-  const { quota } = cpuPolicy(c, count, host, state);
+  // The budget is shared by the runners expected to work this interval: busy
+  // ones plus those about to take queued jobs. Idle warm listeners use no CPU,
+  // and counting them shrank every job's quota (a 16-slot pool under pressure
+  // left 0.6 CPU per job and timed out a five-minute job). A listener that
+  // takes work before the next poll may overshoot the budget briefly; cgroup
+  // weights share contended CPU, and the next poll recomputes.
+  const sharing = Math.max(1, Math.min(active.length + start.length, busy + queued));
+  Object.assign(state, { sharing, sharingAt: now });
+  const { quota } = cpuPolicy(c, sharing, host, state);
   return { queued, waiting, active: active.length, busy, desired, pressure: !!state.pressure, quota,
     start: start.map(r => r.name), retiring: Math.max(0, active.length - desired) };
 }

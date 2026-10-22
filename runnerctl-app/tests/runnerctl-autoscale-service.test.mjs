@@ -42,7 +42,7 @@ test('controller lock excludes a live owner and recovers a dead owner on restart
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 test('six existing baseline runners count toward the total maximum and share CPU quotas', () => {
-  const c = validateConfig({ minRunners: 6, maxRunners: 16, scope: 'organization', target: 'example-org', repositories: ['example-org/repo'], labels: ['self-hosted'], runnerGroupId: 1,
+  const c = validateConfig({ minRunners: 6, maxRunners: 16, minCpuQuotaPercent: 25, scope: 'organization', target: 'example-org', repositories: ['example-org/repo'], labels: ['self-hosted'], runnerGroupId: 1,
     baselineRunners: Array.from({ length: 6 }, (_, i) => `baseline-${i}`), runners: Array.from({ length: 10 }, (_, i) => `burst-${i}`) });
   const local = new Map([...c.baselineRunners.map(name => [name, { active: true, phase: 'baseline' }]), ...c.runners.map(name => [name, { active: false, phase: 'ready' }])]);
   const runners = [...local.keys()].map(name => ({ name, busy: name.startsWith('baseline'), registered: name.startsWith('baseline') }));

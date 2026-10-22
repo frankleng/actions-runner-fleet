@@ -612,10 +612,12 @@ hosts can claim queued jobs first.
 | `cpuBudgetPercent` | 80 | Normal pool CPU budget as a percentage of host CPU capacity |
 | `pressureCpuBudgetPercent` | 30 | Pool CPU budget under host pressure |
 | `pressureQueueGraceSeconds` | 60 | Under CPU pressure, how long a queued job waits before it gets a runner anyway |
-| `minCpuQuotaPercent` / `maxCpuQuotaPercent` | 25 / 800 | Per-runner quota bounds; 100% means one logical CPU |
+| `minCpuQuotaPercent` / `maxCpuQuotaPercent` | `auto` / 800 | Per-runner quota bounds; 100% means one logical CPU. The automatic floor is an eighth of the host, between 100% and 400%, and never above the ceiling |
 
-Under pressure, the controller divides the reduced CPU budget among active
-listeners and holds growth back: a newly queued job waits up to
+The CPU budget is divided among the runners expected to work: busy ones plus
+those about to take queued jobs. Idle warm listeners use no CPU, so they do not
+shrink anyone's quota. Under pressure, the controller divides the reduced
+budget the same way and holds growth back: a newly queued job waits up to
 `pressureQueueGraceSeconds` for the host to recover, then gets a runner anyway,
 because contention only slows a job while a job with no runner never starts.
 Low memory still blocks growth outright. It leaves pressure, restoring the normal budget
@@ -624,8 +626,8 @@ thresholds, it retains the previous pressure state, so a host that was not
 under pressure keeps growing. The minimum count remains a floor under pressure.
 A minimum per-runner quota can make the total exceed the pool budget; these
 are policy targets, not an aggregate cgroup limit. On a 16-CPU host with 16
-active listeners, the defaults allow each 80% of one CPU normally and 30%
-under pressure.
+busy runners, the budget alone would allow each 80% of one CPU normally and 30%
+under pressure; the automatic floor raises both to 200%.
 
 Retirement happens at job completion, not on a timer. A runner already
 listening for its first job remains available until it gets and finishes that
@@ -951,7 +953,7 @@ Autoscaling recovery and portability notes:
 - Config changes are validated each poll. Invalid edits keep the last valid settings and produce an aggregate diagnostic. To provision additional slots, run `./runnerctl autoscale --disable`, edit the config, then `./runnerctl autoscale --prepare`. Disabling the controller does not stop runner services.
 - One unavailable slot reserves capacity conservatively and receives no commands; healthy slots keep CPU control and can accept fresh registrations. HTTP registration rejections (400, 401, 403, 404, 422, 429) release their reservation for retry. Network failures, conflicts, and ambiguous server outcomes remain blocked for inspection.
 - Current controllers and workers use kernel-owned loopback TCP locks, released automatically after a crash. Locks serve no protocol and contain no credentials. A deterministic port collision fails closed with a lock diagnostic. Legacy live PID locks are honored during upgrades. An interrupted generation remains blocked even after its lock is recovered; never replay its credentials.
-- CPU quotas include idle listeners because any listener can accept work between polls. Dividing only by a stale busy count could exceed the host budget. Linux quota updates are batched for service-manager reloads. Available memory comes from Linux `MemAvailable`, macOS `memory_pressure -Q`, or Windows available physical memory; unavailable metrics conservatively block growth. macOS controller logs are bounded to approximately 1 MiB between polls.
+- CPU quotas exclude idle listeners: counting them gave every job a sliver of the budget (0.6 CPU each in a 16-slot pool under pressure, which timed out a five-minute job). A listener that takes work between polls can overshoot the budget until the next poll; runners share contended CPU with interactive work by cgroup weight, and the per-runner floor keeps every job moving. Linux quota updates are batched for service-manager reloads. Available memory comes from Linux `MemAvailable`, macOS `memory_pressure -Q`, or Windows available physical memory; unavailable metrics conservatively block growth. macOS controller logs are bounded to approximately 1 MiB between polls.
 - Use Node.js 24 or newer. The launcher prefers its bundled runtime and validates an explicit override. For a proxy, configure `HTTPS_PROXY`/`NO_PROXY` and `NODE_USE_ENV_PROXY=1` in the controller's private service environment (or foreground shell). These settings are not copied into the generated public service template; provisioning inherits only the explicit proxy/certificate variables, not GitHub tokens. Keep proxy credentials in an owner-only service environment file, outside Git.
 - Public packages copy an explicit source allowlist and install dependencies in clean staging with `pnpm --frozen-lockfile --ignore-scripts`. Building requires pnpm and registry access or a populated package cache. Local dependency trees and unrelated files under source directories are excluded. New public source files must be added explicitly to `.gitignore` and, when shipped, the packaging allowlist.
 - Supported targets are Linux x64, Apple-silicon macOS, and Windows x64, not arbitrary operating systems. macOS and Windows runtime changes require native validation on those hosts; on Windows, run `tests\windows-smoke.ps1`. Updating a worker script on disk takes effect when its parked supervisor is safely restarted; never restart a service that may own a job merely to deploy an update.

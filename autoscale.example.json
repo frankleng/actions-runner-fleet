@@ -13,7 +13,7 @@
   "minFreeMemoryPercent": 10,
   "cpuBudgetPercent": 80,
   "pressureCpuBudgetPercent": 30,
-  "minCpuQuotaPercent": 25,
+  "minCpuQuotaPercent": "auto",
   "maxCpuQuotaPercent": 800,
   "pressureQueueGraceSeconds": 60,
   "labels": [

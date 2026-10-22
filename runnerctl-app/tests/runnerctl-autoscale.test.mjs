@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds, reservationDecision, RESERVATION_GRACE_MS, nextGithubPollAt } from '../lib/runnerctl-autoscale.mjs';
+import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds, hardwareMinCpuQuota, reservationDecision, RESERVATION_GRACE_MS, nextGithubPollAt, localSharing } from '../lib/runnerctl-autoscale.mjs';
 
+// The old fixed floor keeps these tests about how the budget is divided.
 const config = (extra = {}) => validateConfig({ scope: 'organization', target: 'example-org',
-  minRunners: 6, maxRunners: 16, labels: ['self-hosted', 'Linux', 'X64'], runnerGroupId: 1, repositories: ['example-org/example-repo'], runners: Array.from({ length: 16 }, (_, i) => `runner-${i + 1}`), ...extra });
+  minRunners: 6, maxRunners: 16, minCpuQuotaPercent: 25, labels: ['self-hosted', 'Linux', 'X64'], runnerGroupId: 1, repositories: ['example-org/example-repo'], runners: Array.from({ length: 16 }, (_, i) => `runner-${i + 1}`), ...extra });
 function fixture(active = 6, busy = 0, queued = 10) {
   const c = config();
   const runners = c.runners.map((name, i) => ({ id: i + 1, name, status: i < active ? 'online' : 'offline', busy: i < busy,
@@ -60,6 +61,54 @@ test('low memory blocks growth even for jobs that have waited', () => {
   const p = plan(f.c, f.data, f.local, { ...f.host, load: 1.5, freeMemoryPercent: 5 }, {}, now);
   assert.equal(p.waiting, 2);
   assert.equal(p.start.length, 0);
+});
+test('idle warm listeners do not shrink the CPU quota of runners doing work', () => {
+  // Six warm listeners, two of them busy, nothing queued, on a 16-CPU host.
+  const f = fixture(6, 2, 0);
+  const state = {};
+  const p = plan(f.c, f.data, f.local, f.host, state, 0);
+  assert.equal(p.quota, 640);
+  assert.deepEqual(state, { ...state, sharing: 2, sharingAt: 0 });
+  // Queued jobs about to start count as work too.
+  assert.equal(plan(f.c, { ...f.data, queued: 2 }, f.local, f.host, {}, 0).quota, 320);
+  // Nothing busy still shares across one runner, never divides by zero.
+  assert.equal(plan(f.c, { ...fixture(6, 0, 0).data }, f.local, f.host, {}, 0).quota, 800);
+});
+test('local CPU control trusts the last working count only while it is recent and current', () => {
+  const c = config({ intervalSeconds: 20 });
+  // A poll saw 16 runners working.
+  const state = { sharing: 16, sharingAt: 1000000 };
+  assert.equal(localSharing(c, state, 16, 1010000), 16);
+  // Fifteen finished while GitHub reads were paused: never divide by more than are active.
+  assert.equal(localSharing(c, state, 1, 1010000), 1);
+  // A stale count, here 1 from an idle snapshot, gives way to every active slot.
+  assert.equal(localSharing(c, { sharing: 1, sharingAt: 1000000 }, 12, 1000000 + 61000), 12);
+  // No poll yet: every active slot, and never zero.
+  assert.equal(localSharing(c, {}, 6, 0), 6);
+  assert.equal(localSharing(c, {}, 0, 0), 1);
+});
+test('the automatic CPU floor scales with the host and yields to explicit bounds', () => {
+  assert.equal(hardwareMinCpuQuota(32), 400);
+  assert.equal(hardwareMinCpuQuota(16), 200);
+  assert.equal(hardwareMinCpuQuota(8), 100);
+  assert.equal(hardwareMinCpuQuota(2), 100);
+  const raw = { scope: 'organization', target: 'example-org', labels: ['self-hosted'], runnerGroupId: 1,
+    repositories: ['example-org/example-repo'], runners: ['runner-1', 'runner-2'] };
+  const hardware = { cpus: 32, memoryBytes: 128 * 2 ** 30 };
+  assert.equal(validateConfig(raw, hardware).minCpuQuotaPercent, 400);
+  assert.equal(validateConfig({ ...raw, minCpuQuotaPercent: 'auto' }, hardware).minCpuQuotaPercent, 400);
+  assert.equal(validateConfig({ ...raw, minCpuQuotaPercent: 50 }, hardware).minCpuQuotaPercent, 50);
+  assert.equal(validateConfig({ ...raw, maxCpuQuotaPercent: 150 }, hardware).minCpuQuotaPercent, 150);
+  assert.equal(validateConfig(raw, { cpus: 8, memoryBytes: 32 * 2 ** 30 }).minCpuQuotaPercent, 100);
+});
+test('a 16-slot pool under pressure keeps at least the floor per job', () => {
+  const f = fixture(16, 16, 0);
+  const c = validateConfig({ scope: 'organization', target: 'example-org', minRunners: 6, maxRunners: 16,
+    labels: ['self-hosted', 'Linux', 'X64'], runnerGroupId: 1, repositories: ['example-org/example-repo'],
+    runners: f.c.runners }, { cpus: 32, memoryBytes: 128 * 2 ** 30 });
+  const p = plan(c, f.data, f.local, { cpus: 32, load: 2, freeMemoryPercent: 60 }, {}, 0);
+  assert.equal(p.pressure, true);
+  assert.equal(p.quota, 400);
 });
 test('scale down never stops a listener even when GitHub claims it is idle', () => {
   const f = fixture(16, 0, 0);

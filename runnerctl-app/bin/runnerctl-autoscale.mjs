@@ -6,7 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseRegistry, parseServiceStatusOutput } from '../lib/runnerctl-core.mjs';
-import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerListEndpoint, nextGithubPollAt } from '../lib/runnerctl-autoscale.mjs';
+import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerListEndpoint, nextGithubPollAt, localSharing } from '../lib/runnerctl-autoscale.mjs';
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
 import { filePrivate, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
@@ -291,7 +291,7 @@ try {
         if (unavailable) console.error(`${unavailable} slot(s) unavailable; healthy slots remain managed`);
         const host = hostSample();
         const active = [...local.values()].filter(r => r.active).length;
-        const policy = cpuPolicy(c, active, host, state);
+        const policy = cpuPolicy(c, localSharing(c, state, active, Date.now()), host, state);
         if (apply && !quitting) {
           for (const r of [...local.values()].filter(r => !r.unavailable)) {
             if (quitting) break;
