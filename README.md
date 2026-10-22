@@ -15,7 +15,7 @@ tools are never committed.
 Autoscaling is the default deployment path. After preparing the kit, edit the
 ignored `autoscale.json` for your account and run `./runnerctl autoscale --prepare`.
 Slot setup enables and starts the background controller automatically. It starts
-at boot on Linux (with login lingering), or at login on macOS and Windows. See
+at boot on Linux (with login lingering) and Windows, or at login on macOS. See
 [automatic scaling](#automatic-runner-and-cpu-scaling) for configuration.
 
 ## What gets installed
@@ -49,9 +49,9 @@ ARM, and Intel Macs are not currently supported.
   automatically so runners start at boot; if that is not permitted for the
   account, it warns and the fallback is `sudo loginctl enable-linger "$USER"`
 - On macOS, an account that remains logged in while its launchd agents run
-- On Windows, an account that remains logged on while its scheduled tasks run,
+- On Windows, an elevated PowerShell under the runner account to install headless tasks,
   and [Git for Windows](https://git-scm.com/download/win), which `gh auth login`
-  and `actions/checkout` need; administrator rights are not required
+  and `actions/checkout` need; no desktop login is required after installation
 - Network access to GitHub, Node.js, the package registry, Pulumi, and AWS download endpoints
 - Node.js and Corepack when building from this source checkout; setup installs pinned pnpm
 - Admin access to each GitHub repository, organization, or enterprise that will
@@ -564,7 +564,7 @@ registration tokens alone cannot monitor queues or create JIT configurations.
 
 Use `--config /path/to/private-config.json` for configuration outside the
 checkout. Setup installs a systemd user service on Linux, a launchd agent on
-macOS, or a logon scheduled task on Windows. It uses that user's `gh` credential store; tokens are never copied
+macOS, or a headless boot scheduled task on Windows. It uses that user's `gh` credential store; tokens are never copied
 into the generated service definition. A token provided only in a foreground
 shell is not inherited by the installed background service. Do not run a
 second foreground controller while the background controller is enabled.
@@ -766,8 +766,9 @@ The builder:
 ## Windows hosts
 
 Windows x64 hosts use PowerShell counterparts of the shell scripts. They run
-on the built-in Windows PowerShell 5.1 and need no administrator rights, Git
-Bash, or WSL. In PowerShell, `.\runnerctl` resolves to `runnerctl.ps1`, so the
+on the built-in Windows PowerShell 5.1 without Git Bash or WSL. Installing or
+reinstalling tasks requires an elevated PowerShell under the runner account.
+In PowerShell, `.\runnerctl` resolves to `runnerctl.ps1`, so the
 `./runnerctl` commands in this README work unchanged.
 
 | Linux/macOS | Windows |
@@ -779,7 +780,7 @@ Bash, or WSL. In PowerShell, `.\runnerctl` resolves to `runnerctl.ps1`, so the
 | `runsvc.sh` | `runsvc.ps1` supervisor |
 | `job-hooks/*.sh` | `job-hooks\*.ps1` |
 
-Set up an autoscaled Windows pool:
+Set up an autoscaled Windows pool from an elevated PowerShell under the runner account:
 
 ```powershell
 winget install --id Git.Git -e   # then open a new terminal so PATH includes Git
@@ -798,15 +799,28 @@ group is usually `1`.
 Run scripts with `powershell -ExecutionPolicy Bypass -File SCRIPT` if the
 local execution policy blocks unsigned scripts. Behaviour on Windows:
 
-- **Services** are per-user scheduled tasks that start at logon. They run
-  hidden through `conhost --headless`. Like macOS launchd agents, they need an
-  account that stays logged on; no password is stored. The autoscale
+- **Services** are headless scheduled tasks that start at boot under the
+  runner account using S4U logon, with no stored password. They run in session
+  0 through `conhost --headless`, including when nobody is signed in. The autoscale
   controller and the `runnerctl health --install` check (every 5 minutes) are
-  tasks in the same folder.
+  tasks in the same folder and also run headlessly. S4U does not supply Windows
+  network credentials or access to user-encrypted files; tools must authenticate
+  HTTPS requests themselves. Check GitHub authentication in the task context;
+  use the owner-only `.autoscale-token` fallback below if the credential store
+  is unavailable. Administrator accounts can receive an administrator token in
+  this noninteractive context even with `RunLevel Limited`; use a dedicated
+  account when runner jobs should have fewer host permissions.
+  To migrate existing runners, let active jobs finish, stop each idle runner,
+  reconcile it with `.\manage-runners.ps1 reconcile NAME`, and start it again.
+  Reinstall the controller with `.\runnerctl autoscale --enable` and any health
+  timer with `.\runnerctl health --install`. All new and reinstalled tasks use
+  headless logon; there is no login-only runner mode.
 - **Dashboard** opens in a PowerShell window at sign-in. `prepare.ps1` installs
   the current user's `Runner Fleet Dashboard` Startup shortcut. Run
   `.\install-dashboard-startup.ps1` to install or refresh it separately; remove
-  the shortcut from `shell:startup` to disable it.
+  the shortcut from `shell:startup` to disable it. To add, reinstall, or stop
+  headless runners under an administrator account, launch the dashboard from
+  an elevated PowerShell so it can manage their tasks and processes.
 - **Supervision** mirrors the systemd unit. `runsvc.ps1` places itself and
   everything it starts in a kill-on-close job object. It restarts the listener
   5 seconds after any exit and waits for `update.finished` after a
@@ -841,11 +855,13 @@ local execution policy blocks unsigned scripts. Behaviour on Windows:
 - **Credentials:** JIT handoffs write the runner's RSA key with DPAPI, which
   the Windows runner requires. Runner directories are full copies of the
   runner image, because NTFS has no copy-on-write clones.
-- **Symlinks** need Developer Mode. Runner tasks run with a limited token,
-  which lacks the symlink privilege even for administrators, so without it
-  tools such as 7-Zip, Node.js, and Git cannot create symlinks. Enable it once
-  from an elevated PowerShell, then reprovision each runner. Provisioning then
-  sets `core.symlinks=true` through the runner's `.env`:
+- **Symlinks:** grant the runner account **Create symbolic links** in
+  `secpol.msc` under Local Policies → User Rights Assignment, then restart its
+  tasks. Verify `whoami /priv` in a job includes `SeCreateSymbolicLinkPrivilege`;
+  Disabled is fine. This also supports extractors such as 7-Zip that require
+  the privilege. Developer Mode can help tools that opt into unprivileged
+  symlinks. Enable it from an elevated PowerShell and reprovision each runner
+  to set `core.symlinks=true` through the runner's `.env`:
 
   ```powershell
   reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock /t REG_DWORD /f /v AllowDevelopmentWithoutDevLicense /d 1
@@ -871,7 +887,7 @@ pnpm --dir runnerctl-app test
 ./security-audit.sh
 ```
 
-On Windows, run the end-to-end smoke test and the Node tests:
+On Windows, run the end-to-end smoke test from an elevated PowerShell, and the Node tests:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-smoke.ps1
@@ -917,7 +933,8 @@ scripts need Linux or macOS.
   command in [Windows hosts](#windows-hosts).
 - **Windows: a runner task is Running but the runner is offline:** inspect
   `<runner-directory>\_diag\runsvc-supervisor.log`, `runsvc.err.log`, and
-  `Runner_*.log`. Tasks run only while the account is logged on.
+  `Runner_*.log`. Confirm the task uses S4U logon and a startup trigger;
+  older interactive tasks must be reinstalled to run without a desktop login.
 
 Autoscaling recovery and portability notes:
 
@@ -936,4 +953,4 @@ Final review recovery details:
 - A reboot can interrupt even an idle ephemeral listener. Its registration may remain offline at GitHub and the local slot stays blocked. Inspect the slot's private diagnostics, confirm no listener/job remains, resolve the orphan registration, and only then remove failed-generation state before restarting that slot. Never reuse its consumed credentials.
 - Runner service templates require kit, runner, and runtime paths without whitespace or shell/XML special characters. Use a simple path such as `/srv/runner-fleet` or `$HOME/runner-fleet`; unsupported paths are rejected before service provisioning. Controller-only paths are escaped independently. Windows paths may contain spaces but not quotes, percent signs, or other special characters, because scheduled task actions expand `%VARIABLES%`.
 
-macOS services target the logged-in user’s launchd GUI domain. A headless SSH session without a GUI login is not sufficient for starting these agents. Windows scheduled tasks likewise use interactive logon and start when the account logs on. `svc.ps1 stop` and `status` also work from other logon sessions. Template updates require a safe service reload after its generation finishes; `kickstart` alone does not reload a changed plist.
+macOS services target the logged-in user’s launchd GUI domain. A headless SSH session without a GUI login is not sufficient for starting these agents. Windows scheduled tasks use S4U logon and start at boot without a desktop login. `svc.ps1 stop` and `status` also work from other logon sessions. Template updates require a safe service reload after its generation finishes; `kickstart` alone does not reload a changed plist.

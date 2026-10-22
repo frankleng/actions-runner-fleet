@@ -1,13 +1,13 @@
 # Kit-level scheduled tasks for the autoscale controller and the health check:
 # the Windows counterpart of their systemd user units and launchd agents.
-#   install -Name N [-Trigger Logon|Every5Minutes] [-LogPath FILE] -CommandLine BASE64
+#   install -Name N [-Trigger Startup|Every5Minutes] [-LogPath FILE] -CommandLine BASE64
 #   remove -Name N | state -Name N
 # CommandLine is base64-encoded JSON (program first): Windows PowerShell's -File
 # mode would otherwise bind program options such as --config as its own.
 param(
   [Parameter(Mandatory = $true, Position = 0)][ValidateSet('install', 'remove', 'state', 'run')][string]$Command,
   [Parameter(Mandatory = $true)][ValidatePattern('^[A-Za-z0-9_.-]+$')][string]$Name,
-  [ValidateSet('Logon', 'Every5Minutes')][string]$Trigger = 'Logon',
+  [ValidateSet('Startup', 'Every5Minutes')][string]$Trigger = 'Startup',
   [string]$LogPath = '',
   [ValidatePattern('^[A-Za-z0-9+/=]*$')][string]$CommandLine = ''
 )
@@ -30,7 +30,7 @@ switch ($Command) {
     if ($LogPath) { $runArguments += @('-LogPath', $LogPath) }
     Register-KitTask -Name $Name -Script $PSCommandPath -Arguments $runArguments `
       -WorkingDirectory $KitRoot -Trigger $Trigger -Description "actions-runner-fleet ($KitRoot)"
-    if ($Trigger -eq 'Logon') {
+    if ($Trigger -eq 'Startup') {
       # Restart a running controller so it picks up the new definition.
       Stop-KitTask $Name $PidFile $PSCommandPath
       Start-ScheduledTask -TaskPath $KitTaskFolder -TaskName $Name

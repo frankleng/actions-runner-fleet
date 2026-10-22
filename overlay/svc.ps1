@@ -1,5 +1,5 @@
 # Windows service manager for one runner directory, the counterpart of
-# svc-systemd-user.sh: a per-user scheduled task runs runsvc.ps1 at logon.
+# svc-systemd-user.sh: a headless scheduled task runs runsvc.ps1 at boot.
 param(
   [Parameter(Position = 0)][string]$Command = 'status',
   [Parameter(Position = 1)][string]$Value = '',
@@ -89,7 +89,7 @@ function Install-RunnerService {
   Copy-Item -LiteralPath (Get-KitOrRunnerFile 'runsvc.ps1') -Destination "$RunsvcPath.tmp" -Force
   Move-Item -LiteralPath "$RunsvcPath.tmp" -Destination $RunsvcPath -Force
   Save-CpuQuota ([string](Read-RunnerCpuQuota $CpuQuotaPath))
-  Register-KitTask -Name $SvcName -Script $RunsvcPath -WorkingDirectory $RunnerRoot -Trigger Logon `
+  Register-KitTask -Name $SvcName -Script $RunsvcPath -WorkingDirectory $RunnerRoot -Trigger Startup `
     -Description "GitHub Actions Runner ($RunnerName)"
   Write-KitText $ConfigPath "$KitTaskFolder$SvcName`n"
   'svc install complete'

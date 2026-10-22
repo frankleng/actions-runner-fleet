@@ -63,11 +63,11 @@ test("Windows default runner directories use backslashes", () => {
   assert.equal(defaultRunnerDirectory("/kit", "ci 1", "linux"), "/kit/.runners/ci-1");
 });
 
-test("Windows controller runs from a logon task through kit-task.ps1", () => {
+test("Windows controller runs from a headless boot task through kit-task.ps1", () => {
   const unit = controllerService({ root: "C:\\kit", configPath: "C:\\kit\\autoscale.json", node: "C:\\node\\node.exe", platform: "win32" });
   assert.match(unit.name, /^runnerctl-autoscale-[0-9a-f]{12}$/);
   assert.equal(unit.task.at(-1).replaceAll("/", "\\"), "C:\\kit\\kit-task.ps1");
-  assert.deepEqual(unit.install.slice(0, 5), ["install", "-Name", unit.name, "-Trigger", "Logon"]);
+  assert.deepEqual(unit.install.slice(0, 5), ["install", "-Name", unit.name, "-Trigger", "Startup"]);
   const encoded = unit.install[unit.install.indexOf("-CommandLine") + 1];
   assert.match(encoded, /^[A-Za-z0-9+/=]+$/);
   const argv = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));

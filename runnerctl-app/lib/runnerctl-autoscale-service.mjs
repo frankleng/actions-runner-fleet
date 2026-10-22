@@ -24,9 +24,9 @@ export function controllerService({ root, configPath, node = process.execPath, h
   };
   if (platform === 'win32') {
     const log = path.join(root, '.autoscale-controller.log');
-    // kit-task.ps1 runs the controller from a logon task inside a kill-on-close job.
+    // kit-task.ps1 runs the controller from a headless boot task inside a kill-on-close job.
     return { name, file: null, log, task: [...POWERSHELL_ARGS, '-File', path.join(root, 'kit-task.ps1')],
-      install: ['install', '-Name', name, '-Trigger', 'Logon', '-LogPath', log, '-CommandLine', kitTaskCommandLine(args)],
+      install: ['install', '-Name', name, '-Trigger', 'Startup', '-LogPath', log, '-CommandLine', kitTaskCommandLine(args)],
       remove: ['remove', '-Name', name] };
   }
   throw new Error('Unsupported service platform');

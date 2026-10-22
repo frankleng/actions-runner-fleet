@@ -63,17 +63,22 @@ function Get-KitTaskState([string]$Name) {
 }
 
 # Registers a per-user task that runs a PowerShell script without a console
-# window. Interactive logon needs no stored password or admin rights; like a
-# launchd agent, it runs while the account is logged on.
+# window. S4U runs in session 0 without a desktop login or stored password.
+# Registration requires elevation; HTTPS clients supply their own credentials.
 function Register-KitTask {
   param(
     [string]$Name,
     [string]$Script,
     [string[]]$Arguments = @(),
     [string]$WorkingDirectory,
-    [ValidateSet('Logon', 'Every5Minutes')][string]$Trigger = 'Logon',
+    [ValidateSet('Startup', 'Every5Minutes')][string]$Trigger = 'Startup',
     [string]$Description = ''
   )
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal = New-Object Security.Principal.WindowsPrincipal $identity
+  if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Installing headless runner tasks requires an elevated PowerShell. Run as administrator using the runner account.'
+  }
   $commandLine = @($KitPowerShell) + $KitPowerShellArguments + @('-File', $Script) + $Arguments | ForEach-Object {
     if ($_ -match '"') { throw 'Task arguments must not contain double quotes' }
     if ($_ -match '[\s()]') { '"' + $_.TrimEnd('\') + '"' } else { $_ }
@@ -82,16 +87,16 @@ function Register-KitTask {
   # task ends only conhost, so every kit script owns a kill-on-close job object.
   $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\conhost.exe') `
     -Argument ('--headless ' + ($commandLine -join ' ')) -WorkingDirectory $WorkingDirectory
-  $user = "$env:USERDOMAIN\$env:USERNAME"
+  $user = $identity.Name
   if ($Trigger -eq 'Every5Minutes') {
     $taskTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
   } else {
-    $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $taskTrigger = New-ScheduledTaskTrigger -AtStartup
   }
   $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
     -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd
-  $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+  $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
   Register-ScheduledTask -TaskPath $KitTaskFolder -TaskName $Name -Action $action -Trigger $taskTrigger `
     -Settings $settings -Principal $principal -Description $Description -Force | Out-Null
   Enable-ScheduledTask -TaskPath $KitTaskFolder -TaskName $Name | Out-Null

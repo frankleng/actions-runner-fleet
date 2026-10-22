@@ -1,6 +1,7 @@
 # Windows end-to-end smoke test for the PowerShell layer. Runs a sandboxed
 # copy of the kit with its own registry, a fake runner image, and tasks named
 # for example-org, so it never touches real runners or contacts GitHub.
+# Run from an elevated PowerShell:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-smoke.ps1
 $ErrorActionPreference = 'Stop'
 $KitSource = Split-Path -Parent $PSScriptRoot
@@ -129,6 +130,8 @@ $runner = '{"agentId":7,"agentName":"' + $values['--name'] + '","gitHubUrl":"' +
   $persist = Join-Path $Kit '.runners\smoke-persist'
   $TaskNames.Add('actions.runner.example-org.smoke-persist')
   Assert-True ($result.Code -eq 0) 'register succeeds' $result.Output
+  $runnerTask = Get-ScheduledTask -TaskPath '\actions-runner-fleet\' -TaskName 'actions.runner.example-org.smoke-persist'
+  Assert-True ($runnerTask.Principal.LogonType -eq 'S4U' -and $runnerTask.Triggers.CimClass.CimClassName -contains 'MSFT_TaskBootTrigger') 'new runners use passwordless headless boot tasks'
   Assert-True ((Read-Text (Join-Path $persist 'config-args.txt')) -match '--unattended --url https://github.com/example-org --token TOKEN-123 --name smoke-persist --work _work --labels smoke,windows-test') 'config.cmd receives registration arguments and labels'
   Assert-True ((Read-Text (Join-Path $Kit 'runners.tsv')) -ceq "smoke-persist`t$persist`n") 'registry row is written without a BOM'
   $result = Invoke-Kit 'manage-runners.ps1' @('register', 'smoke-persist', 'TOKEN', 'https://github.com/example-org')
@@ -176,6 +179,8 @@ $runner = '{"agentId":7,"agentName":"' + $values['--name'] + '","gitHubUrl":"' +
   Set-Content -LiteralPath (Join-Path $persist 'crash-once') -Value ''
   $result = Invoke-Kit 'manage-runners.ps1' @('start', 'smoke-persist')
   Assert-True ($result.Code -eq 0 -and $result.Output -match 'Started:') 'start reports Started' $result.Output
+  $supervisorPid = [int](Read-Text (Join-Path $persist '.svc.pid'))
+  Assert-True ((Get-Process -Id $supervisorPid).SessionId -eq 0) 'runner supervisor runs in session 0 without a desktop login'
   $listenerLog = Join-Path $persist 'fake-listener.log'
   Assert-True (Wait-Until { ([regex]::Matches((Read-Text $listenerLog), 'start run --startuptype service')).Count -ge 2 } 30) 'supervisor restarts the listener after a retryable exit'
   Assert-True ((Read-Text $listenerLog) -match 'crash') 'first listener run crashed as arranged'
@@ -246,12 +251,17 @@ $runner = '{"agentId":7,"agentName":"' + $values['--name'] + '","gitHubUrl":"' +
   $argv = @($Node, $probe, '--config', (Join-Path $Sandbox 'some config.json'), '--watch')
   $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $argv -Compress)))
   $taskLog = Join-Path $Sandbox 'task.log'
-  $result = Invoke-Kit 'kit-task.ps1' @('install', '-Name', $taskName, '-Trigger', 'Logon', '-LogPath', $taskLog, '-CommandLine', $encoded)
+  $result = Invoke-Kit 'kit-task.ps1' @('install', '-Name', $taskName, '-Trigger', 'Startup', '-LogPath', $taskLog, '-CommandLine', $encoded)
   Assert-True ($result.Code -eq 0) 'kit-task install succeeds' $result.Output
+  $kitTask = Get-ScheduledTask -TaskPath '\actions-runner-fleet\' -TaskName $taskName
+  Assert-True ($kitTask.Principal.LogonType -eq 'S4U' -and $kitTask.Triggers.CimClass.CimClassName -contains 'MSFT_TaskBootTrigger') 'controller uses a headless boot task'
   Assert-True (Wait-Until { Test-Path -LiteralPath $argvFile } 30) 'kit task starts its program'
   Assert-True ((Read-Text $argvFile) -eq (ConvertTo-Json -InputObject @($argv | Select-Object -Skip 2) -Compress)) 'program options such as --config arrive intact'
   Assert-True (Wait-Until { (Read-Text $taskLog) -match 'probe started' } 15) 'kit task appends program output to its log'
   Assert-True ((Invoke-Kit 'kit-task.ps1' @('state', '-Name', $taskName)).Output.Trim() -eq 'Running') 'kit-task state reports Running'
+  $result = Invoke-Kit 'kit-task.ps1' @('install', '-Name', $taskName, '-Trigger', 'Every5Minutes', '-LogPath', $taskLog, '-CommandLine', $encoded)
+  $kitTask = Get-ScheduledTask -TaskPath '\actions-runner-fleet\' -TaskName $taskName
+  Assert-True ($result.Code -eq 0 -and $kitTask.Principal.LogonType -eq 'S4U' -and $kitTask.Triggers.Repetition.Interval -contains 'PT5M') 'reinstalling as a health timer preserves headless logon'
   $result = Invoke-Kit 'kit-task.ps1' @('remove', '-Name', $taskName)
   Assert-True (Wait-Until { -not (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($probe) }) } 15) 'removing a kit task ends its program through the job object'
   Assert-True ((Invoke-Kit 'kit-task.ps1' @('state', '-Name', $taskName)).Output.Trim() -eq 'missing') 'kit-task remove unregisters the task'
@@ -273,9 +283,14 @@ $runner = '{"agentId":7,"agentName":"' + $values['--name'] + '","gitHubUrl":"' +
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   Start-Sleep -Seconds 1
   foreach ($junction in (Join-Path $Kit 'runnerctl-app\node_modules')) {
-    if (Test-Path -LiteralPath $junction) { & cmd.exe /d /c rmdir $junction | Out-Null }
+    if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
   }
-  & cmd.exe /d /c rd /s /q $Sandbox 2>$null
+  $sandboxFull = [IO.Path]::GetFullPath($Sandbox)
+  $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+  if (-not $sandboxFull.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or (Split-Path -Leaf $sandboxFull) -notlike 'fleet-smoke-*') {
+    throw "Refusing to remove unexpected sandbox: $sandboxFull"
+  }
+  Remove-Item -LiteralPath $sandboxFull -Recurse -Force
 }
 
 if ($Failures.Count) {
