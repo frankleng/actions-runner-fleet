@@ -439,10 +439,12 @@ applies a hard cap to the job object that holds the supervisor and every
 process it starts. In each case, a workflow and every process it launches
 share the same limit.
 
-Runner services are assigned to systemd's `background.slice`, whose lower CPU
-weight lets services in `app.slice`—including an interactive T3 Code
-service—take CPU time first when the host is busy. This is contention-aware:
-runners can still use otherwise-idle CPU up to their configured quota.
+Runner services run in their own `runners.slice` at systemd's default CPU
+weight, the same as `app.slice`. When the host is busy, runners and interactive
+services such as T3 Code share CPU time evenly instead of runners yielding to
+them, so local work cannot stall CI. Runners still stop at their configured
+quota. A service picks up a slice change when it next starts; restart an
+autoscale slot only while it is parked, with no listener or job.
 
 In the dashboard, select a runner and press `c` to view or change its limit up
 to the host's full available capacity. The change is persisted in the runner

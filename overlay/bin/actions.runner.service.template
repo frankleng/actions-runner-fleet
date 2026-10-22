@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Slice=background.slice
+Slice=runners.slice
 WorkingDirectory={{RunnerRoot}}
 ExecStart={{RunnerRoot}}/runsvc.sh
 Restart=always

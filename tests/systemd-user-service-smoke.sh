@@ -67,7 +67,7 @@ unit_path="${unit_dir}/actions.runner.example-org.ubuntu-runner-1.service"
 [ -f "${unit_path}" ]
 grep -Fq "WorkingDirectory=${runner_dir}" "${unit_path}"
 grep -Fq "ExecStart=${runner_dir}/runsvc.sh" "${unit_path}"
-grep -Fq "Slice=background.slice" "${unit_path}"
+grep -Fq "Slice=runners.slice" "${unit_path}"
 grep -Fq "CPUQuota=300%" "${unit_path}"
 grep -Fxq "300" "${runner_dir}/.cpu-quota"
 grep -Fq "Started:" <<< "${status_output}"
