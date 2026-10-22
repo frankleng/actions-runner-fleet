@@ -69,11 +69,14 @@ overlay/svc-systemd-user.sh
 overlay/svc.sh
 runnerctl-app/bin/runnerctl-autoscale.mjs
 runnerctl-app/bin/runnerctl-dashboard.mjs
+runnerctl-app/bin/runnerctl-health.mjs
 runnerctl-app/bin/runnerctl-stats.mjs
 runnerctl-app/lib/runnerctl-autoscale-service.mjs
 runnerctl-app/lib/runnerctl-autoscale.mjs
 runnerctl-app/lib/runnerctl-core.mjs
+runnerctl-app/lib/runnerctl-health.mjs
 runnerctl-app/lib/runnerctl-metrics.mjs
+runnerctl-app/lib/runnerctl-platform.mjs
 runnerctl-app/lib/runnerctl-stats.mjs
 runnerctl-app/lib/runnerctl-table.mjs
 runnerctl-app/native/runnerctl-procstats.c
