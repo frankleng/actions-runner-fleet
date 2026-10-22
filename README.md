@@ -593,7 +593,11 @@ the number of available slots. Omit `runners` to generate enough
 `ci-ephemeral-N` slot names automatically during preparation.
 Demand is busy pool members plus matching queued jobs, accounting for
 already-idle listeners. The controller inspects jobs in active workflow runs,
-including workflows with another job already running. All requested labels
+including workflows with another job already running. It lists runners from
+`runnerGroupId` only, so baseline runners must belong to that group too. Reads
+run in parallel and revalidate unchanged pages by ETag; GitHub does not charge
+a 304 against the rate limit. When the token has fewer than 500 requests left
+in its hour, the controller polls at most once a minute. All requested labels
 must match the pool. Counts remain estimates: GitHub's jobs API does not
 expose all runner-group and dependency eligibility information, and other
 hosts can claim queued jobs first.
@@ -607,10 +611,14 @@ hosts can claim queued jobs first.
 | `minFreeMemoryPercent` | 10 | Block growth and reduce CPU budget below this available-memory level |
 | `cpuBudgetPercent` | 80 | Normal pool CPU budget as a percentage of host CPU capacity |
 | `pressureCpuBudgetPercent` | 30 | Pool CPU budget under host pressure |
+| `pressureQueueGraceSeconds` | 60 | Under CPU pressure, how long a queued job waits before it gets a runner anyway |
 | `minCpuQuotaPercent` / `maxCpuQuotaPercent` | 25 / 800 | Per-runner quota bounds; 100% means one logical CPU |
 
 Under pressure, the controller divides the reduced CPU budget among active
-listeners and blocks growth. It leaves pressure, restoring the normal budget
+listeners and holds growth back: a newly queued job waits up to
+`pressureQueueGraceSeconds` for the host to recover, then gets a runner anyway,
+because contention only slows a job while a job with no runner never starts.
+Low memory still blocks growth outright. It leaves pressure, restoring the normal budget
 and growth, below the low load threshold when memory is available. Between
 thresholds, it retains the previous pressure state, so a host that was not
 under pressure keeps growing. The minimum count remains a floor under pressure.

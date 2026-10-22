@@ -15,6 +15,7 @@
   "pressureCpuBudgetPercent": 30,
   "minCpuQuotaPercent": 25,
   "maxCpuQuotaPercent": 800,
+  "pressureQueueGraceSeconds": 60,
   "labels": [
     "self-hosted",
     "Linux",

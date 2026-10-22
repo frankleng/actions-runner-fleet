@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds, reservationDecision, RESERVATION_GRACE_MS } from '../lib/runnerctl-autoscale.mjs';
+import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds, reservationDecision, RESERVATION_GRACE_MS, nextGithubPollAt } from '../lib/runnerctl-autoscale.mjs';
 
 const config = (extra = {}) => validateConfig({ scope: 'organization', target: 'example-org',
   minRunners: 6, maxRunners: 16, labels: ['self-hosted', 'Linux', 'X64'], runnerGroupId: 1, repositories: ['example-org/example-repo'], runners: Array.from({ length: 16 }, (_, i) => `runner-${i + 1}`), ...extra });
@@ -39,6 +39,28 @@ test('memory pressure blocks growth even with low CPU load', () => {
   assert.equal(p.start.length, 0);
   assert.equal(p.pressure, true);
 });
+test('under CPU pressure, jobs queued past the grace period still get runners', () => {
+  const f = fixture(6, 6, 4);
+  const now = 600000;
+  // Two jobs have waited two minutes, two arrived just now.
+  f.data.queuedAt = [now - 120000, now - 120000, now - 1000, now];
+  const busyHost = { ...f.host, load: 1.5 };
+  const p = plan(f.c, f.data, f.local, busyHost, {}, now);
+  assert.equal(p.pressure, true);
+  assert.equal(p.waiting, 2);
+  assert.equal(p.start.length, 2);
+  // Creation times GitHub did not report never count as waited.
+  f.data.queuedAt = [null, null, null, null];
+  assert.equal(plan(f.c, f.data, f.local, busyHost, {}, now).start.length, 0);
+});
+test('low memory blocks growth even for jobs that have waited', () => {
+  const f = fixture(6, 6, 2);
+  const now = 600000;
+  f.data.queuedAt = [0, 0];
+  const p = plan(f.c, f.data, f.local, { ...f.host, load: 1.5, freeMemoryPercent: 5 }, {}, now);
+  assert.equal(p.waiting, 2);
+  assert.equal(p.start.length, 0);
+});
 test('scale down never stops a listener even when GitHub claims it is idle', () => {
   const f = fixture(16, 0, 0);
   const p = plan(f.c, f.data, f.local, f.host, {}, 300000);
@@ -60,7 +82,8 @@ test('completed slots are replenished only up to demand and never reuse a regist
 test('validates account boundaries, bounds, duplicates, and unknown secret keys', () => {
   for (const extra of [{ token: 'do-not-store' }, { repositories: ['another-org/repo'] },
     { target: '../private' }, { runners: ['duplicate', 'duplicate'] }, { maxRunners: 17 },
-    { lowLoad: 2 }, { intervalSeconds: 1 }, { pressureCpuBudgetPercent: 90 }, { minRunners: 0 }, { runnerGroupId: 0 }, { labels: [] }, { labels: ['Linux', 'linux'] }, { idleSeconds: 300 }]) {
+    { lowLoad: 2 }, { intervalSeconds: 1 }, { pressureCpuBudgetPercent: 90 }, { minRunners: 0 }, { runnerGroupId: 0 }, { labels: [] }, { labels: ['Linux', 'linux'] }, { idleSeconds: 300 },
+    { pressureQueueGraceSeconds: 0 }]) {
     assert.throws(() => config(extra), /Invalid autoscale configuration/);
   }
   assert.equal(config({ scope: 'repository', target: 'example-org/example-repo' }).scope, 'repository');
@@ -106,6 +129,88 @@ test('queue discovery includes jobs in running workflows and matches all labels'
   assert.equal((await snapshot(f.c, api, f.local)).queued, 1);
   f.data.runners[0].labels = [];
   assert.equal((await snapshot(f.c, api, f.local)).runners[0].unavailable, true);
+});
+test('queue discovery records when each matching job was queued and lists only the pool group', async () => {
+  const f = fixture();
+  const endpoints = [];
+  const api = async (endpoint, key) => {
+    endpoints.push(endpoint);
+    if (key === 'runners') return f.data.runners;
+    if (key === 'workflow_runs') return endpoint.includes('status=in_progress') ? [{ id: 1 }] : [];
+    return [
+      { id: 1, status: 'queued', labels: ['self-hosted'], created_at: '2026-10-22T10:00:00Z' },
+      { id: 2, status: 'queued', labels: ['self-hosted'] }
+    ];
+  };
+  const data = await snapshot(f.c, api, f.local);
+  assert.deepEqual(data.queuedAt, [Date.parse('2026-10-22T10:00:00Z'), null]);
+  assert.equal(data.queued, 2);
+  assert.ok(endpoints.includes('/orgs/example-org/actions/runner-groups/1/runners'));
+  assert.ok(!endpoints.includes('/orgs/example-org/actions/runners'));
+});
+test('unchanged pages are revalidated by ETag and reused across polls', async () => {
+  const etags = new Map();
+  const sent = [];
+  const fetchImpl = async (url, options) => {
+    sent.push(options.headers['If-None-Match']);
+    if (options.headers['If-None-Match'] === '"v1"') return new Response(null, { status: 304, headers: { 'x-ratelimit-remaining': '4321' } });
+    return new Response(JSON.stringify({ total_count: 1, workflow_runs: [{ id: 7 }] }),
+      { headers: { etag: '"v1"', 'x-ratelimit-remaining': '4322' } });
+  };
+  const first = githubClient('test-credential', fetchImpl, etags);
+  assert.deepEqual(await first('/repos/example-org/example-repo/actions/runs?status=queued', 'workflow_runs'), [{ id: 7 }]);
+  // A later poll builds a new client over the same cache.
+  const second = githubClient('test-credential', fetchImpl, etags);
+  assert.deepEqual(await second('/repos/example-org/example-repo/actions/runs?status=queued', 'workflow_runs'), [{ id: 7 }]);
+  assert.deepEqual(sent, [undefined, '"v1"']);
+  assert.equal(first.rate.remaining, 4322);
+  assert.equal(second.rate.remaining, 4321);
+});
+test('a failed queue read stops new requests and settles in-flight ones before the poll fails', async () => {
+  const c = config({ repositories: Array.from({ length: 8 }, (_, i) => `example-org/repo-${i + 1}`) });
+  const f = fixture();
+  let inFlight = 0;
+  let calls = 0;
+  const api = async (endpoint, key) => {
+    if (key === 'runners') return f.data.runners;
+    calls++;
+    inFlight++;
+    try {
+      // One fast rejection; the failing repository's other reads are slow, and
+      // other repositories answer quickly enough to start more work meanwhile.
+      if (endpoint === '/repos/example-org/repo-1/actions/runs?status=queued') throw new Error('rejected');
+      await new Promise(resolve => setTimeout(resolve, endpoint.startsWith('/repos/example-org/repo-1/') ? 60 : 5));
+      return [];
+    } finally { inFlight--; }
+  };
+  await assert.rejects(snapshot(c, api, f.local), /rejected/);
+  assert.equal(inFlight, 0);
+  const settledCalls = calls;
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(calls, settledCalls);
+  // Four repositories at a time, five status reads each: nothing past the first wave starts.
+  assert.ok(calls <= 20, `${calls} requests`);
+});
+test('a rejected request still records the token budget, and a spent token waits for its reset', async () => {
+  const api = githubClient('test-credential', async () => new Response('{}', { status: 403,
+    headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1000' } }));
+  await assert.rejects(api('/orgs/example-org/actions/runners', 'runners'), /HTTP 403/);
+  assert.deepEqual(api.rate, { remaining: 0, reset: 1000 });
+  assert.equal(nextGithubPollAt(api.rate, 700000), 1001000);
+  assert.equal(nextGithubPollAt(api.rate, 1002000), 1002000);
+  assert.equal(nextGithubPollAt({ remaining: 0, reset: 999999 }, 0), 3600000);
+  assert.equal(nextGithubPollAt({ remaining: 499, reset: NaN }, 5000), 65000);
+  assert.equal(nextGithubPollAt({ remaining: 4000, reset: NaN }, 5000), 5000);
+  assert.equal(nextGithubPollAt(undefined, 5000), 5000);
+});
+test('registration and removal responses also record the token budget', async () => {
+  const spent = { status: 403, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1000' } };
+  const register = githubClient('test-credential', async () => new Response('{}', spent));
+  await assert.rejects(register.create(config(), 'runner-2'), /registration failed/);
+  assert.deepEqual(register.rate, { remaining: 0, reset: 1000 });
+  const remove = githubClient('test-credential', async () => new Response('{}', spent));
+  await assert.rejects(remove.remove(config(), 2), /removal failed/);
+  assert.deepEqual(remove.rate, { remaining: 0, reset: 1000 });
 });
 test('missing GitHub row does not change the active local lifecycle', async () => {
   const f = fixture(16, 0, 0);
@@ -153,7 +258,7 @@ test('CLI dry-run is read-only, applies quotas before starts, and strips service
   try {
     await mkdir(join(root, 'runnerctl-app/bin'), { recursive: true });
     await mkdir(join(root, 'runnerctl-app/lib'), { recursive: true });
-    for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs']) {
+    for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs', 'lib/runnerctl-platform.mjs']) {
       await copyFile(new URL(`../${file}`, import.meta.url), join(root, 'runnerctl-app', file));
     }
     await mkdir(join(root, 'overlay'));
@@ -195,7 +300,7 @@ fi
           return { ok: true, json: async () => (${JSON.stringify(jitResponse())}) };
         }
         const runners = (process.env.AUTOSCALE_TEST_ORPHAN ? [1, 2] : [1]).map(i => ({ id: i, name: 'runner-' + i, status: i === 1 ? 'online' : 'offline', busy: i === 1, labels: [{ name: 'self-hosted' }] }));
-        const data = url.includes('/actions/runners') ? { runners, total_count: runners.length } :
+        const data = url.includes('/runners?') ? { runners, total_count: runners.length } :
           url.includes('/jobs?') ? { jobs: [{ id: 1, status: 'queued', labels: ['self-hosted'] }], total_count: 1 } :
           { workflow_runs: url.includes('status=queued') ? [{ id: 1 }] : [], total_count: url.includes('status=queued') ? 1 : 0 };
         return { ok: true, json: async () => data };

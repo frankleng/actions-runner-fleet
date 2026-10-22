@@ -20,7 +20,7 @@ export function validateConfig(raw, hardware) {
   const defaults = { minRunners: bounds.minRunners, maxRunners: bounds.maxRunners, intervalSeconds: 60,
     cooldownSeconds: 120, lowLoad: 0.6, highLoad: 1,
     minFreeMemoryPercent: 10, cpuBudgetPercent: 80, pressureCpuBudgetPercent: 30,
-    minCpuQuotaPercent: 25, maxCpuQuotaPercent: 800 };
+    minCpuQuotaPercent: 25, maxCpuQuotaPercent: 800, pressureQueueGraceSeconds: 60 };
   const allowed = new Set([...Object.keys(defaults), 'scope', 'target', 'repositories', 'runners', 'labels', 'runnerGroupId', 'baselineRunners']);
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !allowed.has(k))) fail();
   const c = { ...defaults, baselineRunners: [], ...raw };
@@ -60,9 +60,27 @@ export function validateConfig(raw, hardware) {
   return c;
 }
 
+// Unchanged pages answer 304, which GitHub does not charge against the rate
+// limit; a poll then costs only the lists that actually moved.
+const ETAG_CACHE_LIMIT = 1000;
+function rememberPage(etags, url, etag, data) {
+  etags.delete(url);
+  etags.set(url, { etag, data });
+  while (etags.size > ETAG_CACHE_LIMIT) etags.delete(etags.keys().next().value);
+}
+
 // Fixed API origin, no redirects, and no response bodies in errors or logs.
-export function githubClient(token, fetchImpl = fetch) {
+// `etags` outlives a poll's client so later polls can revalidate its pages.
+export function githubClient(token, fetchImpl = fetch, etags = new Map()) {
   if (!token || /[\r\n]/.test(token)) throw new AutoscaleError('GitHub authentication unavailable');
+  // Every response, rejected ones included, reports the token's budget.
+  const noteRate = response => {
+    const remaining = Number(response.headers?.get?.('x-ratelimit-remaining') ?? NaN);
+    if (Number.isFinite(remaining) && remaining <= list.rate.remaining) {
+      list.rate.remaining = remaining;
+      list.rate.reset = Number(response.headers?.get?.('x-ratelimit-reset') ?? NaN);
+    }
+  };
   const list = async function (endpoint, key) {
     if (!/^\/(repos|orgs)\/[A-Za-z0-9_./?=&-]+$/.test(endpoint)) throw new AutoscaleError('Invalid API endpoint');
     // Lists shift while runners register and retire; restart a torn read rather than drop the poll.
@@ -74,16 +92,27 @@ export function githubClient(token, fetchImpl = fetch) {
   const listOnce = async function (endpoint, key) {
     const all = new Map();
     for (let page = 1; page <= 100; page++) {
+      const url = `https://api.github.com${endpoint}${endpoint.includes('?') ? '&' : '?'}per_page=100&page=${page}`;
+      const cached = etags.get(url);
       let response;
       try {
-        response = await fetchImpl(`https://api.github.com${endpoint}${endpoint.includes('?') ? '&' : '?'}per_page=100&page=${page}`, {
+        response = await fetchImpl(url, {
           headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json',
-            'X-GitHub-Api-Version': '2022-11-28' }, redirect: 'error', signal: AbortSignal.timeout(15000)
+            'X-GitHub-Api-Version': '2022-11-28', ...(cached ? { 'If-None-Match': cached.etag } : {}) },
+          redirect: 'error', signal: AbortSignal.timeout(15000)
         });
       } catch { throw new AutoscaleError('GitHub request failed'); }
-      if (!response.ok) throw new AutoscaleError(`GitHub request failed (HTTP ${response.status})`);
+      noteRate(response);
       let data;
-      try { data = await response.json(); } catch { throw new AutoscaleError('Invalid GitHub response'); }
+      if (response.status === 304 && cached) {
+        data = cached.data;
+        rememberPage(etags, url, cached.etag, data);
+      } else {
+        if (!response.ok) throw new AutoscaleError(`GitHub request failed (HTTP ${response.status})`);
+        try { data = await response.json(); } catch { throw new AutoscaleError('Invalid GitHub response'); }
+        const etag = response.headers?.get?.('etag');
+        if (etag) rememberPage(etags, url, etag, data);
+      }
       if (!Array.isArray(data[key]) || !Number.isSafeInteger(data.total_count) || data.total_count < 0) throw new AutoscaleError('Invalid GitHub response');
       // Items shifted across a page boundary appear twice; keep one copy per id.
       for (const item of data[key]) all.set(Number.isSafeInteger(item?.id) ? item.id : Symbol(), item);
@@ -94,6 +123,8 @@ export function githubClient(token, fetchImpl = fetch) {
     }
     throw new AutoscaleError('GitHub pagination limit reached');
   };
+  // Lowest rate-limit remainder this client saw, with its reset time in epoch seconds.
+  list.rate = { remaining: Infinity, reset: NaN };
   list.create = async (c, name) => {
     let response;
     try {
@@ -104,6 +135,7 @@ export function githubClient(token, fetchImpl = fetch) {
         redirect: 'error', signal: AbortSignal.timeout(15000)
       });
     } catch { throw new AutoscaleError('GitHub registration failed; check for an orphan registration before retrying'); }
+    noteRate(response);
     if (!response.ok) {
       const error = new AutoscaleError(`GitHub registration failed (HTTP ${response.status})`);
       error.definiteRejection = [400, 401, 403, 404, 422, 429].includes(response.status);
@@ -121,6 +153,7 @@ export function githubClient(token, fetchImpl = fetch) {
           'X-GitHub-Api-Version': '2022-11-28' }, redirect: 'error', signal: AbortSignal.timeout(15000)
       });
     } catch { throw new AutoscaleError('GitHub runner removal failed'); }
+    noteRate(response);
     // Already gone is the outcome we wanted.
     if (!response.ok && response.status !== 404) throw new AutoscaleError(`GitHub runner removal failed (HTTP ${response.status})`);
   };
@@ -144,6 +177,48 @@ export function reservationDecision(name, remote, ageMs, graceMs = RESERVATION_G
 export function runnerEndpoint(c) {
   return c.scope === 'organization' ? `/orgs/${c.target}/actions/runners` : `/repos/${c.target}/actions/runners`;
 }
+
+// Pool slots register into the configured group, so listing only that group
+// finds every slot in one page even when the organization holds hundreds of
+// unrelated registrations elsewhere.
+export function runnerListEndpoint(c) {
+  return c.scope === 'organization' ? `/orgs/${c.target}/actions/runner-groups/${c.runnerGroupId}/runners` : runnerEndpoint(c);
+}
+
+// Overlaps a poll's GitHub reads instead of issuing them one by one, while
+// staying far below GitHub's limit on concurrent requests. Nested calls share
+// `abort`: the first failure anywhere stops every level from starting new reads,
+// and each level settles what is in flight before rejecting, so no request
+// outlives the poll that issued it.
+async function mapLimit(items, limit, fn, abort = { failed: false }) {
+  const results = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length && !abort.failed) {
+      const i = next++;
+      try { results[i] = await fn(items[i]); }
+      catch (error) {
+        if (!abort.failed) Object.assign(abort, { failed: true, error });
+      }
+    }
+  }));
+  // Results are partial once any branch failed; report that branch's error.
+  if (abort.failed) throw abort.error;
+  return results;
+}
+
+// The token is usually the operator's own gh login, shared with everything
+// else they run. Near its hourly limit, read GitHub at most once a minute; once
+// it is spent, wait for GitHub's reset instead of polling into rejections.
+// Returns the earliest time (epoch ms) of the next GitHub read; local CPU
+// control keeps its own interval meanwhile.
+export const RATE_FLOOR = 500;
+export function nextGithubPollAt(rate, nowMs) {
+  const remaining = rate?.remaining ?? Infinity;
+  if (remaining <= 0 && Number.isFinite(rate.reset)) return Math.min(nowMs + 3600000, Math.max(nowMs, rate.reset * 1000 + 1000));
+  return remaining < RATE_FLOOR ? nowMs + 60000 : nowMs;
+}
+const RUN_STATUSES = ['queued', 'in_progress', 'pending', 'waiting', 'requested'];
 
 export function decodeJit(c, name, data) {
   if (data.runner?.name !== name || !Number.isSafeInteger(data.runner?.id) || typeof data.encoded_jit_config !== 'string') throw new AutoscaleError('Invalid JIT response');
@@ -171,7 +246,7 @@ export function decodeJit(c, name, data) {
 }
 
 export async function snapshot(c, api, local) {
-  const remote = await api(runnerEndpoint(c), 'runners');
+  const remote = await api(runnerListEndpoint(c), 'runners');
   const runners = [...c.baselineRunners, ...c.runners].map(name => {
     const matches = remote.filter(r => r.name === name);
     const slot = local.get(name);
@@ -187,27 +262,30 @@ export async function snapshot(c, api, local) {
     return { name, busy: slot.active && r?.busy === true, registered: !!r };
   });
   const eligible = new Set(c.labels.map(l => l.toLowerCase()));
-  let queued = 0;
-  for (const repo of c.repositories) {
+  // When each matching queued job was created; null when GitHub omits it.
+  const queuedAt = [];
+  const abort = { failed: false };
+  await mapLimit(c.repositories, 4, async repo => {
     const runs = new Map();
-    for (const status of ['queued', 'in_progress', 'pending', 'waiting', 'requested']) {
-      for (const run of await api(`/repos/${repo}/actions/runs?status=${status}`, 'workflow_runs')) {
-        if (!Number.isSafeInteger(run.id)) throw new AutoscaleError('Invalid workflow run');
-        runs.set(run.id, run);
-      }
+    const lists = await mapLimit(RUN_STATUSES, RUN_STATUSES.length, status => api(`/repos/${repo}/actions/runs?status=${status}`, 'workflow_runs'), abort);
+    for (const run of lists.flat()) {
+      if (!Number.isSafeInteger(run.id)) throw new AutoscaleError('Invalid workflow run');
+      runs.set(run.id, run);
     }
     const jobs = new Set();
-    for (const run of runs.values()) {
-      for (const job of await api(`/repos/${repo}/actions/runs/${run.id}/jobs?filter=latest`, 'jobs')) {
-        if (!Number.isSafeInteger(job.id) || typeof job.status !== 'string' || !Array.isArray(job.labels) ||
-            job.labels.some(l => typeof l !== 'string')) throw new AutoscaleError('Invalid workflow job');
-        if (!jobs.has(job.id) && job.status === 'queued' && job.labels.length &&
-            job.labels.every(l => eligible.has(l.toLowerCase()))) queued++;
-        jobs.add(job.id);
+    const jobLists = await mapLimit([...runs.values()], 4, run => api(`/repos/${repo}/actions/runs/${run.id}/jobs?filter=latest`, 'jobs'), abort);
+    for (const job of jobLists.flat()) {
+      if (!Number.isSafeInteger(job.id) || typeof job.status !== 'string' || !Array.isArray(job.labels) ||
+          job.labels.some(l => typeof l !== 'string')) throw new AutoscaleError('Invalid workflow job');
+      if (!jobs.has(job.id) && job.status === 'queued' && job.labels.length &&
+          job.labels.every(l => eligible.has(l.toLowerCase()))) {
+        const created = Date.parse(job.created_at);
+        queuedAt.push(Number.isFinite(created) ? created : null);
       }
+      jobs.add(job.id);
     }
-  }
-  return { runners, queued };
+  }, abort);
+  return { runners, queued: queuedAt.length, queuedAt };
 }
 
 export function hostSample() {
@@ -240,7 +318,7 @@ export function cpuPolicy(c, count, host, state) {
   return { pressure: !!state.pressure, free, quota };
 }
 
-export function plan(c, { runners, queued }, local, host, state, now) {
+export function plan(c, { runners, queued, queuedAt = [] }, local, host, state, now) {
   if (![host.cpus, host.load, host.freeMemoryPercent].every(Number.isFinite) || host.cpus < 1 || host.load < 0) {
     throw new AutoscaleError('Host metrics unavailable');
   }
@@ -248,16 +326,24 @@ export function plan(c, { runners, queued }, local, host, state, now) {
   const active = runners.filter(r => local.get(r.name).active);
   const busy = runners.filter(r => r.busy).length;
   let desired = Math.max(c.minRunners, Math.min(c.maxRunners, busy + queued));
-  // Runner jobs raise host load themselves, so only latched pressure (not "not idle") blocks growth.
+  // Runner jobs raise host load themselves, so only latched pressure (not "not idle") holds growth back.
   const { pressure } = cpuPolicy(c, active.length, host, state);
-  if (pressure && desired > active.length) desired = Math.max(c.minRunners, active.length);
+  // Under CPU pressure a fresh job waits one grace period for the host to
+  // recover, then gets a runner anyway: contention only slows a job, while a
+  // job with no runner never starts. Unknown creation times count as fresh.
+  const waiting = queuedAt.filter(t => t !== null && now - t >= c.pressureQueueGraceSeconds * 1000).length;
+  if (pressure && desired > active.length) {
+    desired = Math.max(c.minRunners, active.length, Math.min(c.maxRunners, busy + waiting));
+  }
+  // Low memory still blocks growth outright: an out-of-memory kill fails jobs already running.
+  if (host.freeMemoryPercent < c.minFreeMemoryPercent && desired > active.length) desired = Math.max(c.minRunners, active.length);
   // Ephemeral listeners are consumed per job; delaying growth only leaves queued jobs waiting.
   const target = desired;
   const start = runners.filter(r => !r.unavailable && !local.get(r.name).unavailable && !local.get(r.name).active && local.get(r.name).phase === 'ready' && !r.registered)
     .slice(0, Math.max(0, target - active.length));
   const count = Math.max(1, active.length + start.length);
   const { quota } = cpuPolicy(c, count, host, state);
-  return { queued, active: active.length, busy, desired, pressure: !!state.pressure, quota,
+  return { queued, waiting, active: active.length, busy, desired, pressure: !!state.pressure, quota,
     start: start.map(r => r.name), retiring: Math.max(0, active.length - desired) };
 }
 

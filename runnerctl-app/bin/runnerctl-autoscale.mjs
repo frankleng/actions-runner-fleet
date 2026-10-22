@@ -6,7 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseRegistry, parseServiceStatusOutput } from '../lib/runnerctl-core.mjs';
-import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerEndpoint } from '../lib/runnerctl-autoscale.mjs';
+import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerListEndpoint, nextGithubPollAt } from '../lib/runnerctl-autoscale.mjs';
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
 import { filePrivate, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
@@ -166,7 +166,7 @@ async function publishGeneration(c, name, slot, api) {
 async function resolveReservations(c, api, local) {
   const reserved = [...local.values()].filter(slot => slot.reservation);
   if (!reserved.length) return;
-  const remote = await api(runnerEndpoint(c), 'runners');
+  const remote = await api(runnerListEndpoint(c), 'runners');
   let resolved = 0;
   for (const [name, slot] of local) {
     if (!slot.reservation || quitting) continue;
@@ -268,8 +268,11 @@ try {
     configureAfter = true;
   } else {
     const state = {};
+    const etags = new Map();
+    let githubNotBefore = 0;
     do {
       let localReport;
+      let api;
       try {
         await boundControllerLog(root);
         // Invalid edits retain the last validated config so CPU control continues.
@@ -303,7 +306,8 @@ try {
         localReport = { mode: apply ? 'apply' : 'dry-run', queueAvailable: false, active, unavailable,
           pressure: policy.pressure, cpuQuotaPercent: policy.quota };
         // Local CPU control is complete before any authentication or GitHub calls.
-        const api = githubClient(await token());
+        if (Date.now() < githubNotBefore) throw new AutoscaleError('GitHub reads paused near the token rate limit; local CPU control continues');
+        api = githubClient(await token(), fetch, etags);
         if (apply && !quitting) {
           await resolveReservations(c, api, local);
           unavailable = [...local.values()].filter(r => r.unavailable).length;
@@ -345,16 +349,18 @@ try {
           }
         }
 
-        console.log(JSON.stringify({ mode: apply ? 'apply' : 'dry-run', queued: p.queued, active: p.active, unavailable,
+        console.log(JSON.stringify({ mode: apply ? 'apply' : 'dry-run', queued: p.queued, waiting: p.waiting, active: p.active, unavailable,
           busy: p.busy, desired: p.desired, pressure: p.pressure, cpuQuotaPercent: p.quota,
           loadPerCpu: Math.round(host.load * 100) / 100, plannedStarts: p.start.length,
-          retiring: p.retiring, started }));
+          retiring: p.retiring, started, ...(Number.isFinite(api.rate.remaining) ? { rateRemaining: api.rate.remaining } : {}) }));
       } catch (error) {
         if (localReport) console.log(JSON.stringify(localReport));
         // No raw exception details: OS errors may contain paths, remote errors may contain private payloads.
         console.error(error instanceof AutoscaleError ? error.message : 'Autoscale poll failed; inspect local slot files and services.');
         if (!watch) { process.exitCode = 1; break; }
       }
+      // A failed poll still reports what GitHub said about the token's budget.
+      if (api) githubNotBefore = nextGithubPollAt(api.rate, Date.now());
       if (watch && !quitting) {
         sleeper = new AbortController();
         await sleep(c.intervalSeconds * 1000, undefined, { signal: sleeper.signal }).catch(() => {});
