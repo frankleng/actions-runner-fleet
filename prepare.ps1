@@ -111,6 +111,7 @@ if (-not (Test-Path -LiteralPath $AutoscalePath)) {
   Write-KitText $AutoscalePath (($config | ConvertTo-Json -Depth 5) + "`n")
   Set-OwnerOnlyAcl $AutoscalePath
 }
+& (Join-Path $ScriptDir 'install-dashboard-startup.ps1')
 'preparation complete'
 'next: edit autoscale.json for your account, then run .\runnerctl autoscale --prepare'
 'autoscaling is enabled automatically after slot preparation'

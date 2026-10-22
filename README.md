@@ -803,6 +803,10 @@ local execution policy blocks unsigned scripts. Behaviour on Windows:
   account that stays logged on; no password is stored. The autoscale
   controller and the `runnerctl health --install` check (every 5 minutes) are
   tasks in the same folder.
+- **Dashboard** opens in a PowerShell window at sign-in. `prepare.ps1` installs
+  the current user's `Runner Fleet Dashboard` Startup shortcut. Run
+  `.\install-dashboard-startup.ps1` to install or refresh it separately; remove
+  the shortcut from `shell:startup` to disable it.
 - **Supervision** mirrors the systemd unit. `runsvc.ps1` places itself and
   everything it starts in a kill-on-close job object. It restarts the listener
   5 seconds after any exit and waits for `update.finished` after a

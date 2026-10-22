@@ -22,6 +22,7 @@
 !docs/images/runnerctl-stats-demo.png
 !fleet.example.tsv
 !kit-task.ps1
+!install-dashboard-startup.ps1
 !manage-runners.ps1
 !manage-runners.sh
 !overlay/RunnerFleetNative.cs
