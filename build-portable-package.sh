@@ -35,6 +35,8 @@ mkdir -p "${package_root}/docs/images"
 
 cp "${ROOT_DIR}/bootstrap.sh" "${package_root}/bootstrap.sh"
 cp "${ROOT_DIR}/configure-host-temp.sh" "${package_root}/configure-host-temp.sh"
+cp "${ROOT_DIR}/install-launchd-helper.sh" "${package_root}/install-launchd-helper.sh"
+cp "${ROOT_DIR}/launchd-helper.sh" "${package_root}/launchd-helper.sh"
 cp "${ROOT_DIR}/restore-fleet.sh" "${package_root}/restore-fleet.sh"
 cp "${ROOT_DIR}/manage-runners.sh" "${package_root}/manage-runners.sh"
 cp "${ROOT_DIR}/provision-runner-tooling.sh" "${package_root}/provision-runner-tooling.sh"
@@ -94,6 +96,8 @@ printf '%s\n' "${RUNNER_VERSION}" > "${package_root}/VERSION"
 chmod u+x \
   "${package_root}/bootstrap.sh" \
   "${package_root}/configure-host-temp.sh" \
+  "${package_root}/install-launchd-helper.sh" \
+  "${package_root}/launchd-helper.sh" \
   "${package_root}/restore-fleet.sh" \
   "${package_root}/manage-runners.sh" \
   "${package_root}/provision-runner-tooling.sh" \

@@ -15,6 +15,7 @@ SELF_NAME="$(basename "${0}")"
 RUNNER_PGREP_BIN="${RUNNER_PGREP_BIN:-pgrep}"
 RUNNER_PKILL_BIN="${RUNNER_PKILL_BIN:-pkill}"
 RUNNER_SUDO_BIN="${RUNNER_SUDO_BIN:-sudo}"
+RUNNER_LAUNCHD_HELPER="${RUNNER_LAUNCHD_HELPER:-/usr/local/libexec/actions-runner-fleet/launchd-helper}"
 RUNNER_STOP_GRACE_SECONDS="${RUNNER_STOP_GRACE_SECONDS:-2}"
 RUNNER_LABELS="${RUNNER_LABELS:-}"
 RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-0}"
@@ -362,10 +363,17 @@ reconcile_all_runners() {
   if [ "${RUNNER_SERVICE_MANAGER}" = "launchd" ] &&
      [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT:-0}" != "1" ] &&
      [ "$(id -u)" -ne 0 ]; then
-    "${RUNNER_SUDO_BIN}" -v || {
-      echo "macOS administrator access is required to install system LaunchDaemons" >&2
-      exit 1
-    }
+    if [ -x "${RUNNER_LAUNCHD_HELPER}" ]; then
+      "${RUNNER_SUDO_BIN}" "${RUNNER_LAUNCHD_HELPER}" check || {
+        echo "launchd helper access failed; rerun sudo ./install-launchd-helper.sh" >&2
+        exit 1
+      }
+    else
+      "${RUNNER_SUDO_BIN}" -v || {
+        echo "macOS administrator access is required to install system LaunchDaemons" >&2
+        exit 1
+      }
+    fi
   fi
 
   while IFS=$'\t' read -r runner_name runner_dir; do

@@ -255,6 +255,22 @@ setup command with `sudo`: each LaunchDaemon drops privileges to the account
 that owns and configured its runner, and then starts at boot without an
 interactive sign-in.
 
+To manage runner services without that prompt (for example, from automation),
+install the launchd helper once:
+
+```bash
+sudo ./install-launchd-helper.sh
+```
+
+This installs `launchd-helper.sh` as a root-owned command at
+`/usr/local/libexec/actions-runner-fleet/launchd-helper` and adds a sudoers rule
+that lets the installing account run only that command without a password.
+`svc.sh` and `manage-runners.sh` use it automatically when it is present. The
+helper manages only `actions.runner.*` LaunchDaemons. It installs a plist only
+when the plist runs the caller's own `runsvc.sh` as the caller with the keys the
+service template renders, so it cannot be used to start anything as root.
+Remove it with `sudo ./install-launchd-helper.sh --uninstall`.
+
 Prompted entry is recommended because the token is never written to disk or
 shell history. For unattended setup, provide variables derived from the token
 keys:
