@@ -9,16 +9,19 @@ import { promisify } from 'node:util';
 import { parseRegistry } from '../lib/runnerctl-core.mjs';
 import { acquireLock } from '../../overlay/autoscale-lock.mjs';
 import { filePrivate, kitTaskCommandLine, POWERSHELL_ARGS, serviceActive, windowsPowerShell, windowsTaskState } from '../lib/runnerctl-platform.mjs';
-import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, DEFAULT_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
+import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, DEFAULT_THRESHOLD_MS, DEFAULT_AUTOSCALE_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
-  console.log(`Usage: runnerctl health [--dry-run] [--threshold-minutes N] [--install|--uninstall]
-Checks every registered runner, autoscale slot and the autoscale controller.
-When a problem persists past the threshold (default 30 minutes), alerts once
-per new overdue problem, and again when the fleet recovers:
+  console.log(`Usage: runnerctl health [--dry-run] [--threshold-minutes N] [--autoscale-threshold-minutes N] [--install|--uninstall]
+Checks every registered runner, autoscale slot and the autoscale controller,
+including whether the controller's GitHub calls succeed.
+When a problem persists past the threshold (default 30 minutes; 10 minutes for
+autoscaler GitHub auth failures, queued jobs with no online runner, and a hung
+controller), alerts once per new overdue problem, and again when the fleet
+recovers:
 - GitHub: a repository_dispatch (event runner-health) to the OWNER/REPO in
   RUNNER_HEALTH_GITHUB_REPO or .health-github-repo, whose workflow opens and
   closes issues as github-actions[bot] so you get notified
@@ -33,6 +36,9 @@ const dryRun = args.includes('--dry-run');
 const thresholdIndex = args.indexOf('--threshold-minutes');
 const thresholdMs = thresholdIndex >= 0 ? Number(args[thresholdIndex + 1]) * 60000 : DEFAULT_THRESHOLD_MS;
 if (!Number.isFinite(thresholdMs) || thresholdMs < 0) { console.error('Invalid --threshold-minutes'); process.exit(1); }
+const autoscaleIndex = args.indexOf('--autoscale-threshold-minutes');
+const autoscaleThresholdMs = autoscaleIndex >= 0 ? Number(args[autoscaleIndex + 1]) * 60000 : DEFAULT_AUTOSCALE_THRESHOLD_MS;
+if (!Number.isFinite(autoscaleThresholdMs) || autoscaleThresholdMs < 0) { console.error('Invalid --autoscale-threshold-minutes'); process.exit(1); }
 const statePath = path.join(root, '.health-state.json');
 const unitBase = `runnerctl-health-${createHash('sha256').update(root).digest('hex').slice(0, 12)}`;
 const unitDir = path.join(os.homedir(), '.config/systemd/user');
@@ -126,8 +132,10 @@ async function gatherFacts() {
   const autoscaleUnit = `runnerctl-autoscale-${createHash('sha256').update(root).digest('hex').slice(0, 12)}${windows ? '' : '.service'}`;
   const autoscaleConfig = await readJson(path.join(root, 'autoscale.json')).catch(() => null);
   const configured = windows ? await windowsTaskState(autoscaleUnit) !== null : await exists(path.join(unitDir, autoscaleUnit));
+  // The controller's own report; unreadable counts as missing, which health reports.
+  const health = await readJson(path.join(root, '.autoscale-health.json')).catch(() => null);
   const autoscaler = { configured, active: await serviceActive(autoscaleUnit),
-    org: autoscaleConfig?.target?.split('/')[0] ?? null };
+    org: autoscaleConfig?.target?.split('/')[0] ?? null, health };
   return { facts, autoscaler, githubChecked: !!token };
 }
 
@@ -196,7 +204,7 @@ try {
     catch { throw new Error('Another health check is running'); }
   }
   const { facts, autoscaler, githubChecked } = await gatherFacts();
-  const problems = findProblems(facts, autoscaler);
+  const problems = findProblems(facts, autoscaler, { now: Date.now(), autoscaleThresholdMs, thresholdMs });
   // One incident per org, so each org's issue opens and closes on its own.
   const raw = await readJson(statePath, {});
   const host = os.hostname();

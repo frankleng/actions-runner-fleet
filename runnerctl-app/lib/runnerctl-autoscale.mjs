@@ -78,10 +78,28 @@ function rememberPage(etags, url, etag, data) {
   while (etags.size > ETAG_CACHE_LIMIT) etags.delete(etags.keys().next().value);
 }
 
+// Failed GitHub calls carry a kind for the health state: auth (401, or 403
+// that is not a rate limit), rate-limit, http, network, or invalid.
+function githubError(message, githubKind, status) {
+  return Object.assign(new AutoscaleError(message), { githubKind, ...(status ? { status } : {}) });
+}
+function httpFailure(message, response) {
+  const status = response.status;
+  const header = name => response.headers?.get?.(name);
+  const rateLimited = status === 429 || (status === 403 && (header('x-ratelimit-remaining') === '0' || header('retry-after') != null));
+  const kind = rateLimited ? 'rate-limit' : [401, 403].includes(status) ? 'auth' : 'http';
+  return githubError(message, kind, status);
+}
+/** The recorded failure for a poll error, or null when it did not come from GitHub. */
+export function githubFailure(error) {
+  if (!(error instanceof AutoscaleError) || !error.githubKind) return null;
+  return { kind: error.githubKind, ...(error.status ? { status: error.status } : {}) };
+}
+
 // Fixed API origin, no redirects, and no response bodies in errors or logs.
 // `etags` outlives a poll's client so later polls can revalidate its pages.
 export function githubClient(token, fetchImpl = fetch, etags = new Map()) {
-  if (!token || /[\r\n]/.test(token)) throw new AutoscaleError('GitHub authentication unavailable');
+  if (!token || /[\r\n]/.test(token)) throw githubError('GitHub authentication unavailable', 'no-token');
   // Every response, rejected ones included, reports the token's budget.
   const noteRate = response => {
     const remaining = Number(response.headers?.get?.('x-ratelimit-remaining') ?? NaN);
@@ -110,19 +128,19 @@ export function githubClient(token, fetchImpl = fetch, etags = new Map()) {
             'X-GitHub-Api-Version': '2022-11-28', ...(cached ? { 'If-None-Match': cached.etag } : {}) },
           redirect: 'error', signal: AbortSignal.timeout(15000)
         });
-      } catch { throw new AutoscaleError('GitHub request failed'); }
+      } catch { throw githubError('GitHub request failed', 'network'); }
       noteRate(response);
       let data;
       if (response.status === 304 && cached) {
         data = cached.data;
         rememberPage(etags, url, cached.etag, data);
       } else {
-        if (!response.ok) throw new AutoscaleError(`GitHub request failed (HTTP ${response.status})`);
-        try { data = await response.json(); } catch { throw new AutoscaleError('Invalid GitHub response'); }
+        if (!response.ok) throw httpFailure(`GitHub request failed (HTTP ${response.status})`, response);
+        try { data = await response.json(); } catch { throw githubError('Invalid GitHub response', 'invalid'); }
         const etag = response.headers?.get?.('etag');
         if (etag) rememberPage(etags, url, etag, data);
       }
-      if (!Array.isArray(data[key]) || !Number.isSafeInteger(data.total_count) || data.total_count < 0) throw new AutoscaleError('Invalid GitHub response');
+      if (!Array.isArray(data[key]) || !Number.isSafeInteger(data.total_count) || data.total_count < 0) throw githubError('Invalid GitHub response', 'invalid');
       // Items shifted across a page boundary appear twice; keep one copy per id.
       for (const item of data[key]) all.set(Number.isSafeInteger(item?.id) ? item.id : Symbol(), item);
       // Filtered run searches have a 1,000-result ceiling. Never treat a truncated queue as empty.
@@ -143,10 +161,10 @@ export function githubClient(token, fetchImpl = fetch, etags = new Map()) {
         body: JSON.stringify({ name, runner_group_id: c.runnerGroupId, labels: c.labels, work_folder: '_work' }),
         redirect: 'error', signal: AbortSignal.timeout(15000)
       });
-    } catch { throw new AutoscaleError('GitHub registration failed; check for an orphan registration before retrying'); }
+    } catch { throw githubError('GitHub registration failed; check for an orphan registration before retrying', 'network'); }
     noteRate(response);
     if (!response.ok) {
-      const error = new AutoscaleError(`GitHub registration failed (HTTP ${response.status})`);
+      const error = httpFailure(`GitHub registration failed (HTTP ${response.status})`, response);
       error.definiteRejection = [400, 401, 403, 404, 422, 429].includes(response.status);
       throw error;
     }
@@ -161,10 +179,10 @@ export function githubClient(token, fetchImpl = fetch, etags = new Map()) {
         method: 'DELETE', headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json',
           'X-GitHub-Api-Version': '2022-11-28' }, redirect: 'error', signal: AbortSignal.timeout(15000)
       });
-    } catch { throw new AutoscaleError('GitHub runner removal failed'); }
+    } catch { throw githubError('GitHub runner removal failed', 'network'); }
     noteRate(response);
     // Already gone is the outcome we wanted.
-    if (!response.ok && response.status !== 404) throw new AutoscaleError(`GitHub runner removal failed (HTTP ${response.status})`);
+    if (!response.ok && response.status !== 404) throw httpFailure(`GitHub runner removal failed (HTTP ${response.status})`, response);
   };
   return list;
 }
@@ -294,7 +312,10 @@ export async function snapshot(c, api, local) {
       jobs.add(job.id);
     }
   }, abort);
-  return { runners, queued: queuedAt.length, queuedAt };
+  // Pool runners GitHub reports online; health alerts when jobs queue with none.
+  const names = new Set([...c.baselineRunners, ...c.runners]);
+  const online = remote.filter(r => names.has(r?.name) && r.status === 'online').length;
+  return { runners, queued: queuedAt.length, queuedAt, online };
 }
 
 export function hostSample() {
@@ -379,4 +400,44 @@ export function effectiveQuota(status, savedQuota) {
   const quota = Number(match[1]) / Number(match[2]) * 100;
   // A stale saved quota also needs repair, even if the live cap happens to match policy.
   return Math.abs(quota - savedQuota) < 0.001 ? savedQuota : NaN;
+}
+
+// Controller health for `runnerctl health`: whether GitHub calls succeed, which
+// token source is in use, and whether queued jobs see any online runner. The
+// file is rewritten only when this changes, or once a minute as a heartbeat.
+export const HEALTH_FILE = '.autoscale-health.json';
+export const HEALTH_WRITE_INTERVAL_MS = 60000;
+/**
+ * poll: { at, tokenSource?: 'env'|'file'|'gh'|null, outcome: 'ok'|'failed'|'local',
+ *   failure?: { kind, status? }, githubOk?: boolean, observed?: { queued, online, busy } }
+ * 'local' means the poll stopped before GitHub was consulted; GitHub state is unchanged.
+ */
+export function trackHealth(previous, poll, c, pid = process.pid) {
+  const prev = previous?.version === 1 && previous.scope === c.scope && previous.target === c.target ? previous : {};
+  const next = { version: 1, pid, updatedAt: poll.at, intervalSeconds: c.intervalSeconds, scope: c.scope, target: c.target,
+    tokenSource: poll.tokenSource !== undefined ? poll.tokenSource : prev.tokenSource ?? null,
+    lastSuccessAt: poll.githubOk ? poll.at : prev.lastSuccessAt ?? null,
+    error: prev.error ?? null, observed: prev.observed ?? null, queuedNoRunnersSince: prev.queuedNoRunnersSince ?? null };
+  if (poll.observed) {
+    const { queued, online, busy } = poll.observed;
+    next.observed = { at: poll.at, queued, online, busy };
+    next.queuedNoRunnersSince = queued > 0 && online === 0 ? prev.queuedNoRunnersSince ?? poll.at : null;
+  }
+  // A poll that read GitHub and then failed locally still proves the token works.
+  if (poll.outcome === 'ok' || (poll.outcome === 'local' && poll.githubOk)) next.error = null;
+  else if (poll.outcome === 'failed' && poll.failure) {
+    const e = prev.error;
+    const status = poll.failure.status ?? null;
+    const same = e && e.kind === poll.failure.kind && (e.status ?? null) === status;
+    next.error = { kind: poll.failure.kind, ...(status ? { status } : {}), since: same ? e.since : poll.at, lastAt: poll.at };
+  }
+  return next;
+}
+/** What must reach disk promptly; everything else waits for the heartbeat. */
+export function healthFingerprint(h) {
+  return JSON.stringify([h.scope, h.target, h.intervalSeconds, h.tokenSource, h.lastSuccessAt === null,
+    h.error && [h.error.kind, h.error.status ?? null, h.error.since], h.queuedNoRunnersSince]);
+}
+export function healthWriteDue(written, next, now) {
+  return !written || healthFingerprint(written.state) !== healthFingerprint(next) || now - written.at >= HEALTH_WRITE_INTERVAL_MS;
 }

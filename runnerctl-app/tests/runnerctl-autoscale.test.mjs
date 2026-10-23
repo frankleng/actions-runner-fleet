@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds, hardwareMinCpuQuota, reservationDecision, RESERVATION_GRACE_MS, nextGithubPollAt, localSharing } from '../lib/runnerctl-autoscale.mjs';
+import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds, hardwareMinCpuQuota, reservationDecision, RESERVATION_GRACE_MS, nextGithubPollAt, localSharing,
+  githubFailure, trackHealth, healthWriteDue, HEALTH_WRITE_INTERVAL_MS } from '../lib/runnerctl-autoscale.mjs';
 
 // The old fixed floor keeps these tests about how the budget is divided.
 const config = (extra = {}) => validateConfig({ scope: 'organization', target: 'example-org',
@@ -583,4 +584,139 @@ test('runner removal deletes by id, treats already-gone as success, and fails cl
   await githubClient('test-credential', respond(404)).remove(config(), 7);
   await assert.rejects(githubClient('test-credential', respond(500)).remove(config(), 7), /removal failed \(HTTP 500\)/);
   await assert.rejects(githubClient('test-credential', respond(204)).remove(config(), 0), /Invalid runner id/);
+});
+
+test('GitHub failures are classified for health: auth, rate limit, network and other HTTP', async () => {
+  const failure = async response => {
+    const api = githubClient('test-credential', async () => { if (response instanceof Error) throw response; return response; });
+    return api('/orgs/example-org/actions/runners', 'runners').then(() => null, githubFailure);
+  };
+  assert.deepEqual(await failure(new Response('{}', { status: 403 })), { kind: 'auth', status: 403 });
+  assert.deepEqual(await failure(new Response('{}', { status: 401 })), { kind: 'auth', status: 401 });
+  // A spent budget answers 403 too; it is not an authentication failure.
+  assert.deepEqual(await failure(new Response('{}', { status: 403, headers: { 'x-ratelimit-remaining': '0' } })), { kind: 'rate-limit', status: 403 });
+  assert.deepEqual(await failure(new Response('{}', { status: 403, headers: { 'retry-after': '60' } })), { kind: 'rate-limit', status: 403 });
+  assert.deepEqual(await failure(new Response('{}', { status: 502 })), { kind: 'http', status: 502 });
+  assert.deepEqual(await failure(new Error('private-detail')), { kind: 'network' });
+  const register = githubClient('test-credential', async () => new Response('{}', { status: 403 }));
+  assert.deepEqual(await register.create(config(), 'runner-2').then(() => null, githubFailure), { kind: 'auth', status: 403 });
+  assert.throws(() => githubClient(''), error => githubFailure(error).kind === 'no-token');
+  assert.equal(githubFailure(new Error('local')), null);
+});
+
+test('snapshot counts only the pool runners GitHub reports online', async () => {
+  const f = fixture(3, 0, 0);
+  const foreign = { id: 99, name: 'someone-else', status: 'online', busy: false, labels: [] };
+  const api = async (endpoint, key) => key === 'runners' ? [...f.data.runners, foreign] : [];
+  assert.equal((await snapshot(f.c, api, f.local)).online, 3);
+});
+
+test('controller health keeps failure and starvation clocks across polls and clears them on success', () => {
+  const c = config();
+  const auth = { kind: 'auth', status: 403 };
+  let h = trackHealth(null, { at: 1000, outcome: 'ok', tokenSource: 'gh', githubOk: true, observed: { queued: 0, online: 2, busy: 0 } }, c, 7);
+  assert.deepEqual([h.lastSuccessAt, h.error, h.queuedNoRunnersSince, h.tokenSource, h.target], [1000, null, null, 'gh', 'example-org']);
+  h = trackHealth(h, { at: 2000, outcome: 'failed', failure: auth, tokenSource: 'gh' }, c);
+  h = trackHealth(h, { at: 3000, outcome: 'failed', failure: auth, tokenSource: 'gh' }, c);
+  assert.deepEqual(h.error, { kind: 'auth', status: 403, since: 2000, lastAt: 3000 });
+  assert.equal(h.lastSuccessAt, 1000);
+  // A local failure before GitHub is consulted says nothing about the token.
+  h = trackHealth(h, { at: 4000, outcome: 'local' }, c);
+  assert.equal(h.error.since, 2000);
+  // A different status starts a new clock.
+  h = trackHealth(h, { at: 5000, outcome: 'failed', failure: { kind: 'auth', status: 401 } }, c);
+  assert.equal(h.error.since, 5000);
+  h = trackHealth(h, { at: 6000, outcome: 'ok', githubOk: true, observed: { queued: 2, online: 0, busy: 0 } }, c);
+  h = trackHealth(h, { at: 7000, outcome: 'ok', githubOk: true, observed: { queued: 3, online: 0, busy: 0 } }, c);
+  assert.deepEqual([h.error, h.queuedNoRunnersSince, h.observed.queued], [null, 6000, 3]);
+  h = trackHealth(h, { at: 8000, outcome: 'ok', githubOk: true, observed: { queued: 3, online: 1, busy: 1 } }, c);
+  assert.equal(h.queuedNoRunnersSince, null);
+  // A retargeted controller starts clean.
+  const other = trackHealth({ ...h, error: { kind: 'auth', since: 1 } }, { at: 9000, outcome: 'local' }, config({ target: 'other-org', repositories: ['other-org/repo'] }));
+  assert.deepEqual([other.error, other.lastSuccessAt], [null, null]);
+});
+
+test('controller health writes on change and otherwise at most once a minute', () => {
+  const c = config();
+  const a = trackHealth(null, { at: 0, outcome: 'ok', tokenSource: 'file', githubOk: true, observed: { queued: 0, online: 1, busy: 0 } }, c);
+  assert.equal(healthWriteDue(null, a, 0), true);
+  const written = { state: a, at: 0 };
+  const b = trackHealth(a, { at: 20000, outcome: 'ok', tokenSource: 'file', githubOk: true, observed: { queued: 1, online: 1, busy: 1 } }, c);
+  assert.equal(healthWriteDue(written, b, 20000), false);
+  assert.equal(healthWriteDue(written, b, HEALTH_WRITE_INTERVAL_MS), true);
+  const failed = trackHealth(a, { at: 20000, outcome: 'failed', failure: { kind: 'auth', status: 403 }, tokenSource: 'file' }, c);
+  assert.equal(healthWriteDue(written, failed, 20000), true);
+  const gh = trackHealth(a, { at: 20000, outcome: 'ok', tokenSource: 'gh', githubOk: true }, c);
+  assert.equal(healthWriteDue(written, gh, 20000), true);
+});
+
+test('the background controller records GitHub auth failures and its token source, never the token', { timeout: 60000 }, async () => {
+  const { mkdtemp, mkdir, copyFile, writeFile, readFile, rm, stat } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawn, execFile } = await import('node:child_process');
+  const { once } = await import('node:events');
+  const { setTimeout: sleep } = await import('node:timers/promises');
+  const root = await mkdtemp(join(tmpdir(), 'autoscale-health-'));
+  try {
+    await mkdir(join(root, 'runnerctl-app/bin'), { recursive: true });
+    await mkdir(join(root, 'runnerctl-app/lib'), { recursive: true });
+    for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs', 'lib/runnerctl-platform.mjs']) {
+      await copyFile(new URL(`../${file}`, import.meta.url), join(root, 'runnerctl-app', file));
+    }
+    await mkdir(join(root, 'overlay'));
+    await copyFile(new URL('../../overlay/autoscale-lock.mjs', import.meta.url), join(root, 'overlay/autoscale-lock.mjs'));
+    await writeFile(join(root, 'autoscale.json'), JSON.stringify(config({ minRunners: 1, maxRunners: 1, labels: ['self-hosted'], runners: ['runner-1'] })));
+    const directory = join(root, 'runner-1');
+    await mkdir(directory);
+    await writeFile(join(directory, '.autoscale-slot.json'), JSON.stringify({ version: 1, agentName: 'runner-1', gitHubUrl: 'https://github.com/example-org' }));
+    await writeFile(join(directory, '.service'), 'installed');
+    await writeFile(join(directory, '.cpu-quota'), '50');
+    await writeFile(join(directory, 'svc.sh'), '#!/bin/sh\n[ "$1" != status ] || echo Stopped\n', { mode: 0o700 });
+    await writeFile(join(root, 'runners.tsv'), `runner-1\t${directory}`);
+    // Every GitHub call is rejected, as with a token that lost admin:org.
+    await writeFile(join(root, 'mock-api.mjs'), `globalThis.fetch = async () => new Response('{"message":"private-detail"}', { status: 403 });`);
+    await mkdir(join(root, 'test-bin'));
+    await writeFile(join(root, 'test-bin/systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    await writeFile(join(root, 'test-bin/gh'), '#!/bin/sh\necho private-gh-value\n', { mode: 0o700 });
+    const args = ['--import', join(root, 'mock-api.mjs'), join(root, 'runnerctl-app/bin/runnerctl-autoscale.mjs')];
+    const env = { ...process.env, PATH: join(root, 'test-bin') + ':' + process.env.PATH, RUNNER_AUTOSCALE_TOKEN: 'private-test-value' };
+    delete env.RUNNER_REGISTRY_PATH;
+    delete env.RUNNER_AUTOSCALE_TOKEN_FILE;
+    const healthFile = join(root, '.autoscale-health.json');
+    // One-off polls never refresh the heartbeat.
+    await new Promise(resolve => execFile(process.execPath, [...args, '--once'], { env }, resolve));
+    await assert.rejects(stat(healthFile));
+    // Runs the controller until it writes a health state other than `previous`.
+    const runDaemon = async (daemonEnv, previous = null) => {
+      const daemon = spawn(process.execPath, args, { env: daemonEnv, stdio: 'ignore' });
+      try {
+        for (let i = 0; i < 400; i++) {
+          const text = await readFile(healthFile, 'utf8').catch(() => null);
+          if (text && text !== previous) return { text, health: JSON.parse(text) };
+          await sleep(25);
+        }
+        throw new Error('Controller wrote no health state');
+      } finally {
+        const done = once(daemon, 'exit');
+        daemon.kill('SIGTERM');
+        await done;
+      }
+    };
+    let { text, health } = await runDaemon(env);
+    assert.equal(health.tokenSource, 'env');
+    assert.equal(health.target, 'example-org');
+    assert.deepEqual([health.error.kind, health.error.status], ['auth', 403]);
+    assert.equal(health.lastSuccessAt, null);
+    assert.equal((await stat(healthFile)).mode & 0o777, 0o600);
+    assert.ok(!text.includes('private-test-value') && !text.includes('private-detail'));
+    const since = health.error.since;
+    // A restarted controller keeps the failure clock; a gh login is recorded as such.
+    const ghEnv = { ...env };
+    delete ghEnv.RUNNER_AUTOSCALE_TOKEN;
+    ({ text, health } = await runDaemon(ghEnv, text));
+    assert.equal(health.tokenSource, 'gh');
+    assert.equal(health.error.since, since);
+    assert.ok(!text.includes('private-gh-value'));
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

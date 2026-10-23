@@ -6,7 +6,8 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseRegistry, parseServiceStatusOutput } from '../lib/runnerctl-core.mjs';
-import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerListEndpoint, nextGithubPollAt, localSharing } from '../lib/runnerctl-autoscale.mjs';
+import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerListEndpoint, nextGithubPollAt, localSharing,
+  githubFailure, trackHealth, healthWriteDue, HEALTH_FILE } from '../lib/runnerctl-autoscale.mjs';
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
 import { filePrivate, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
@@ -185,31 +186,51 @@ async function resolveReservations(c, api, local) {
   if (pending) console.error(`${pending} ambiguous registration(s) awaiting resolution`);
 }
 let cachedToken;
+// Which source the last token came from (env, file, gh); never the value.
+let tokenSource = null;
+const noToken = message => Object.assign(new AutoscaleError(message), { githubKind: 'no-token' });
 async function token() {
-  if (process.env.RUNNER_AUTOSCALE_TOKEN) return process.env.RUNNER_AUTOSCALE_TOKEN;
+  tokenSource = null;
+  if (process.env.RUNNER_AUTOSCALE_TOKEN) { tokenSource = 'env'; return process.env.RUNNER_AUTOSCALE_TOKEN; }
   const tokenFile = process.env.RUNNER_AUTOSCALE_TOKEN_FILE || path.join(root, '.autoscale-token');
   const stat = await fs.stat(tokenFile).catch(() => null);
   if (stat) {
     if (!await filePrivate(tokenFile, stat)) {
-      throw new AutoscaleError(process.platform === 'win32' ? 'Token file must be a regular file readable only by this user'
-        : 'Token file must be a regular file owned by this user with mode 0600');
+      throw Object.assign(new AutoscaleError(process.platform === 'win32' ? 'Token file must be a regular file readable only by this user'
+        : 'Token file must be a regular file owned by this user with mode 0600'), { githubKind: 'token-file' });
     }
     const value = (await fs.readFile(tokenFile, 'utf8')).trim();
-    if (value) return value;
+    if (value) { tokenSource = 'file'; return value; }
   }
   try {
     const { stdout } = await exec('gh', ['auth', 'token', '--hostname', 'github.com'], { timeout: 15000, maxBuffer: 65536 });
-    if (stdout.trim()) return (cachedToken = stdout.trim());
+    if (stdout.trim()) { tokenSource = 'gh'; return (cachedToken = stdout.trim()); }
   } catch {}
   // gh reads a desktop keyring that locks when its daemon restarts; keep polling with the last good token.
-  if (cachedToken) return cachedToken;
-  throw new AutoscaleError('Set RUNNER_AUTOSCALE_TOKEN, RUNNER_AUTOSCALE_TOKEN_FILE, or authenticate gh for github.com');
+  if (cachedToken) { tokenSource = 'gh'; return cachedToken; }
+  throw noToken('Set RUNNER_AUTOSCALE_TOKEN, RUNNER_AUTOSCALE_TOKEN_FILE, or authenticate gh for github.com');
+}
+// Only the background controller (continuous apply) reports health; previews
+// and one-off polls must not refresh the heartbeat of a hung controller.
+const healthPath = path.join(root, HEALTH_FILE);
+let health = null;
+let healthWritten = null;
+async function recordHealth(poll) {
+  health = trackHealth(health, poll, c);
+  if (!healthWriteDue(healthWritten, health, poll.at)) return;
+  try {
+    await fs.writeFile(`${healthPath}.tmp`, JSON.stringify(health), { mode: 0o600 });
+    if (process.platform !== 'win32') await fs.chmod(`${healthPath}.tmp`, 0o600);
+    await fs.rename(`${healthPath}.tmp`, healthPath);
+    healthWritten = { state: health, at: poll.at };
+  } catch { console.error('Could not write autoscaler health state'); }
 }
 process.on('SIGTERM', () => { quitting = true; sleeper?.abort(); });
 process.on('SIGINT', () => { quitting = true; sleeper?.abort(); });
+let c;
 try {
   const initialRaw = JSON.parse(await fs.readFile(configPath, 'utf8'));
-  let c = validateConfig(initialRaw);
+  c = validateConfig(initialRaw);
   if (!prepare && initialRaw.runners === undefined) throw new AutoscaleError('Run --prepare first to persist the generated slot list');
   if ([prepare, enable, disable].filter(Boolean).length > 1 ||
       ((prepare || enable || disable) && (dryRun || onceOnly || args.includes('--watch') || args.includes('--apply'))) ||
@@ -270,9 +291,13 @@ try {
     const state = {};
     const etags = new Map();
     let githubNotBefore = 0;
+    const reportHealth = apply && watch;
+    // A restart keeps the failure clocks running, so a crash loop still alerts.
+    if (reportHealth) health = await readJson(healthPath).catch(() => null);
     do {
       let localReport;
       let api;
+      const poll = { at: Date.now(), outcome: 'local' };
       try {
         await boundControllerLog(root);
         // Invalid edits retain the last validated config so CPU control continues.
@@ -306,13 +331,15 @@ try {
         localReport = { mode: apply ? 'apply' : 'dry-run', queueAvailable: false, active, unavailable,
           pressure: policy.pressure, cpuQuotaPercent: policy.quota };
         // Local CPU control is complete before any authentication or GitHub calls.
-        if (Date.now() < githubNotBefore) throw new AutoscaleError('GitHub reads paused near the token rate limit; local CPU control continues');
-        api = githubClient(await token(), fetch, etags);
+        if (Date.now() < githubNotBefore) throw Object.assign(new AutoscaleError('GitHub reads paused near the token rate limit; local CPU control continues'), { githubKind: 'rate-limit' });
+        try { api = githubClient(await token(), fetch, etags); }
+        finally { poll.tokenSource = tokenSource; }
         if (apply && !quitting) {
           await resolveReservations(c, api, local);
           unavailable = [...local.values()].filter(r => r.unavailable).length;
         }
         const data = await snapshot(c, api, local);
+        Object.assign(poll, { githubOk: true, observed: { queued: data.queued, online: data.online, busy: data.runners.filter(r => r.busy).length } });
         const remoteUnavailable = data.runners.filter(r => r.unavailable).length;
         if (remoteUnavailable) console.error(`${remoteUnavailable} remote slot identity check(s) failed; affected slots will not receive registrations`);
         const p = plan(c, data, local, host, state, Date.now());
@@ -349,11 +376,14 @@ try {
           }
         }
 
+        poll.outcome = 'ok';
         console.log(JSON.stringify({ mode: apply ? 'apply' : 'dry-run', queued: p.queued, waiting: p.waiting, active: p.active, unavailable,
           busy: p.busy, desired: p.desired, pressure: p.pressure, cpuQuotaPercent: p.quota,
           loadPerCpu: Math.round(host.load * 100) / 100, plannedStarts: p.start.length,
           retiring: p.retiring, started, ...(Number.isFinite(api.rate.remaining) ? { rateRemaining: api.rate.remaining } : {}) }));
       } catch (error) {
+        const failure = githubFailure(error);
+        if (failure) Object.assign(poll, { outcome: 'failed', failure });
         if (localReport) console.log(JSON.stringify(localReport));
         // No raw exception details: OS errors may contain paths, remote errors may contain private payloads.
         console.error(error instanceof AutoscaleError ? error.message : 'Autoscale poll failed; inspect local slot files and services.');
@@ -361,6 +391,7 @@ try {
       }
       // A failed poll still reports what GitHub said about the token's budget.
       if (api) githubNotBefore = nextGithubPollAt(api.rate, Date.now());
+      if (reportHealth) await recordHealth(poll);
       if (watch && !quitting) {
         sleeper = new AbortController();
         await sleep(c.intervalSeconds * 1000, undefined, { signal: sleeper.signal }).catch(() => {});

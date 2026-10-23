@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown } from '../lib/runnerctl-health.mjs';
+import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, DEFAULT_AUTOSCALE_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const MIN = 60000;
 const healthy = { name: 'ci-1', kind: 'ephemeral', org: 'example-org', unitActive: true, unitUnrendered: false, phase: 'ready' };
@@ -86,4 +86,88 @@ test('problems group by org, including the autoscaler, so each org is its own in
   assert.equal(t.resolved, true);
   assert.equal(f.resolved, undefined);
   assert.equal(f.alert, null);
+});
+
+// The controller's .autoscale-health.json as it looks while GitHub answers normally.
+const NOW = Date.parse('2026-10-23T22:00:00Z');
+const report = (extra = {}) => ({ version: 1, pid: 1, updatedAt: NOW - 30000, intervalSeconds: 60, scope: 'organization', target: 'titledock',
+  tokenSource: 'file', lastSuccessAt: NOW - 30000, error: null, observed: { at: NOW - 30000, queued: 0, online: 2, busy: 0 },
+  queuedNoRunnersSince: null, ...extra });
+const controller = health => ({ configured: true, active: true, org: 'titledock', health });
+const autoscaleProblems = (health, now = NOW) => findProblems([], controller(health), { now }).map(p => p.kind);
+
+test('a controller whose GitHub calls succeed with a dedicated token has no problems', () => {
+  assert.deepEqual(autoscaleProblems(report()), []);
+  // A stopped controller is only autoscaler-down; its last report is not evidence.
+  assert.deepEqual(findProblems([], { configured: true, active: false, org: 'titledock', health: null }, { now: NOW }).map(p => p.kind), ['autoscaler-down']);
+});
+
+test('persistent autoscaler GitHub auth failures alert after the short threshold with the fix, never a token', () => {
+  const since = NOW - 3 * MIN;
+  const health = report({ tokenSource: 'gh', lastSuccessAt: NOW - 3 * MIN, error: { kind: 'auth', status: 403, since, lastAt: NOW - 30000 } });
+  const problems = findProblems([], controller(health), { now: NOW });
+  const auth = problems.find(p => p.kind === 'autoscaler-auth');
+  assert.equal(auth.org, 'titledock');
+  assert.match(auth.detail, /HTTP 403/);
+  assert.match(auth.detail, /admin:org/);
+  assert.match(auth.detail, /\.autoscale-token/);
+  assert.match(auth.detail, /gh auth login/);
+  // The clock starts when the controller first failed, not when health first looked.
+  let r = planAlert({}, problems, NOW);
+  assert.equal(r.alert, null);
+  r = planAlert(r.state, problems, since + DEFAULT_AUTOSCALE_THRESHOLD_MS);
+  assert.ok(r.alert.problems.some(p => p.kind === 'autoscaler-auth' && p.new));
+  assert.match(r.alert.summary, /lasting 10\+ min/);
+  assert.ok(!JSON.stringify(r.alert).includes('startedAt'));
+  r = planAlert(r.state, problems, since + 20 * MIN);
+  assert.equal(r.alert, null); // Once per incident.
+  // A missing token and a refused token file are the same alert.
+  for (const kind of ['no-token', 'token-file']) {
+    assert.deepEqual(autoscaleProblems(report({ error: { kind, since, lastAt: NOW } })), ['autoscaler-auth']);
+  }
+  // Rate limits and network errors are not authentication failures.
+  for (const kind of ['rate-limit', 'network', 'http']) assert.deepEqual(autoscaleProblems(report({ error: { kind, status: 403, since, lastAt: NOW } })), []);
+  // Recovery closes the incident.
+  r = planAlert(planAlert({}, problems.filter(p => p.kind === 'autoscaler-auth'), NOW + DEFAULT_AUTOSCALE_THRESHOLD_MS).state,
+    findProblems([], controller(report()), { now: NOW }), NOW + 30 * MIN);
+  assert.equal(r.resolved, true);
+});
+
+test('jobs queued with none of the autoscaler runners online alert after the short threshold', () => {
+  const since = NOW - 11 * MIN;
+  const starved = report({ observed: { at: NOW - 30000, queued: 24, online: 0, busy: 0 }, queuedNoRunnersSince: since });
+  const problems = findProblems([], controller(starved), { now: NOW });
+  assert.deepEqual(problems.map(p => p.kind), ['autoscaler-starved']);
+  assert.match(problems[0].detail, /24 job\(s\) queued for titledock/);
+  assert.ok(planAlert({}, problems, NOW).alert);
+  // An observation from a controller that stopped reporting proves nothing about now.
+  const old = { ...starved, observed: { ...starved.observed, at: NOW - 20 * MIN } };
+  assert.deepEqual(autoscaleProblems(old), []);
+});
+
+test('a running controller that stops reporting, or never reported, is stale', () => {
+  assert.deepEqual(autoscaleProblems(report({ updatedAt: NOW - 2 * MIN })), []);
+  const hung = findProblems([], controller(report({ updatedAt: NOW - 12 * MIN, error: { kind: 'auth', status: 403, since: NOW - 20 * MIN } })), { now: NOW });
+  // Stale hides the outdated details it would otherwise report.
+  assert.deepEqual(hung.map(p => p.kind), ['autoscaler-stale']);
+  assert.ok(planAlert({}, hung, NOW).alert); // Silent since 12 minutes: overdue at once.
+  // A slow poll interval stretches the heartbeat it is judged by.
+  assert.deepEqual(autoscaleProblems(report({ updatedAt: NOW - 12 * MIN, intervalSeconds: 300 })), []);
+  for (const missing of [null, { version: 2 }]) {
+    const problems = findProblems([], controller(missing), { now: NOW });
+    assert.deepEqual(problems.map(p => p.kind), ['autoscaler-stale']);
+    assert.equal(planAlert({}, problems, NOW).alert, null);
+  }
+});
+
+test('an autoscaler on a personal gh login is a warning on the longer threshold', () => {
+  const problems = findProblems([], controller(report({ tokenSource: 'gh' })), { now: NOW, thresholdMs: 30 * MIN });
+  assert.deepEqual(problems.map(p => [p.kind, p.severity]), [['autoscaler-personal-token', 'warning']]);
+  let r = planAlert({}, problems, NOW, 30 * MIN);
+  r = planAlert(r.state, problems, NOW + 15 * MIN, 30 * MIN);
+  assert.equal(r.alert, null);
+  r = planAlert(r.state, problems, NOW + 30 * MIN, 30 * MIN);
+  assert.equal(r.alert.problems[0].severity, 'warning');
+  assert.ok(renderAlertMarkdown({ host: 'h', kit: '/kit', ...r.alert }).includes('.autoscale-token'));
+  for (const tokenSource of ['env', 'file']) assert.deepEqual(autoscaleProblems(report({ tokenSource })), []);
 });
