@@ -8,6 +8,11 @@ export const DEFAULT_AUTOSCALE_THRESHOLD_MS = 10 * 60 * 1000;
 const HEALTH_HEARTBEAT_MS = 60 * 1000;
 const iso = ms => new Date(ms).toISOString();
 const TOKEN_FIX = 'see README "Autoscaler GitHub token"; prefer a dedicated token in .autoscale-token (mode 0600)';
+// Kinds judged from the controller's report. When that report cannot say
+// (controller hung or stopped, no recent GitHub observation), an alerted
+// problem of the kind stays open rather than counting as recovered.
+const REPORTED_KINDS = ['autoscaler-auth', 'autoscaler-starved', 'autoscaler-personal-token'];
+const hold = kind => ({ kind, hold: true });
 
 /**
  * Problems from the controller's own report (.autoscale-health.json, or null
@@ -19,7 +24,7 @@ export function autoscalerHealthProblems(health, { now, thresholdMs = DEFAULT_AU
   const add = (kind, detail, extra = {}) => problems.push({ kind, detail, thresholdMs, ...extra });
   if (!health || health.version !== 1 || !Number.isFinite(health.updatedAt)) {
     add('autoscaler-stale', 'autoscale controller is running but has written no .autoscale-health.json; restart it if it predates health reporting');
-    return problems;
+    return [...problems, ...REPORTED_KINDS.map(hold)];
   }
   // Heartbeats come once a minute or once a poll, whichever is longer.
   const heartbeat = Math.max(HEALTH_HEARTBEAT_MS, (health.intervalSeconds ?? 60) * 1000);
@@ -27,8 +32,8 @@ export function autoscalerHealthProblems(health, { now, thresholdMs = DEFAULT_AU
   if (now - health.updatedAt > staleAfter) {
     add('autoscaler-stale', `autoscale controller is running but has not completed a poll since ${iso(health.updatedAt)}; it may be hung`,
       { startedAt: health.updatedAt, thresholdMs: Math.max(thresholdMs, staleAfter) });
-    // Its last report is no longer evidence of the present.
-    return problems;
+    // Its last report is no longer evidence of the present, of failure or of recovery.
+    return [...problems, ...REPORTED_KINDS.map(hold)];
   }
   const viaGh = health.tokenSource === 'gh' ? ' It is using the gh login (gh auth token); re-running gh auth login without -s admin:org drops the scope.' : '';
   // The outage clock, not the latest error: a rate-limit pause in between
@@ -45,7 +50,10 @@ export function autoscalerHealthProblems(health, { now, thresholdMs = DEFAULT_AU
     }
   }
   const seen = health.observed;
-  if (Number.isFinite(health.queuedNoRunnersSince) && seen && now - seen.at <= staleAfter) {
+  // Only a recent observation shows starvation, or that it ended (runners
+  // online or nothing queued); while GitHub reads fail, nobody knows.
+  if (!seen || !(now - seen.at <= staleAfter)) problems.push(hold('autoscaler-starved'));
+  else if (Number.isFinite(health.queuedNoRunnersSince)) {
     add('autoscaler-starved', `${seen.queued} job(s) queued for ${health.target} with none of the autoscaler's runners online since ${iso(health.queuedNoRunnersSince)}`,
       { startedAt: health.queuedNoRunnersSince });
   }
@@ -82,10 +90,15 @@ export function findProblems(facts, autoscaler, options = {}) {
     }
   }
   if (autoscaler.configured && !autoscaler.active) add('autoscaler-down', 'runnerctl-autoscale', autoscaler.org ?? null, 'autoscale controller service is not active');
+  const autoscaleHold = kind => problems.push({ key: `hold:${kind}:runnerctl-autoscale`, kind, runner: 'runnerctl-autoscale',
+    org: autoscaler.org ?? null, holds: `${kind}:runnerctl-autoscale` });
+  // A stopped controller reports nothing; autoscaler-down covers it meanwhile.
+  if (autoscaler.configured && !autoscaler.active && autoscaler.health !== undefined) REPORTED_KINDS.forEach(autoscaleHold);
   if (autoscaler.configured && autoscaler.active && autoscaler.health !== undefined) {
     const now = options.now ?? Date.now();
-    for (const { kind, detail, ...extra } of autoscalerHealthProblems(autoscaler.health, { now,
+    for (const { kind, detail, hold: held, ...extra } of autoscalerHealthProblems(autoscaler.health, { now,
       thresholdMs: options.autoscaleThresholdMs, warningThresholdMs: options.thresholdMs })) {
+      if (held) { autoscaleHold(kind); continue; }
       const p = { kind, runner: 'runnerctl-autoscale', org: autoscaler.org ?? null, detail, ...extra };
       // Each outage is its own problem: a failure that recovered and recurred
       // between checks must neither inherit the old clock nor its alert.
@@ -104,6 +117,16 @@ export function findProblems(facts, autoscaler, options = {}) {
  * lasted already.
  */
 export function planAlert(previous, problems, now, thresholdMs = DEFAULT_THRESHOLD_MS) {
+  // A hold marks a problem whose state is unknown: an alerted one is carried
+  // forward unchanged, and nothing is raised when none was alerted.
+  const holds = problems.filter(p => p.holds);
+  problems = problems.filter(p => !p.holds);
+  for (const k of previous?.alerted ?? []) {
+    const h = holds.find(h => k === h.holds || k.startsWith(`${h.holds}@`));
+    if (!h || problems.some(p => p.key === k)) continue;
+    problems.push({ key: k, kind: h.kind, runner: h.runner, org: h.org, detail: 'status unknown while the controller cannot report it; still treated as open',
+      carried: true, thresholdMs: 0 });
+  }
   const firstSeen = {};
   for (const p of problems) firstSeen[p.key] = previous?.firstSeen?.[p.key] ?? Math.min(now, p.startedAt ?? now);
   const current = new Set(problems.map(p => p.key));
@@ -122,7 +145,7 @@ export function planAlert(previous, problems, now, thresholdMs = DEFAULT_THRESHO
   if (!fresh.length && !recovered.length) return { state, alert: null };
   const counts = {};
   for (const p of overdue) counts[p.kind] = (counts[p.kind] ?? 0) + 1;
-  const minutes = Math.round(Math.min(...overdue.map(limit)) / 60000);
+  const minutes = Math.round(Math.min(...overdue.filter(p => !p.carried).map(limit)) / 60000);
   const tally = list => Object.entries(list.reduce((n, kind) => ({ ...n, [kind]: (n[kind] ?? 0) + 1 }), {})).map(([kind, n]) => `${n} ${kind}`).join(', ');
   // Some alerted problems recovered while others stay open: report it on the open incident.
   const summary = (fresh.length ? `${overdue.length} runner problem(s) lasting ${minutes}+ min: ` +
@@ -140,6 +163,9 @@ export function planAlert(previous, problems, now, thresholdMs = DEFAULT_THRESHO
     },
   };
 }
+
+/** Problems that exist now, without the holds planAlert consumes. */
+export const realProblems = problems => problems.filter(p => !p.holds);
 
 /** Problems grouped by GitHub org; each org is a separate incident. */
 export const UNKNOWN_ORG = 'unknown';

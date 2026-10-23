@@ -785,7 +785,9 @@ new problem with a new clock. Each incident alerts once. A new overdue problem
 alerts again. When every alerted problem has cleared, the org gets a resolution
 and the incident resets, even if newer problems are still under their threshold
 (they alert on their own later). When some alerted problems clear while others
-stay, an `open` update reports what recovered. Failed deliveries retry on the next run, and incident state
+stay, an `open` update reports what recovered. Recovery needs evidence: while
+the controller is hung or stopped, or GitHub reads fail, an alerted
+`autoscaler-*` problem stays open instead of counting as resolved. Failed deliveries retry on the next run, and incident state
 lives in the private `.health-state.json`. Configure one or both targets:
 
 - **GitHub issues (recommended).** Put `OWNER/REPO` in `.health-github-repo` (or

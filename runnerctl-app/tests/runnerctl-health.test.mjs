@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, DEFAULT_AUTOSCALE_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
+import { findProblems as findAll, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, realProblems, DEFAULT_AUTOSCALE_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const MIN = 60000;
+// What is wrong now; planAlert itself always receives the holds too (see the carry-forward tests).
+const findProblems = (...args) => realProblems(findAll(...args));
 const healthy = { name: 'ci-1', kind: 'ephemeral', org: 'example-org', unitActive: true, unitUnrendered: false, phase: 'ready' };
 
 test('a healthy fleet has no problems', () => {
@@ -215,4 +217,41 @@ test('recovery is reported even while other problems or warnings remain on the s
   assert.match(r.alert.summary, /^1 runner problem\(s\) still open; recovered: 1 autoscaler-auth$/);
   assert.deepEqual(r.alert.recovered, ['autoscaler-auth']);
   assert.equal(planAlert(r.state, warningOnly, NOW + 40 * MIN, 30 * MIN).alert, null); // Reported once.
+});
+
+test('an alerted auth outage stays open while the controller hangs, and resolves only on a clean poll', () => {
+  const outage = report({ authFailure: { kind: 'auth', status: 403, since: NOW - 11 * MIN, lastAt: NOW } });
+  let r = planAlert({}, findAll([], controller(outage), { now: NOW }), NOW);
+  assert.ok(r.alert);
+  // Five minutes later the controller is hung: its report proves neither failure nor recovery.
+  const hung = findAll([], controller({ ...outage, updatedAt: NOW }), { now: NOW + 5 * MIN });
+  r = planAlert(r.state, hung, NOW + 5 * MIN);
+  assert.equal(r.resolved, undefined);
+  assert.equal(r.alert, null);
+  assert.ok(r.state.alerted.some(k => k.startsWith('autoscaler-auth:')));
+  // Stopped controller: the same.
+  r = planAlert(r.state, findAll([], { configured: true, active: false, org: 'titledock', health: outage }, { now: NOW + 6 * MIN }), NOW + 6 * MIN);
+  assert.equal(r.resolved, undefined);
+  assert.ok(r.state.alerted.some(k => k.startsWith('autoscaler-auth:')));
+  // A fresh report with a clean authenticated poll is the evidence.
+  const clean = report({ updatedAt: NOW + 7 * MIN - 30000, lastSuccessAt: NOW + 7 * MIN - 30000,
+    observed: { at: NOW + 7 * MIN - 30000, queued: 0, online: 2, busy: 0 } });
+  r = planAlert(r.state, findAll([], controller(clean), { now: NOW + 7 * MIN }), NOW + 7 * MIN);
+  assert.equal(r.resolved, true);
+});
+
+test('alerted starvation stays open through GitHub errors and resolves only once runners are seen', () => {
+  const starved = report({ observed: { at: NOW - 30000, queued: 24, online: 0, busy: 0 }, queuedNoRunnersSince: NOW - 11 * MIN });
+  let r = planAlert({}, findAll([], controller(starved), { now: NOW }), NOW);
+  assert.ok(r.alert);
+  // Five minutes of HTTP 503: the controller keeps reporting, but observes nothing.
+  const blind = { ...starved, updatedAt: NOW + 5 * MIN - 30000, error: { kind: 'http', status: 503, since: NOW, lastAt: NOW + 5 * MIN - 30000 } };
+  r = planAlert(r.state, findAll([], controller(blind), { now: NOW + 5 * MIN }), NOW + 5 * MIN);
+  assert.equal(r.resolved, undefined);
+  assert.ok(r.state.alerted.some(k => k.startsWith('autoscaler-starved:')));
+  // Holds never raise anything on their own.
+  assert.deepEqual(planAlert({}, findAll([], controller(blind), { now: NOW + 5 * MIN }), NOW + 5 * MIN).state, { firstSeen: {}, alerted: [] });
+  const served = report({ updatedAt: NOW + 6 * MIN, observed: { at: NOW + 6 * MIN, queued: 3, online: 2, busy: 2 } });
+  r = planAlert(r.state, findAll([], controller(served), { now: NOW + 6 * MIN }), NOW + 6 * MIN);
+  assert.equal(r.resolved, true);
 });

@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 import { parseRegistry } from '../lib/runnerctl-core.mjs';
 import { acquireLock } from '../../overlay/autoscale-lock.mjs';
 import { filePrivate, kitTaskCommandLine, POWERSHELL_ARGS, serviceActive, windowsPowerShell, windowsTaskState } from '../lib/runnerctl-platform.mjs';
-import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, DEFAULT_THRESHOLD_MS, DEFAULT_AUTOSCALE_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
+import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, realProblems, DEFAULT_THRESHOLD_MS, DEFAULT_AUTOSCALE_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -216,10 +216,11 @@ try {
   for (const org of new Set([...Object.keys(previousByOrg), ...Object.keys(groups)])) {
     plans[org] = planAlert(previousByOrg[org], groups[org] ?? [], now, thresholdMs);
   }
-  const report = { runners: facts.length, problems: problems.length, githubChecked,
+  const current = realProblems(problems);
+  const report = { runners: facts.length, problems: current.length, githubChecked,
     alerting: Object.keys(plans).filter(o => plans[o].alert), resolved: Object.keys(plans).filter(o => plans[o].resolved) };
   if (dryRun) {
-    console.log(JSON.stringify({ ...report, details: problems.map(({ key, ...p }) => ({ ...p,
+    console.log(JSON.stringify({ ...report, details: current.map(({ key, ...p }) => ({ ...p,
       firstSeen: new Date(plans[p.org ?? 'unknown'].state.firstSeen[key]).toISOString() })) }, null, 2));
     process.exit(0);
   }

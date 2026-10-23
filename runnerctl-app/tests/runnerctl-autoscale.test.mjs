@@ -657,7 +657,7 @@ test('controller health writes on change and otherwise at most once a minute', (
   assert.equal(healthWriteDue(written, gh, 20000), true);
 });
 
-test('the background controller records GitHub auth failures and its token source, never the token', { timeout: 60000 }, async () => {
+test('the background controller records GitHub auth failures and its token source, never the token', { timeout: 120000 }, async () => {
   const { mkdtemp, mkdir, copyFile, writeFile, readFile, rm, stat } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -696,18 +696,22 @@ test('the background controller records GitHub auth failures and its token sourc
     await assert.rejects(stat(healthFile));
     // Runs the controller until it writes a health state other than `previous`.
     const runDaemon = async (daemonEnv, previous = null) => {
-      const daemon = spawn(process.execPath, args, { env: daemonEnv, stdio: 'ignore' });
+      const daemon = spawn(process.execPath, args, { env: daemonEnv, stdio: ['ignore', 'ignore', 'pipe'] });
+      // Listen from the start: a controller that already exited never emits 'exit' again.
+      const exited = once(daemon, 'exit');
+      let stderr = '';
+      daemon.stderr.on('data', d => { stderr += d; });
       try {
-        for (let i = 0; i < 400; i++) {
+        // Generous under a loaded host; a healthy first poll takes well under a second.
+        for (const deadline = Date.now() + 45000; Date.now() < deadline && daemon.exitCode === null;) {
           const text = await readFile(healthFile, 'utf8').catch(() => null);
           if (text && text !== previous) return { text, health: JSON.parse(text) };
           await sleep(25);
         }
-        throw new Error('Controller wrote no health state');
+        throw new Error(`Controller wrote no health state: ${stderr}`);
       } finally {
-        const done = once(daemon, 'exit');
         daemon.kill('SIGTERM');
-        await done;
+        await exited;
       }
     };
     let { text, health } = await runDaemon(env);
