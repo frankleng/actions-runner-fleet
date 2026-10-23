@@ -578,6 +578,48 @@ write** or **Administration: write**, respectively, to generate ephemeral
 registrations. Organization approval/SSO policies still apply. Short-lived
 registration tokens alone cannot monitor queues or create JIT configurations.
 
+### Autoscaler GitHub token
+
+Give the controller a dedicated token in `.autoscale-token` rather than your
+`gh` login: re-running `gh auth login` without `-s admin:org` silently removes
+the scope the controller needs, and every poll then fails with HTTP 403 while
+jobs queue with no runners. `runnerctl health` warns while the controller runs
+on `gh auth token` (`autoscaler-personal-token`).
+
+The controller makes exactly these calls (no registration-token endpoint; it
+uses JIT configurations):
+
+| Call | Endpoint | Classic PAT scope | Fine-grained permission |
+|---|---|---|---|
+| List pool runners | `GET /orgs/{org}/actions/runner-groups/{id}/runners` (repository pool: `GET /repos/{owner}/{repo}/actions/runners`) | `admin:org` (repository pool: `repo`) | Organization **Self-hosted runners: read** (repository pool: **Administration: read**) |
+| Register a listener | `POST …/actions/runners/generate-jitconfig` | `admin:org` (repository pool: `repo`) | Organization **Self-hosted runners: write** (repository pool: **Administration: write**) |
+| Remove an orphan registration | `DELETE …/actions/runners/{id}` | `admin:org` (repository pool: `repo`) | as registration |
+| Read the queue | `GET /repos/{owner}/{repo}/actions/runs?status=…` and `…/runs/{id}/jobs` for each repository in `repositories` | `repo` (private repositories) | Repository **Actions: read** on those repositories |
+
+So an organization pool needs either a classic PAT with `admin:org` and `repo`,
+or a fine-grained token owned by the organization with **Self-hosted runners:
+read and write** plus **Actions: read** on the configured repositories (the
+organization may have to approve fine-grained tokens). The token's user must be
+an organization owner.
+
+`runnerctl health` reads the same token first. With a fine-grained token, also
+grant **Contents: write** on the `.health-github-repo` repository (alert
+dispatches) and **Self-hosted runners: read** in every other org whose persistent
+runners this kit hosts; a fine-grained token covers one owner, so a kit serving
+several orgs needs a classic PAT, or health reports those runners as
+`runner-unverified`.
+
+Store it owner-only; the next poll picks it up without a restart:
+
+```bash
+umask 077
+read -rs -p 'Token: ' token && printf '%s\n' "$token" > .autoscale-token; unset token; echo
+chmod 600 .autoscale-token
+./runnerctl health --dry-run   # autoscaler-auth and autoscaler-personal-token clear after the next poll
+```
+
+On Windows, use the owner-only access list in [Windows hosts](#windows-hosts).
+
 ```bash
 ./runnerctl autoscale --prepare          # Prepare and enable background autoscaling (default)
 ./runnerctl autoscale --dry-run          # Preview one poll without changes
@@ -712,6 +754,19 @@ the autoscale controller. It looks for:
 - slots parked as blocked, or holding an unresolved registration reservation
 - persistent runners that are offline or unregistered at GitHub
 - a stopped autoscale controller
+- a running controller whose GitHub calls fail authentication (HTTP 401/403) or
+  that has no usable token (`autoscaler-auth`)
+- jobs queued for the controller's target while none of its runners is online
+  (`autoscaler-starved`)
+- a running controller that stopped reporting polls (`autoscaler-stale`)
+- a controller using a personal `gh` login instead of a dedicated token
+  (`autoscaler-personal-token`, a warning on the normal threshold)
+
+The controller records what it saw in the private `.autoscale-health.json`
+(mode `0600`): last successful GitHub call, last error kind, HTTP status and
+since when, token source (`env`, `file` or `gh`, never the value), and queued
+versus online counts. It rewrites the file when that changes, otherwise once a
+minute.
 
 ```bash
 ./runnerctl health --dry-run   # print current problems; send and save nothing
@@ -720,7 +775,10 @@ the autoscale controller. It looks for:
 ```
 
 A problem alerts only after it has persisted past the threshold (default 30
-minutes; override with `--threshold-minutes`). Each incident alerts once. A new
+minutes; override with `--threshold-minutes`). `autoscaler-auth`,
+`autoscaler-starved` and `autoscaler-stale` use a shorter threshold (default 10
+minutes; override with `--autoscale-threshold-minutes`), counted from when the
+controller first saw the condition. Each incident alerts once. A new
 overdue problem alerts again, and a fully healthy fleet sends a resolution and
 resets the incident. Failed deliveries retry on the next run, and incident state
 lives in the private `.health-state.json`. Configure one or both targets:
@@ -966,7 +1024,29 @@ scripts need Linux or macOS.
   `$env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')`.
 - **Windows: autoscaling gets HTTP 403 from the runner APIs:** the GitHub token
   lacks `admin:org`. `gh auth status` lists its scopes; log in again with the
-  command in [Windows hosts](#windows-hosts).
+  command in [Windows hosts](#windows-hosts), or better, use a dedicated token
+  (see [Autoscaler GitHub token](#autoscaler-github-token)).
+- **Health alert `autoscaler-auth`:** the controller is running but GitHub
+  rejects its calls (HTTP 401/403), it has no token, or it refuses a token file
+  that is not owner-only. Ephemeral runners are not re-registered after their
+  jobs, so the org's jobs queue with no runners. The usual cause is a `gh auth
+  login` without `admin:org`. Create a dedicated token and store it in
+  `.autoscale-token` ([Autoscaler GitHub token](#autoscaler-github-token)); no
+  restart is needed. `cat .autoscale-health.json` shows the error kind, status
+  and token source.
+- **Health alert `autoscaler-starved`:** GitHub answers, but jobs for the
+  controller's labels have queued while none of its runners is online. Check the
+  controller journal for registration or slot errors (blocked or quarantined
+  slots), and `./runnerctl autoscale --dry-run`.
+- **Health alert `autoscaler-stale`:** the controller service is active but has
+  not finished a poll for several intervals, so it is probably hung; inspect its
+  journal, then restart it with `./runnerctl autoscale --enable`. Right after an
+  upgrade, a controller started before health reporting existed raises this
+  until it is restarted.
+- **Health warning `autoscaler-personal-token`:** the controller uses `gh auth
+  token`. It works, but any `gh auth login` can change its scopes. Switch to
+  `.autoscale-token`. While the warning stands, the org's incident stays open,
+  so it never sends a recovery notice.
 - **Windows: a runner task is Running but the runner is offline:** inspect
   `<runner-directory>\_diag\runsvc-supervisor.log`, `runsvc.err.log`, and
   `Runner_*.log`. Confirm the task uses S4U logon and a startup trigger;
