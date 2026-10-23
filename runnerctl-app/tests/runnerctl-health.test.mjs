@@ -104,7 +104,8 @@ test('a controller whose GitHub calls succeed with a dedicated token has no prob
 
 test('persistent autoscaler GitHub auth failures alert after the short threshold with the fix, never a token', () => {
   const since = NOW - 3 * MIN;
-  const health = report({ tokenSource: 'gh', lastSuccessAt: NOW - 3 * MIN, error: { kind: 'auth', status: 403, since, lastAt: NOW - 30000 } });
+  const failure = { kind: 'auth', status: 403, since, lastAt: NOW - 30000 };
+  const health = report({ tokenSource: 'gh', lastSuccessAt: NOW - 3 * MIN, error: failure, authFailure: failure });
   const problems = findProblems([], controller(health), { now: NOW });
   const auth = problems.find(p => p.kind === 'autoscaler-auth');
   assert.equal(auth.org, 'titledock');
@@ -123,7 +124,7 @@ test('persistent autoscaler GitHub auth failures alert after the short threshold
   assert.equal(r.alert, null); // Once per incident.
   // A missing token and a refused token file are the same alert.
   for (const kind of ['no-token', 'token-file']) {
-    assert.deepEqual(autoscaleProblems(report({ error: { kind, since, lastAt: NOW } })), ['autoscaler-auth']);
+    assert.deepEqual(autoscaleProblems(report({ error: { kind, since, lastAt: NOW }, authFailure: { kind, since, lastAt: NOW } })), ['autoscaler-auth']);
   }
   // Rate limits and network errors are not authentication failures.
   for (const kind of ['rate-limit', 'network', 'http']) assert.deepEqual(autoscaleProblems(report({ error: { kind, status: 403, since, lastAt: NOW } })), []);
@@ -147,7 +148,7 @@ test('jobs queued with none of the autoscaler runners online alert after the sho
 
 test('a running controller that stops reporting, or never reported, is stale', () => {
   assert.deepEqual(autoscaleProblems(report({ updatedAt: NOW - 2 * MIN })), []);
-  const hung = findProblems([], controller(report({ updatedAt: NOW - 12 * MIN, error: { kind: 'auth', status: 403, since: NOW - 20 * MIN } })), { now: NOW });
+  const hung = findProblems([], controller(report({ updatedAt: NOW - 12 * MIN, authFailure: { kind: 'auth', status: 403, since: NOW - 20 * MIN } })), { now: NOW });
   // Stale hides the outdated details it would otherwise report.
   assert.deepEqual(hung.map(p => p.kind), ['autoscaler-stale']);
   assert.ok(planAlert({}, hung, NOW).alert); // Silent since 12 minutes: overdue at once.
@@ -170,4 +171,48 @@ test('an autoscaler on a personal gh login is a warning on the longer threshold'
   assert.equal(r.alert.problems[0].severity, 'warning');
   assert.ok(renderAlertMarkdown({ host: 'h', kit: '/kit', ...r.alert }).includes('.autoscale-token'));
   for (const tokenSource of ['env', 'file']) assert.deepEqual(autoscaleProblems(report({ tokenSource })), []);
+});
+
+test('a rate-limit pause after an auth failure keeps the auth outage and its clock', () => {
+  // The latest error is the pause; the outage clock still runs from the first 403.
+  const health = report({ error: { kind: 'rate-limit', since: NOW - MIN, lastAt: NOW - 30000 },
+    authFailure: { kind: 'auth', status: 403, since: NOW - 11 * MIN, lastAt: NOW - 2 * MIN } });
+  const problems = findProblems([], controller(health), { now: NOW });
+  assert.deepEqual(problems.map(p => p.kind), ['autoscaler-auth']);
+  assert.ok(planAlert({}, problems, NOW).alert);
+});
+
+test('an auth outage that recovered and recurred between checks is a new problem with a new clock', () => {
+  const outage = since => findProblems([], controller(report({ authFailure: { kind: 'auth', status: 403, since, lastAt: NOW } })), { now: NOW });
+  let r = planAlert({}, outage(NOW - 11 * MIN), NOW);
+  assert.ok(r.alert); // First outage alerts.
+  // Between checks it recovered and failed again a minute ago.
+  // The first outage's incident resolves; the new one is not overdue yet.
+  r = planAlert(r.state, outage(NOW + 4 * MIN), NOW + 5 * MIN);
+  assert.deepEqual([r.alert, r.resolved], [null, true]);
+  r = planAlert(r.state, outage(NOW + 4 * MIN), NOW + 13 * MIN);
+  assert.equal(r.alert, null);
+  // It alerts again once the new outage is itself overdue.
+  r = planAlert(r.state, outage(NOW + 4 * MIN), NOW + 14 * MIN);
+  assert.ok(r.alert.problems.find(p => p.kind === 'autoscaler-auth').new);
+});
+
+test('recovery is reported even while other problems or warnings remain on the same org', () => {
+  const auth = findProblems([], controller(report({ tokenSource: 'gh', authFailure: { kind: 'auth', status: 403, since: NOW - 11 * MIN, lastAt: NOW } })),
+    { now: NOW, thresholdMs: 30 * MIN });
+  let r = planAlert({}, auth, NOW, 30 * MIN);
+  assert.ok(r.alert.problems.some(p => p.kind === 'autoscaler-auth' && p.new));
+  // Auth recovers; the personal-token warning has not aged into an alert: the incident resolves.
+  const warningOnly = findProblems([], controller(report({ tokenSource: 'gh' })), { now: NOW, thresholdMs: 30 * MIN });
+  const recovered = planAlert(r.state, warningOnly, NOW + 5 * MIN, 30 * MIN);
+  assert.equal(recovered.resolved, true);
+  // The warning still alerts later on its own.
+  assert.ok(planAlert(recovered.state, warningOnly, NOW + 31 * MIN, 30 * MIN).alert);
+  // Auth recovers while an alerted warning stays open: the recovery is still reported.
+  r = planAlert(r.state, auth, NOW + 30 * MIN, 30 * MIN);
+  assert.ok(r.alert.problems.some(p => p.kind === 'autoscaler-personal-token' && p.new));
+  r = planAlert(r.state, warningOnly, NOW + 35 * MIN, 30 * MIN);
+  assert.match(r.alert.summary, /^1 runner problem\(s\) still open; recovered: 1 autoscaler-auth$/);
+  assert.deepEqual(r.alert.recovered, ['autoscaler-auth']);
+  assert.equal(planAlert(r.state, warningOnly, NOW + 40 * MIN, 30 * MIN).alert, null); // Reported once.
 });

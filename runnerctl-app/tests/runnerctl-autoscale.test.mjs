@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfig, githubClient, snapshot, plan, decodeJit, effectiveQuota, hardwareRunnerBounds, hardwareMinCpuQuota, reservationDecision, RESERVATION_GRACE_MS, nextGithubPollAt, localSharing,
   githubFailure, trackHealth, healthWriteDue, HEALTH_WRITE_INTERVAL_MS } from '../lib/runnerctl-autoscale.mjs';
+import { restrictToOwner } from '../lib/runnerctl-platform.mjs';
 
 // The old fixed floor keeps these tests about how the budget is divided.
 const config = (extra = {}) => validateConfig({ scope: 'organization', target: 'example-org',
@@ -597,6 +598,12 @@ test('GitHub failures are classified for health: auth, rate limit, network and o
   assert.deepEqual(await failure(new Response('{}', { status: 403, headers: { 'x-ratelimit-remaining': '0' } })), { kind: 'rate-limit', status: 403 });
   assert.deepEqual(await failure(new Response('{}', { status: 403, headers: { 'retry-after': '60' } })), { kind: 'rate-limit', status: 403 });
   assert.deepEqual(await failure(new Response('{}', { status: 502 })), { kind: 'http', status: 502 });
+  // The secondary limit sends neither header; only its message says so.
+  const secondary = JSON.stringify({ message: 'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.',
+    documentation_url: 'https://docs.github.com/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits' });
+  assert.deepEqual(await failure(new Response(secondary, { status: 403 })), { kind: 'rate-limit', status: 403 });
+  const scope = JSON.stringify({ message: 'Resource not accessible by personal access token', documentation_url: 'https://docs.github.com/rest/actions/self-hosted-runners' });
+  assert.deepEqual(await failure(new Response(scope, { status: 403 })), { kind: 'auth', status: 403 });
   assert.deepEqual(await failure(new Error('private-detail')), { kind: 'network' });
   const register = githubClient('test-credential', async () => new Response('{}', { status: 403 }));
   assert.deepEqual(await register.create(config(), 'runner-2').then(() => null, githubFailure), { kind: 'auth', status: 403 });
@@ -719,4 +726,39 @@ test('the background controller records GitHub auth failures and its token sourc
     assert.equal(health.error.since, since);
     assert.ok(!text.includes('private-gh-value'));
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('rate-limit pauses and network errors neither end nor restart an auth outage; a clean poll ends it', () => {
+  const c = config();
+  const auth = { kind: 'auth', status: 403 };
+  let h = trackHealth(null, { at: 1000, outcome: 'failed', failure: auth }, c);
+  // With a 15-second interval and a low budget, pauses follow every failure.
+  for (const [at, failure] of [[2000, { kind: 'rate-limit' }], [3000, auth], [4000, { kind: 'network' }], [5000, { kind: 'rate-limit' }]]) {
+    h = trackHealth(h, { at, outcome: 'failed', failure }, c);
+  }
+  assert.equal(h.error.kind, 'rate-limit');
+  assert.deepEqual([h.authFailure.kind, h.authFailure.since], ['auth', 1000]);
+  // Reads succeeding while registration is still rejected keep the outage.
+  h = trackHealth(h, { at: 6000, outcome: 'failed', githubOk: true, failure: auth }, c);
+  assert.equal(h.authFailure.since, 1000);
+  h = trackHealth(h, { at: 7000, outcome: 'ok', githubOk: true }, c);
+  assert.equal(h.authFailure, null);
+  h = trackHealth(h, { at: 8000, outcome: 'failed', failure: auth }, c);
+  assert.equal(h.authFailure.since, 8000);
+});
+
+test('owner-only files get a protected owner-only access list on Windows and mode 0600 elsewhere', async () => {
+  const calls = [];
+  await restrictToOwner('C:\\kit\\.autoscale-health.json.tmp', { platform: 'win32', sid: 'S-1-5-21-1-2-3-1001', run: async (...call) => calls.push(call) });
+  assert.deepEqual(calls[0].slice(0, 2), ['icacls', ['C:\\kit\\.autoscale-health.json.tmp', '/inheritance:r', '/grant:r', '*S-1-5-21-1-2-3-1001:F', '*S-1-5-18:F', '*S-1-5-32-544:F']]);
+  await assert.rejects(restrictToOwner('x', { platform: 'win32', sid: 'Everyone', run: async () => {} }), /SID unavailable/);
+  const { mkdtemp, writeFile, stat, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'owner-only-'));
+  try {
+    await writeFile(join(dir, 'f'), '', { mode: 0o644 });
+    await restrictToOwner(join(dir, 'f'), { platform: 'linux' });
+    assert.equal((await stat(join(dir, 'f'))).mode & 0o777, 0o600);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

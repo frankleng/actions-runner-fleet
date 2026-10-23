@@ -31,7 +31,9 @@ export function autoscalerHealthProblems(health, { now, thresholdMs = DEFAULT_AU
     return problems;
   }
   const viaGh = health.tokenSource === 'gh' ? ' It is using the gh login (gh auth token); re-running gh auth login without -s admin:org drops the scope.' : '';
-  const e = health.error;
+  // The outage clock, not the latest error: a rate-limit pause in between
+  // neither ends nor restarts it.
+  const e = health.authFailure;
   if (e && Number.isFinite(e.since)) {
     if (e.kind === 'auth') {
       add('autoscaler-auth', `autoscaler GitHub calls rejected (HTTP ${e.status ?? '401/403'}) since ${iso(e.since)}: the token likely lacks admin:org ` +
@@ -84,7 +86,11 @@ export function findProblems(facts, autoscaler, options = {}) {
     const now = options.now ?? Date.now();
     for (const { kind, detail, ...extra } of autoscalerHealthProblems(autoscaler.health, { now,
       thresholdMs: options.autoscaleThresholdMs, warningThresholdMs: options.thresholdMs })) {
-      add(kind, 'runnerctl-autoscale', autoscaler.org ?? null, detail, extra.startedAt != null ? iso(extra.startedAt) : null, extra);
+      const p = { kind, runner: 'runnerctl-autoscale', org: autoscaler.org ?? null, detail, ...extra };
+      // Each outage is its own problem: a failure that recovered and recurred
+      // between checks must neither inherit the old clock nor its alert.
+      if (extra.startedAt != null) Object.assign(p, { since: iso(extra.startedAt), key: `${kind}:runnerctl-autoscale@${iso(extra.startedAt)}` });
+      problems.push({ key: `${kind}:runnerctl-autoscale`, ...p });
     }
   }
   return problems;
@@ -106,20 +112,27 @@ export function planAlert(previous, problems, now, thresholdMs = DEFAULT_THRESHO
   const isOverdue = p => now - firstSeen[p.key] >= limit(p);
   const overdue = problems.filter(isOverdue);
   const fresh = overdue.filter(p => !alerted.has(p.key));
+  // Alerted problems that are gone now. Problems that never alerted do not
+  // hold back the news: they alert on their own once overdue.
+  const recovered = (previous?.alerted ?? []).filter(k => !current.has(k)).map(k => k.split(':')[0]);
   for (const p of overdue) alerted.add(p.key);
   const state = { firstSeen, alerted: [...alerted].sort() };
   // Everything that was alerted on is healthy again: close the incident.
-  if (!problems.length && previous?.alerted?.length) return { state, alert: null, resolved: true };
-  if (!fresh.length) return { state, alert: null };
+  if (!alerted.size && previous?.alerted?.length) return { state, alert: null, resolved: true };
+  if (!fresh.length && !recovered.length) return { state, alert: null };
   const counts = {};
   for (const p of overdue) counts[p.kind] = (counts[p.kind] ?? 0) + 1;
   const minutes = Math.round(Math.min(...overdue.map(limit)) / 60000);
-  const summary = `${overdue.length} runner problem(s) lasting ${minutes}+ min: ` +
-    Object.entries(counts).map(([kind, n]) => `${n} ${kind}`).join(', ');
+  const tally = list => Object.entries(list.reduce((n, kind) => ({ ...n, [kind]: (n[kind] ?? 0) + 1 }), {})).map(([kind, n]) => `${n} ${kind}`).join(', ');
+  // Some alerted problems recovered while others stay open: report it on the open incident.
+  const summary = (fresh.length ? `${overdue.length} runner problem(s) lasting ${minutes}+ min: ` +
+    Object.entries(counts).map(([kind, n]) => `${n} ${kind}`).join(', ') : `${overdue.length} runner problem(s) still open`) +
+    (recovered.length ? `; recovered: ${tally(recovered)}` : '');
   return {
     state,
     alert: {
       summary,
+      ...(recovered.length ? { recovered } : {}),
       problems: problems.map(p => {
         const { key, startedAt, thresholdMs: _, ...rest } = p;
         return { ...rest, firstSeen: new Date(firstSeen[key]).toISOString(), overdue: isOverdue(p), new: fresh.some(f => f.key === key) };

@@ -68,6 +68,21 @@ if (@($trusted[0], 'S-1-5-32-544') -contains $acl.GetOwner($sid).Value -and $oth
   } catch { return false; }
 }
 
+// Make a file this kit writes owner-only: mode 0600, or on Windows the
+// protected access list the README documents for .autoscale-token (this user,
+// SYSTEM, Administrators). Restrict before writing anything into it.
+let currentUserSid;
+export async function restrictToOwner(file, { platform = process.platform, run = exec, sid } = {}) {
+  if (platform !== 'win32') {
+    const { chmod } = await import('node:fs/promises');
+    await chmod(file, 0o600);
+    return;
+  }
+  const user = sid ?? (currentUserSid ??= await powershell('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'));
+  if (!/^S-1-[0-9-]+$/.test(user)) throw new Error('Current user SID unavailable');
+  await run('icacls', [file, '/inheritance:r', '/grant:r', `*${user}:F`, '*S-1-5-18:F', '*S-1-5-32-544:F'], { windowsHide: true, timeout: 30000 });
+}
+
 // Windows has no load average (os.loadavg() is always zero). The busy fraction
 // of all logical CPUs between polls serves the same role: 1.0 means saturated.
 let previousCpuTimes;

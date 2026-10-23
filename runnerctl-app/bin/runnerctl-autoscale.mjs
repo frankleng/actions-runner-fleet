@@ -10,7 +10,7 @@ import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, pla
   githubFailure, trackHealth, healthWriteDue, HEALTH_FILE } from '../lib/runnerctl-autoscale.mjs';
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
-import { filePrivate, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
+import { filePrivate, restrictToOwner, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -219,8 +219,11 @@ async function recordHealth(poll) {
   health = trackHealth(health, poll, c);
   if (!healthWriteDue(healthWritten, health, poll.at)) return;
   try {
-    await fs.writeFile(`${healthPath}.tmp`, JSON.stringify(health), { mode: 0o600 });
-    if (process.platform !== 'win32') await fs.chmod(`${healthPath}.tmp`, 0o600);
+    // Restrict the empty file first, then fill it; rename keeps its access list.
+    await fs.rm(`${healthPath}.tmp`, { force: true });
+    await fs.writeFile(`${healthPath}.tmp`, '', { mode: 0o600, flag: 'wx' });
+    await restrictToOwner(`${healthPath}.tmp`);
+    await fs.writeFile(`${healthPath}.tmp`, JSON.stringify(health));
     await fs.rename(`${healthPath}.tmp`, healthPath);
     healthWritten = { state: health, at: poll.at };
   } catch { console.error('Could not write autoscaler health state'); }

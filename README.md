@@ -763,8 +763,10 @@ the autoscale controller. It looks for:
   (`autoscaler-personal-token`, a warning on the normal threshold)
 
 The controller records what it saw in the private `.autoscale-health.json`
-(mode `0600`): last successful GitHub call, last error kind, HTTP status and
-since when, token source (`env`, `file` or `gh`, never the value), and queued
+(mode `0600`, or the owner-only access list on Windows): last successful GitHub
+call, the current authentication outage and since when (rate-limit pauses and
+network errors in between neither end nor restart it), the latest error kind and
+HTTP status, token source (`env`, `file` or `gh`, never the value), and queued
 versus online counts. It rewrites the file when that changes, otherwise once a
 minute.
 
@@ -778,9 +780,12 @@ A problem alerts only after it has persisted past the threshold (default 30
 minutes; override with `--threshold-minutes`). `autoscaler-auth`,
 `autoscaler-starved` and `autoscaler-stale` use a shorter threshold (default 10
 minutes; override with `--autoscale-threshold-minutes`), counted from when the
-controller first saw the condition. Each incident alerts once. A new
-overdue problem alerts again, and a fully healthy fleet sends a resolution and
-resets the incident. Failed deliveries retry on the next run, and incident state
+controller first saw the condition; an outage that recovers and recurs is a
+new problem with a new clock. Each incident alerts once. A new overdue problem
+alerts again. When every alerted problem has cleared, the org gets a resolution
+and the incident resets, even if newer problems are still under their threshold
+(they alert on their own later). When some alerted problems clear while others
+stay, an `open` update reports what recovered. Failed deliveries retry on the next run, and incident state
 lives in the private `.health-state.json`. Configure one or both targets:
 
 - **GitHub issues (recommended).** Put `OWNER/REPO` in `.health-github-repo` (or
@@ -1045,8 +1050,8 @@ scripts need Linux or macOS.
   until it is restarted.
 - **Health warning `autoscaler-personal-token`:** the controller uses `gh auth
   token`. It works, but any `gh auth login` can change its scopes. Switch to
-  `.autoscale-token`. While the warning stands, the org's incident stays open,
-  so it never sends a recovery notice.
+  `.autoscale-token`. Once it has alerted, the org's incident stays open until
+  it clears; other problems still report their own recovery as updates.
 - **Windows: a runner task is Running but the runner is offline:** inspect
   `<runner-directory>\_diag\runsvc-supervisor.log`, `runsvc.err.log`, and
   `Runner_*.log`. Confirm the task uses S4U logon and a startup trigger;

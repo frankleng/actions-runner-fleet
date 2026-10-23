@@ -83,10 +83,19 @@ function rememberPage(etags, url, etag, data) {
 function githubError(message, githubKind, status) {
   return Object.assign(new AutoscaleError(message), { githubKind, ...(status ? { status } : {}) });
 }
-function httpFailure(message, response) {
+// GitHub's secondary (abuse) limit answers 403 with neither header; only its
+// message says so. The body is inspected, never logged or kept.
+async function secondaryRateLimit(response) {
+  try {
+    const text = typeof response.text === 'function' ? (await response.text()).slice(0, 4096) : '';
+    return /rate limit/i.test(text) || /secondary-rate-limits|rate-limits-for-the-rest-api/i.test(text);
+  } catch { return false; }
+}
+async function httpFailure(message, response) {
   const status = response.status;
   const header = name => response.headers?.get?.(name);
-  const rateLimited = status === 429 || (status === 403 && (header('x-ratelimit-remaining') === '0' || header('retry-after') != null));
+  const rateLimited = status === 429 || (status === 403 && (header('x-ratelimit-remaining') === '0' || header('retry-after') != null ||
+    await secondaryRateLimit(response)));
   const kind = rateLimited ? 'rate-limit' : [401, 403].includes(status) ? 'auth' : 'http';
   return githubError(message, kind, status);
 }
@@ -135,7 +144,7 @@ export function githubClient(token, fetchImpl = fetch, etags = new Map()) {
         data = cached.data;
         rememberPage(etags, url, cached.etag, data);
       } else {
-        if (!response.ok) throw httpFailure(`GitHub request failed (HTTP ${response.status})`, response);
+        if (!response.ok) throw await httpFailure(`GitHub request failed (HTTP ${response.status})`, response);
         try { data = await response.json(); } catch { throw githubError('Invalid GitHub response', 'invalid'); }
         const etag = response.headers?.get?.('etag');
         if (etag) rememberPage(etags, url, etag, data);
@@ -164,7 +173,7 @@ export function githubClient(token, fetchImpl = fetch, etags = new Map()) {
     } catch { throw githubError('GitHub registration failed; check for an orphan registration before retrying', 'network'); }
     noteRate(response);
     if (!response.ok) {
-      const error = httpFailure(`GitHub registration failed (HTTP ${response.status})`, response);
+      const error = await httpFailure(`GitHub registration failed (HTTP ${response.status})`, response);
       error.definiteRejection = [400, 401, 403, 404, 422, 429].includes(response.status);
       throw error;
     }
@@ -182,7 +191,7 @@ export function githubClient(token, fetchImpl = fetch, etags = new Map()) {
     } catch { throw githubError('GitHub runner removal failed', 'network'); }
     noteRate(response);
     // Already gone is the outcome we wanted.
-    if (!response.ok && response.status !== 404) throw httpFailure(`GitHub runner removal failed (HTTP ${response.status})`, response);
+    if (!response.ok && response.status !== 404) throw await httpFailure(`GitHub runner removal failed (HTTP ${response.status})`, response);
   };
   return list;
 }
@@ -402,6 +411,8 @@ export function effectiveQuota(status, savedQuota) {
   return Math.abs(quota - savedQuota) < 0.001 ? savedQuota : NaN;
 }
 
+// Kinds that mean the controller cannot authenticate at all.
+export const AUTH_FAILURE_KINDS = ['auth', 'no-token', 'token-file'];
 // Controller health for `runnerctl health`: whether GitHub calls succeed, which
 // token source is in use, and whether queued jobs see any online runner. The
 // file is rewritten only when this changes, or once a minute as a heartbeat.
@@ -411,18 +422,25 @@ export const HEALTH_WRITE_INTERVAL_MS = 60000;
  * poll: { at, tokenSource?: 'env'|'file'|'gh'|null, outcome: 'ok'|'failed'|'local',
  *   failure?: { kind, status? }, githubOk?: boolean, observed?: { queued, online, busy } }
  * 'local' means the poll stopped before GitHub was consulted; GitHub state is unchanged.
+ * `error` is the latest failure of any kind. `authFailure` is the current
+ * authentication outage: other failures in between (a rate-limit pause, a
+ * network error) neither end nor restart it; only a GitHub call that succeeds does.
  */
 export function trackHealth(previous, poll, c, pid = process.pid) {
   const prev = previous?.version === 1 && previous.scope === c.scope && previous.target === c.target ? previous : {};
   const next = { version: 1, pid, updatedAt: poll.at, intervalSeconds: c.intervalSeconds, scope: c.scope, target: c.target,
     tokenSource: poll.tokenSource !== undefined ? poll.tokenSource : prev.tokenSource ?? null,
     lastSuccessAt: poll.githubOk ? poll.at : prev.lastSuccessAt ?? null,
-    error: prev.error ?? null, observed: prev.observed ?? null, queuedNoRunnersSince: prev.queuedNoRunnersSince ?? null };
+    error: prev.error ?? null, authFailure: prev.authFailure ?? null,
+    observed: prev.observed ?? null, queuedNoRunnersSince: prev.queuedNoRunnersSince ?? null };
   if (poll.observed) {
     const { queued, online, busy } = poll.observed;
     next.observed = { at: poll.at, queued, online, busy };
     next.queuedNoRunnersSince = queued > 0 && online === 0 ? prev.queuedNoRunnersSince ?? poll.at : null;
   }
+  const authFailed = poll.outcome === 'failed' && AUTH_FAILURE_KINDS.includes(poll.failure?.kind);
+  // Only a poll whose GitHub calls authenticated ends the outage.
+  if (poll.githubOk && !authFailed) next.authFailure = null;
   // A poll that read GitHub and then failed locally still proves the token works.
   if (poll.outcome === 'ok' || (poll.outcome === 'local' && poll.githubOk)) next.error = null;
   else if (poll.outcome === 'failed' && poll.failure) {
@@ -430,13 +448,16 @@ export function trackHealth(previous, poll, c, pid = process.pid) {
     const status = poll.failure.status ?? null;
     const same = e && e.kind === poll.failure.kind && (e.status ?? null) === status;
     next.error = { kind: poll.failure.kind, ...(status ? { status } : {}), since: same ? e.since : poll.at, lastAt: poll.at };
+    // A registration rejected after a successful read is still an outage.
+    if (authFailed) next.authFailure = { kind: poll.failure.kind, ...(status ? { status } : {}), since: prev.authFailure?.since ?? poll.at, lastAt: poll.at };
   }
   return next;
 }
 /** What must reach disk promptly; everything else waits for the heartbeat. */
 export function healthFingerprint(h) {
   return JSON.stringify([h.scope, h.target, h.intervalSeconds, h.tokenSource, h.lastSuccessAt === null,
-    h.error && [h.error.kind, h.error.status ?? null, h.error.since], h.queuedNoRunnersSince]);
+    h.error && [h.error.kind, h.error.status ?? null, h.error.since],
+    h.authFailure && [h.authFailure.kind, h.authFailure.status ?? null, h.authFailure.since], h.queuedNoRunnersSince]);
 }
 export function healthWriteDue(written, next, now) {
   return !written || healthFingerprint(written.state) !== healthFingerprint(next) || now - written.at >= HEALTH_WRITE_INTERVAL_MS;
