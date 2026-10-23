@@ -23,6 +23,8 @@
 !fleet.example.tsv
 !kit-task.ps1
 !install-dashboard-startup.ps1
+!install-launchd-helper.sh
+!launchd-helper.sh
 !manage-runners.ps1
 !manage-runners.sh
 !overlay/RunnerFleetNative.cs
@@ -79,6 +81,7 @@
 !tests/autoscale-prepare-smoke.sh
 !tests/bootstrap-smoke.sh
 !tests/host-temp-smoke.sh
+!tests/launchd-helper-smoke.sh
 !tests/manage-runners-smoke.sh
 !tests/portable-package-smoke.sh
 !tests/restore-fleet-smoke.sh

@@ -15,6 +15,7 @@ SVC_CMD="${1:-status}"
 RUNNER_LAUNCHCTL_BIN="${RUNNER_LAUNCHCTL_BIN:-launchctl}"
 RUNNER_SUDO_BIN="${RUNNER_SUDO_BIN:-sudo}"
 RUNNER_INSTALL_BIN="${RUNNER_INSTALL_BIN:-/usr/bin/install}"
+RUNNER_LAUNCHD_HELPER="${RUNNER_LAUNCHD_HELPER:-/usr/local/libexec/actions-runner-fleet/launchd-helper}"
 RUNNER_PGREP_BIN="${RUNNER_PGREP_BIN:-pgrep}"
 RUNNER_PKILL_BIN="${RUNNER_PKILL_BIN:-pkill}"
 RUNNER_STOP_GRACE_SECONDS="${RUNNER_STOP_GRACE_SECONDS:-2}"
@@ -134,6 +135,9 @@ DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-${CALCULATED_DEFA
 run_privileged() {
   if [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT}" = "1" ] || [ "$(id -u)" -eq 0 ]; then
     "$@"
+  elif [ -x "${RUNNER_LAUNCHD_HELPER}" ]; then
+    # install-launchd-helper.sh allows this validated helper without a password.
+    "${RUNNER_SUDO_BIN}" "${RUNNER_LAUNCHD_HELPER}" "$(basename "$1")" "${@:2}"
   else
     "${RUNNER_SUDO_BIN}" "$@"
   fi
