@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# GitHub's config.sh sources env.sh; the exec below would replace config.sh and
+# silently skip configure/remove, so run as a child and return instead.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  bash "${BASH_SOURCE[0]}"
+  return
+fi
+
 set -euo pipefail
 
 SOURCE="${BASH_SOURCE[0]}"

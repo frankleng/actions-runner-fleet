@@ -133,14 +133,14 @@ run_launchctl() {
 install_plist() {
   local source_path="${7:-}"
   local destination_path="${8:-}"
-  local staged
   local label
 
   [ "$#" -eq 8 ] && [ "$1 $2 $3 $4 $5 $6" = "-o root -g wheel -m 0644" ] ||
     fail "unsupported install arguments: $*"
 
+  # Global, not local: the EXIT trap runs after this function returns.
   staged="$(mktemp /tmp/launchd-helper.XXXXXX)"
-  trap 'rm -f "${staged}"' EXIT
+  trap 'rm -f "${staged:-}"' EXIT
   # Read as the caller so a symlinked source cannot expose root-only files.
   sudo -u "${caller_user}" cat -- "${source_path}" > "${staged}" || fail "cannot read ${source_path}"
 

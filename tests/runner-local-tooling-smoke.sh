@@ -155,3 +155,16 @@ if grep -Fq "/opt/homebrew/Cellar/awscli" "${SCRIPT_PATH}"; then
   echo "runner tooling must not depend on a Homebrew AWS CLI path"
   exit 1
 fi
+
+# GitHub's config.sh sources env.sh; it must keep running afterward to configure or remove.
+env_check_dir="$(mktemp -d)"
+cp "${ROOT_DIR}/overlay/env.sh" "${env_check_dir}/env.sh"
+printf '#!/bin/bash\ntouch "%s/provisioned"\n' "${env_check_dir}" > "${env_check_dir}/provision"
+printf '#!/bin/bash\ncd "$(dirname "$0")"\nsource ./env.sh\ntouch configured\n' > "${env_check_dir}/config.sh"
+chmod +x "${env_check_dir}/env.sh" "${env_check_dir}/provision" "${env_check_dir}/config.sh"
+RUNNER_PROVISION_SCRIPT_PATH="${env_check_dir}/provision" bash "${env_check_dir}/config.sh"
+if [ ! -f "${env_check_dir}/provisioned" ] || [ ! -f "${env_check_dir}/configured" ]; then
+  echo "sourcing env.sh must provision and then return to config.sh"
+  exit 1
+fi
+rm -rf "${env_check_dir}"
