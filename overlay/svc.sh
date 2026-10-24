@@ -26,6 +26,7 @@ RUNNER_LOG_RETENTION_DAYS="${RUNNER_LOG_RETENTION_DAYS:-7}"
 RUNNER_LOG_ROTATE_MAX_BYTES="${RUNNER_LOG_ROTATE_MAX_BYTES:-52428800}"
 CPU_QUOTA_PATH="${RUNNER_ROOT}/.cpu-quota"
 INSTALL_STARTED_SERVICE=0
+OTHER_SERVICE_STOPPED=0
 
 read_runner_json_value() {
   local key="$1"
@@ -61,10 +62,27 @@ RUNNER_OWNER="${RUNNER_OWNER##*/}"
 # GitHub's runner self-update swaps bin/ for upstream files, whose service
 # template uses placeholders this script does not fill and whose runsvc.sh lacks
 # the kit's wrapper. Prefer the kit's own copies while the kit is on disk.
+KIT_ROOT_DIR=""
 KIT_OVERLAY_DIR=""
 if [ -f "${RUNNER_ROOT}/.kit-root" ]; then
-  KIT_OVERLAY_DIR="$(cat "${RUNNER_ROOT}/.kit-root")/overlay"
+  KIT_ROOT_DIR="$(cat "${RUNNER_ROOT}/.kit-root")"
+  KIT_OVERLAY_DIR="${KIT_ROOT_DIR}/overlay"
 fi
+
+# "system" runs a root LaunchDaemon that drops to the runner account. "user"
+# runs a Background agent in the account's own launchd domain instead, where the
+# account's security daemon (secd) is reachable, so codesign can build
+# certificate chains from job keychains. manage-runners.sh set-launchd-domain
+# records the choice for the whole kit.
+RUNNER_LAUNCHD_DOMAIN_MODE="${RUNNER_LAUNCHD_DOMAIN_MODE:-}"
+if [ -z "${RUNNER_LAUNCHD_DOMAIN_MODE}" ] && [ -n "${KIT_ROOT_DIR}" ] && [ -f "${KIT_ROOT_DIR}/.launchd-domain" ]; then
+  RUNNER_LAUNCHD_DOMAIN_MODE="$(tr -d '[:space:]' < "${KIT_ROOT_DIR}/.launchd-domain")"
+fi
+RUNNER_LAUNCHD_DOMAIN_MODE="${RUNNER_LAUNCHD_DOMAIN_MODE:-system}"
+case "${RUNNER_LAUNCHD_DOMAIN_MODE}" in
+  system|user) ;;
+  *) echo "unsupported launchd domain: ${RUNNER_LAUNCHD_DOMAIN_MODE} (expected system or user)" >&2; exit 1 ;;
+esac
 
 kit_or_runner_file() {
   if [ -n "${KIT_OVERLAY_DIR}" ] && [ -f "${KIT_OVERLAY_DIR}/$1" ]; then
@@ -79,14 +97,25 @@ SVC_NAME="${SVC_NAME// /_}"
 RUNNER_HOME="${RUNNER_ROOT}/home"
 RUNNER_LOG_DIR="${RUNNER_HOME}/Library/Logs/${SVC_NAME}"
 LAUNCHD_USER_HOME="${RUNNER_LAUNCHD_USER_HOME:-$(default_launchd_user_home)}"
-LAUNCH_PATH="${RUNNER_LAUNCH_PATH:-/Library/LaunchDaemons}"
-PLIST_PATH="${LAUNCH_PATH}/${SVC_NAME}.plist"
-LAUNCHD_DOMAIN="system"
+LAUNCHD_UID="$(id -u "${RUNNER_LAUNCHD_USER}")"
+DAEMON_PLIST_PATH="${RUNNER_LAUNCH_PATH:-/Library/LaunchDaemons}/${SVC_NAME}.plist"
+AGENT_PLIST_PATH="${RUNNER_LEGACY_LAUNCH_PATH:-${LAUNCHD_USER_HOME}/Library/LaunchAgents}/${SVC_NAME}.plist"
+# Services of the other mode, and the kit's original GUI-session agents, are
+# removed on install so one runner never has two listeners.
+if [ "${RUNNER_LAUNCHD_DOMAIN_MODE}" = "user" ]; then
+  PLIST_PATH="${AGENT_PLIST_PATH}"
+  LAUNCHD_DOMAIN="user/${LAUNCHD_UID}"
+  TEMPLATE_PATH="$(kit_or_runner_file bin/actions.runner.agent.plist.template bin/actions.runner.agent.plist.template)"
+  OTHER_PLIST_PATH="${DAEMON_PLIST_PATH}"
+  OTHER_SERVICE_TARGETS=("system/${SVC_NAME}" "gui/${LAUNCHD_UID}/${SVC_NAME}")
+else
+  PLIST_PATH="${DAEMON_PLIST_PATH}"
+  LAUNCHD_DOMAIN="system"
+  TEMPLATE_PATH="$(kit_or_runner_file bin/actions.runner.plist.template bin/actions.runner.plist.template)"
+  OTHER_PLIST_PATH="${AGENT_PLIST_PATH}"
+  OTHER_SERVICE_TARGETS=("user/${LAUNCHD_UID}/${SVC_NAME}" "gui/${LAUNCHD_UID}/${SVC_NAME}")
+fi
 LAUNCHD_SERVICE_TARGET="${LAUNCHD_DOMAIN}/${SVC_NAME}"
-LEGACY_LAUNCH_PATH="${RUNNER_LEGACY_LAUNCH_PATH:-${LAUNCHD_USER_HOME}/Library/LaunchAgents}"
-LEGACY_PLIST_PATH="${LEGACY_LAUNCH_PATH}/${SVC_NAME}.plist"
-LEGACY_SERVICE_TARGET="gui/$(id -u "${RUNNER_LAUNCHD_USER}")/${SVC_NAME}"
-TEMPLATE_PATH="$(kit_or_runner_file bin/actions.runner.plist.template bin/actions.runner.plist.template)"
 RUNSVC_SOURCE_PATH="$(kit_or_runner_file runsvc.sh bin/runsvc.sh)"
 TEMP_PATH="${RUNNER_ROOT}/bin/actions.runner.plist.temp"
 CONFIG_PATH="${RUNNER_ROOT}/.service"
@@ -147,8 +176,29 @@ run_privileged_launchctl() {
   run_privileged "${RUNNER_LAUNCHCTL_BIN}" "$@"
 }
 
+# Only the system domain needs root; the account manages its own domains.
+launchctl_for_target() {
+  local verb="$1"
+  local target="$2"
+
+  shift 2
+  if [[ "${target}" == system* ]]; then
+    run_privileged_launchctl "${verb}" "${target}" "$@"
+  else
+    "${RUNNER_LAUNCHCTL_BIN}" "${verb}" "${target}" "$@"
+  fi
+}
+
 service_is_loaded() {
-  run_privileged_launchctl print "$1" >/dev/null 2>&1
+  launchctl_for_target print "$1" >/dev/null 2>&1
+}
+
+remove_service_plist() {
+  if [ "$1" = "${DAEMON_PLIST_PATH}" ]; then
+    run_privileged rm -f "$1"
+  else
+    rm -f "$1"
+  fi
 }
 
 require_non_negative_integer() {
@@ -272,8 +322,8 @@ render_plist() {
     case "${value}" in *[!a-zA-Z0-9_./:@+-]*) failed "Unsupported runtime path for service template" ;; esac
   done
   mkdir -p "${RUNNER_LOG_DIR}"
-  if [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT}" = "1" ]; then
-    mkdir -p "${LAUNCH_PATH}"
+  if [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT}" = "1" ] || [ "${RUNNER_LAUNCHD_DOMAIN_MODE}" = "user" ]; then
+    mkdir -p "$(dirname "${PLIST_PATH}")"
   fi
 
   sed \
@@ -303,14 +353,21 @@ render_plist() {
     rm -f "${TEMP_PATH}"
     failed "rendered launchd plist is invalid"
   }
-  if [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT}" = "1" ]; then
-    plist_install_args=(-m 0644 "${TEMP_PATH}" "${PLIST_PATH}")
+  if [ "${RUNNER_LAUNCHD_DOMAIN_MODE}" = "user" ]; then
+    if ! "${RUNNER_INSTALL_BIN}" -m 0644 "${TEMP_PATH}" "${PLIST_PATH}"; then
+      rm -f "${TEMP_PATH}"
+      failed "failed to install ${PLIST_PATH}"
+    fi
   else
-    plist_install_args=(-o root -g wheel -m 0644 "${TEMP_PATH}" "${PLIST_PATH}")
-  fi
-  if ! run_privileged "${RUNNER_INSTALL_BIN}" "${plist_install_args[@]}"; then
-    rm -f "${TEMP_PATH}"
-    failed "failed to install ${PLIST_PATH}; macOS administrator access is required"
+    if [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT}" = "1" ]; then
+      plist_install_args=(-m 0644 "${TEMP_PATH}" "${PLIST_PATH}")
+    else
+      plist_install_args=(-o root -g wheel -m 0644 "${TEMP_PATH}" "${PLIST_PATH}")
+    fi
+    if ! run_privileged "${RUNNER_INSTALL_BIN}" "${plist_install_args[@]}"; then
+      rm -f "${TEMP_PATH}"
+      failed "failed to install ${PLIST_PATH}; macOS administrator access is required"
+    fi
   fi
   rm -f "${TEMP_PATH}"
 }
@@ -325,23 +382,38 @@ sync_runtime_files() {
   printf '%s\n' "${PLIST_PATH}" > "${CONFIG_PATH}" || failed "failed to write ${CONFIG_PATH}"
 }
 
+# Removing a plist does not unload its KeepAlive service, and the helper needs
+# the daemon plist to boot it out, so other-domain services are stopped and
+# confirmed gone before any plist for this domain is written or started.
+stop_other_domain_services() {
+  local target
+
+  for target in "${OTHER_SERVICE_TARGETS[@]}"; do
+    if service_is_loaded "${target}"; then
+      echo "stopping ${target}"
+      OTHER_SERVICE_STOPPED=1
+      launchctl_for_target bootout "${target}" 2>/dev/null || true
+      if service_is_loaded "${target}"; then
+        failed "could not stop ${target}; not starting a second listener"
+      fi
+    fi
+  done
+}
+
 install() {
-  local migrated_legacy_agent=0
+  local migrated=0
 
   persist_cpu_quota_percent "$(read_cpu_quota_percent)"
+  stop_other_domain_services
   sync_runtime_files
 
-  if [ "${LEGACY_PLIST_PATH}" != "${PLIST_PATH}" ] && [ -f "${LEGACY_PLIST_PATH}" ]; then
-    migrated_legacy_agent=1
-    if service_is_loaded "${LEGACY_SERVICE_TARGET}"; then
-      run_privileged_launchctl bootout "${LEGACY_SERVICE_TARGET}" 2>/dev/null ||
-        run_privileged_launchctl unload "${LEGACY_PLIST_PATH}" 2>/dev/null || true
-    fi
-    rm -f "${LEGACY_PLIST_PATH}" || failed "failed to remove legacy LaunchAgent ${LEGACY_PLIST_PATH}"
-    echo "migrated legacy LaunchAgent to system LaunchDaemon"
+  if [ "${OTHER_PLIST_PATH}" != "${PLIST_PATH}" ] && [ -f "${OTHER_PLIST_PATH}" ]; then
+    migrated=1
+    remove_service_plist "${OTHER_PLIST_PATH}" || failed "failed to remove ${OTHER_PLIST_PATH}"
   fi
 
-  if [ "${migrated_legacy_agent}" -eq 1 ]; then
+  if [ "${migrated}" -eq 1 ] || [ "${OTHER_SERVICE_STOPPED}" -eq 1 ]; then
+    echo "moved ${SVC_NAME} to the ${LAUNCHD_DOMAIN} launchd domain"
     start_launch_daemon
     INSTALL_STARTED_SERVICE=1
   fi
@@ -391,15 +463,16 @@ set_cpu_limit() {
 }
 
 start_launch_daemon() {
-  run_privileged_launchctl enable "${LAUNCHD_SERVICE_TARGET}" ||
+  stop_other_domain_services
+  launchctl_for_target enable "${LAUNCHD_SERVICE_TARGET}" ||
     failed "failed to enable ${LAUNCHD_SERVICE_TARGET}"
 
   if service_is_loaded "${LAUNCHD_SERVICE_TARGET}"; then
     # No -k: never kill an already running listener.
-    run_privileged_launchctl kickstart "${LAUNCHD_SERVICE_TARGET}" ||
+    launchctl_for_target kickstart "${LAUNCHD_SERVICE_TARGET}" ||
       failed "failed to start ${LAUNCHD_SERVICE_TARGET}"
   else
-    run_privileged_launchctl bootstrap "${LAUNCHD_DOMAIN}" "${PLIST_PATH}" ||
+    launchctl_for_target bootstrap "${LAUNCHD_DOMAIN}" "${PLIST_PATH}" ||
       failed "failed to bootstrap ${PLIST_PATH}"
   fi
 }
@@ -417,6 +490,10 @@ start() {
 }
 
 stop() {
+  # A service left in the other domain by a mode switch would respawn the
+  # listener under KeepAlive, so it stops too.
+  stop_other_domain_services
+
   if [ ! -f "${PLIST_PATH}" ]; then
     echo "stopping ${SVC_NAME}"
     echo "service is not installed"
@@ -425,7 +502,7 @@ stop() {
 
   echo "stopping ${SVC_NAME}"
   if service_is_loaded "${LAUNCHD_SERVICE_TARGET}"; then
-    run_privileged_launchctl bootout "${LAUNCHD_SERVICE_TARGET}" ||
+    launchctl_for_target bootout "${LAUNCHD_SERVICE_TARGET}" ||
       failed "failed to boot out ${LAUNCHD_SERVICE_TARGET}"
   fi
   status
@@ -433,7 +510,7 @@ stop() {
 
 uninstall() {
   stop
-  run_privileged rm -f "${PLIST_PATH}" || failed "failed to remove ${PLIST_PATH}"
+  remove_service_plist "${PLIST_PATH}" || failed "failed to remove ${PLIST_PATH}"
   rm -f "${CONFIG_PATH}"
 }
 

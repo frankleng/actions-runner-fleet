@@ -271,6 +271,25 @@ when the plist runs the caller's own `runsvc.sh` as the caller with the keys the
 service template renders, so it cannot be used to start anything as root.
 Remove it with `sudo ./install-launchd-helper.sh --uninstall`.
 
+### macOS code signing: user-domain runners
+
+A LaunchDaemon cannot reach the account's security daemon (`secd`), so
+`codesign` fails with `errSecInternalComponent` whenever it must build a
+certificate chain from a job keychain (iOS distribution signing, for example).
+To sign from job keychains, run the runners as agents in the account's own
+launchd domain instead:
+
+```bash
+sudo ./install-launchd-helper.sh          # also installs the boot job
+./manage-runners.sh set-launchd-domain user
+```
+
+The boot job loads the agents at startup, so they still run without a login.
+Each agent is limited to the `Background` session, so a GUI login does not start
+a second listener. `set-launchd-domain` records the choice in `.launchd-domain`,
+which later reconciles keep. It restarts every runner, so run it while they are
+idle. `./manage-runners.sh set-launchd-domain system` moves them back.
+
 Prompted entry is recommended because the token is never written to disk or
 shell history. For unattended setup, provide variables derived from the token
 keys:
@@ -1076,4 +1095,4 @@ Final review recovery details:
 - A reboot can interrupt even an idle ephemeral listener. Its registration may remain offline at GitHub and the local slot stays blocked. Inspect the slot's private diagnostics, confirm no listener/job remains, resolve the orphan registration, and only then remove failed-generation state before restarting that slot. Never reuse its consumed credentials.
 - Runner service templates require kit, runner, and runtime paths without whitespace or shell/XML special characters. Use a simple path such as `/srv/runner-fleet` or `$HOME/runner-fleet`; unsupported paths are rejected before service provisioning. Controller-only paths are escaped independently. Windows paths may contain spaces but not quotes, percent signs, or other special characters, because scheduled task actions expand `%VARIABLES%`.
 
-macOS services target the logged-in user’s launchd GUI domain. A headless SSH session without a GUI login is not sufficient for starting these agents. Windows scheduled tasks use S4U logon and start at boot without a desktop login. `svc.ps1 stop` and `status` also work from other logon sessions. Template updates require a safe service reload after its generation finishes; `kickstart` alone does not reload a changed plist.
+macOS runner services are root LaunchDaemons, or agents in the account's launchd user domain after `set-launchd-domain user`; both start at boot without a login. Windows scheduled tasks use S4U logon and start at boot without a desktop login. `svc.ps1 stop` and `status` also work from other logon sessions. Template updates require a safe service reload after its generation finishes; `kickstart` alone does not reload a changed plist.

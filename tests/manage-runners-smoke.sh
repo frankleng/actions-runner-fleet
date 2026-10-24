@@ -64,6 +64,8 @@ case "${command}" in
     ;;
   print)
     svc_name="${1##*/}"
+    # These runners use the system domain; the state tracks it and legacy GUI agents.
+    case "${1:-}" in user/*) exit 113 ;; esac
     if [ -f "${state_path}" ] && grep -Fxq "${svc_name}" "${state_path}"; then
       printf 'system/%s = {\n\tpid = 123\n}\n' "${svc_name}"
     else

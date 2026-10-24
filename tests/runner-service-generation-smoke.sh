@@ -45,6 +45,7 @@ cp "${OVERLAY_DIR}/env.sh" "${runner_dir}/env.sh"
 cp "${OVERLAY_DIR}/svc.sh" "${runner_dir}/svc.sh"
 cp "${OVERLAY_DIR}/runsvc.sh" "${runner_dir}/bin/runsvc.sh"
 cp "${OVERLAY_DIR}/bin/actions.runner.plist.template" "${runner_dir}/bin/actions.runner.plist.template"
+cp "${OVERLAY_DIR}/bin/actions.runner.agent.plist.template" "${runner_dir}/bin/actions.runner.agent.plist.template"
 chmod +x "${runner_dir}/env.sh" "${runner_dir}/svc.sh" "${runner_dir}/bin/runsvc.sh"
 
 cat > "${runner_dir}/externals/node20/bin/node" <<'EOF'
@@ -56,7 +57,8 @@ chmod +x "${runner_dir}/externals/node20/bin/node"
 
 cat > "${launchctl_stub}" <<'EOF'
 #!/bin/bash
-exit 0
+# Nothing is loaded.
+[ "$1" != "print" ]
 EOF
 chmod +x "${launchctl_stub}"
 
@@ -221,3 +223,74 @@ printf '%s\n' "2001" > "${process_state}"
 [ ! -s "${process_state}" ]
 grep -Fq "Runner\\.Listener" "${pgrep_log}"
 grep -Fq "Runner\\.Listener" "${pkill_log}"
+
+# Moving between launchd domains leaves exactly one loaded service.
+domain_launchctl_stub="${temp_dir}/launchctl-domains"
+loaded_services="${temp_dir}/loaded-services"
+cat > "${domain_launchctl_stub}" <<'EOF'
+#!/bin/bash
+state="${RUNNER_TEST_LOADED_SERVICES:?}"
+touch "${state}"
+case "$1" in
+  print) grep -Fxq "$2" "${state}" ;;
+  bootout)
+    [ "${RUNNER_TEST_BOOTOUT_FAILS:-0}" = "1" ] && exit 1
+    grep -Fxv "$2" "${state}" > "${state}.tmp" || true
+    mv "${state}.tmp" "${state}"
+    ;;
+  bootstrap) printf '%s/%s\n' "$2" "$(basename "$3" .plist)" >> "${state}" ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "${domain_launchctl_stub}"
+
+svc_in_domain() {
+  local mode="$1"
+  shift
+  (
+    cd "${runner_dir}"
+    RUNNER_LAUNCHD_DOMAIN_MODE="${mode}" \
+    RUNNER_LAUNCHD_USER_HOME="${temp_user_home}" \
+    RUNNER_LAUNCH_PATH="${launch_daemons_path}" \
+    RUNNER_LAUNCHCTL_BIN="${domain_launchctl_stub}" \
+    RUNNER_TEST_LOADED_SERVICES="${loaded_services}" \
+    "$@"
+  )
+}
+
+label="actions.runner.example-org.smoke-runner"
+agent_plist_path="${temp_user_home}/Library/LaunchAgents/${label}.plist"
+printf 'system/%s\n' "${label}" > "${loaded_services}"
+[ -f "${plist_path}" ]
+
+# A LaunchDaemon that will not stop keeps its plist, and no agent starts.
+if svc_in_domain user env RUNNER_TEST_BOOTOUT_FAILS=1 ./svc.sh install >/dev/null 2>&1; then
+  echo "expected install to fail while the LaunchDaemon is still loaded"
+  exit 1
+fi
+[ -f "${plist_path}" ]
+[ ! -e "${agent_plist_path}" ] || { echo "failed migration published the user agent"; exit 1; }
+if svc_in_domain user env RUNNER_TEST_BOOTOUT_FAILS=1 ./svc.sh start >/dev/null 2>&1; then
+  echo "expected start to fail while the LaunchDaemon is still loaded"
+  exit 1
+fi
+[ "$(cat "${loaded_services}")" = "system/${label}" ]
+
+svc_in_domain user ./svc.sh install
+[ ! -e "${plist_path}" ] || { echo "user-domain install left the LaunchDaemon behind"; exit 1; }
+[ "$(cat "${loaded_services}")" = "user/$(id -u)/${label}" ]
+[ "$(plutil -extract LimitLoadToSessionType raw -o - "${agent_plist_path}")" = "Background" ]
+if plutil -extract UserName raw -o - "${agent_plist_path}" >/dev/null 2>&1; then
+  echo "user-domain agent must not set UserName"
+  exit 1
+fi
+
+# Stopping from either mode stops the agent, so KeepAlive cannot respawn it.
+svc_in_domain system ./svc.sh stop >/dev/null
+[ ! -s "${loaded_services}" ]
+
+printf 'user/%s/%s\n' "$(id -u)" "${label}" > "${loaded_services}"
+svc_in_domain system ./svc.sh install
+[ ! -e "${agent_plist_path}" ] || { echo "system install left the user agent behind"; exit 1; }
+[ -f "${plist_path}" ]
+[ "$(cat "${loaded_services}")" = "system/${label}" ]

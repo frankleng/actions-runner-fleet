@@ -62,6 +62,7 @@ while IFS= read -r source_file; do
 done <<'PUBLIC_FILES'
 overlay/autoscale-lock.mjs
 overlay/autoscale-worker.mjs
+overlay/bin/actions.runner.agent.plist.template
 overlay/bin/actions.runner.plist.template
 overlay/bin/actions.runner.service.template
 overlay/env.sh

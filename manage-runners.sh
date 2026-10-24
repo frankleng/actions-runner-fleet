@@ -16,6 +16,7 @@ RUNNER_PGREP_BIN="${RUNNER_PGREP_BIN:-pgrep}"
 RUNNER_PKILL_BIN="${RUNNER_PKILL_BIN:-pkill}"
 RUNNER_SUDO_BIN="${RUNNER_SUDO_BIN:-sudo}"
 RUNNER_LAUNCHD_HELPER="${RUNNER_LAUNCHD_HELPER:-/usr/local/libexec/actions-runner-fleet/launchd-helper}"
+RUNNER_LAUNCHD_BOOT_PLIST_PATH="${RUNNER_LAUNCHD_BOOT_PLIST_PATH:-/Library/LaunchDaemons/com.github.actions-runner-fleet.user-agents.$(id -un).plist}"
 RUNNER_STOP_GRACE_SECONDS="${RUNNER_STOP_GRACE_SECONDS:-2}"
 RUNNER_LABELS="${RUNNER_LABELS:-}"
 RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-0}"
@@ -85,6 +86,7 @@ Usage:
   ./${SELF_NAME} stop <name>
   ./${SELF_NAME} status <name>
   ./${SELF_NAME} set-cpu-limit <name> <percent>
+  ./${SELF_NAME} set-launchd-domain <system|user>
 
 Notes:
   - ./config.sh is only needed once per new runner directory.
@@ -99,6 +101,10 @@ Notes:
     and the maximum matches the logical CPUs available to this process.
   - RUNNER_LABELS adds comma-separated custom labels during registration.
   - RUNNER_NO_DEFAULT_LABELS=1 makes jobs require a custom runner label.
+  - set-launchd-domain (macOS) moves every runner between root LaunchDaemons
+    (system) and agents in the account's own launchd domain (user), which
+    codesign needs for job keychains. It restarts each runner in turn, so run
+    it while they are idle.
   - The registry lives at: ${REGISTRY_PATH}
 EOF
 }
@@ -215,6 +221,7 @@ copy_overlay() {
   cp "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
   chmod u+x "${runner_dir}/job-hooks/runner-job-started.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
   cp "${OVERLAY_DIR}/bin/actions.runner.plist.template" "${runner_dir}/bin/actions.runner.plist.template"
+  cp "${OVERLAY_DIR}/bin/actions.runner.agent.plist.template" "${runner_dir}/bin/actions.runner.agent.plist.template"
   cp "${OVERLAY_DIR}/bin/actions.runner.service.template" "${runner_dir}/bin/actions.runner.service.template"
   chmod u+x "${runner_dir}/env.sh" "${runner_dir}/svc.sh" "${runner_dir}/bin/runsvc.sh"
 }
@@ -591,6 +598,28 @@ set_runner_cpu_limit() {
   echo "CPU limit for ${name}: ${cpu_quota_percent}% (applies when the managed service is installed)"
 }
 
+set_launchd_domain() {
+  local mode="$1"
+
+  case "${mode}" in
+    system|user) ;;
+    *) usage; exit 1 ;;
+  esac
+  if [ "${RUNNER_SERVICE_MANAGER}" != "launchd" ]; then
+    echo "launchd domains apply only to macOS runners" >&2
+    exit 1
+  fi
+  if [ "${mode}" = "user" ] && [ ! -f "${RUNNER_LAUNCHD_BOOT_PLIST_PATH}" ]; then
+    echo "user-domain runners need the boot job that starts them without a login; run sudo ./install-launchd-helper.sh first" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${mode}" > "${ROOT_DIR}/.launchd-domain.tmp"
+  mv "${ROOT_DIR}/.launchd-domain.tmp" "${ROOT_DIR}/.launchd-domain"
+  echo "runners now use the ${mode} launchd domain; restarting each runner"
+  reconcile_all_runners
+}
+
 case "${1:-help}" in
   help|-h|--help)
     usage
@@ -664,6 +693,13 @@ case "${1:-help}" in
       exit 1
     fi
     set_runner_cpu_limit "$2" "$3"
+    ;;
+  set-launchd-domain)
+    if [ "$#" -ne 2 ]; then
+      usage
+      exit 1
+    fi
+    set_launchd_domain "$2"
     ;;
   *)
     usage

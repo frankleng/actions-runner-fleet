@@ -1,7 +1,9 @@
 #!/bin/bash
 # Installs launchd-helper.sh as a root-owned command and lets the invoking
 # account run it through sudo without a password, so runner LaunchDaemons can be
-# installed, started, stopped, and removed without an administrator prompt.
+# installed, started, stopped, and removed without an administrator prompt. It
+# also installs a boot LaunchDaemon that loads the account's user-domain runner
+# agents (manage-runners.sh set-launchd-domain user) without a login.
 #
 #   sudo ./install-launchd-helper.sh             install or update the helper
 #   sudo ./install-launchd-helper.sh --uninstall remove the helper and sudo rule
@@ -26,11 +28,23 @@ account="${SUDO_USER:-}"
 [ -n "${account}" ] && [ "${account}" != "root" ] ||
   fail "run with sudo from the account that owns the runners"
 [[ "${account}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || fail "unsupported account name: ${account}"
+# One boot job per account: each loads only its own account's agents.
+BOOT_LABEL="com.github.actions-runner-fleet.user-agents.${account}"
+BOOT_PLIST_PATH="/Library/LaunchDaemons/${BOOT_LABEL}.plist"
 
 if [ "${1:-}" = "--uninstall" ]; then
+  launchctl bootout "system/${BOOT_LABEL}" 2>/dev/null || true
+  rm -f "${BOOT_PLIST_PATH}"
+  # Other accounts' boot jobs still run the shared helper.
+  for other_boot_plist in /Library/LaunchDaemons/com.github.actions-runner-fleet.user-agents.*.plist; do
+    if [ -f "${other_boot_plist}" ]; then
+      echo "removed ${BOOT_PLIST_PATH}; kept ${HELPER_PATH} for ${other_boot_plist}"
+      exit 0
+    fi
+  done
   rm -f "${SUDOERS_PATH}" "${HELPER_PATH}"
   rmdir "${HELPER_DIR}" 2>/dev/null || true
-  echo "removed ${HELPER_PATH} and ${SUDOERS_PATH}"
+  echo "removed ${HELPER_PATH}, ${SUDOERS_PATH} and ${BOOT_PLIST_PATH}"
   exit 0
 fi
 [ "$#" -eq 0 ] || fail "usage: sudo $0 [--uninstall]"
@@ -59,5 +73,39 @@ EOF
 visudo -c -q -f "${staged_sudoers}" || fail "generated sudoers rule failed validation"
 install -o root -g wheel -m 0440 "${staged_sudoers}" "${SUDOERS_PATH}"
 
+staged_boot_plist="$(mktemp /tmp/actions-runner-fleet-boot.XXXXXX)"
+trap 'rm -f "${staged_sudoers}" "${staged_boot_plist}"' EXIT
+cat > "${staged_boot_plist}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${BOOT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${HELPER_PATH}</string>
+      <string>boot-user-agents</string>
+      <string>${account}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Retry until every agent has loaded, however long the domain takes. -->
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+  </dict>
+</plist>
+EOF
+plutil -lint -s "${staged_boot_plist}" >/dev/null || fail "generated boot plist failed validation"
+launchctl bootout "system/${BOOT_LABEL}" 2>/dev/null || true
+install -o root -g wheel -m 0644 "${staged_boot_plist}" "${BOOT_PLIST_PATH}"
+launchctl bootstrap system "${BOOT_PLIST_PATH}"
+
 echo "installed ${HELPER_PATH}"
+echo "${account}'s user-domain runner agents now load at boot"
 echo "${account} can now manage runner LaunchDaemons without a password"
