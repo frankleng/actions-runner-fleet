@@ -489,8 +489,10 @@ never reuses objects from the previous compiler.
 ccache matches by content, not timestamps, so it survives jobs that delete and
 regenerate their native project, which a persistent Xcode DerivedData does
 not. Workflows opt in: React Native's Podfile routes the compilers through
-ccache only when `pod install` runs with `USE_CCACHE=1`. Swift sources are not
-cached.
+ccache only when `pod install` runs with `USE_CCACHE=1`, and its
+`ccache-clang.sh` reads `CCACHE_BINARY` from the environment, which Xcode does
+not fill from build settings: export `CCACHE_BINARY=$(command -v ccache)`
+before `xcodebuild`. Swift sources are not cached.
 
 ### Configure runner CPU limits
 
