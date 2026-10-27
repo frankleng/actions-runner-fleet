@@ -35,6 +35,8 @@ at boot on Linux (with login lingering) and Windows, or at login on macOS. See
   tooling installed once per host under `host-tools/` and shared by every
   runner, along with a shared Actions tool cache, pnpm store, and npm cache;
   each runner keeps only symlinks, shims, and its own runtime state
+- On macOS, pinned ccache `4.14.2` and one host-wide compiler cache shared by
+  every runner (see [compiler cache](#compiler-cache-macos))
 - A terminal dashboard for status, registration, start, stop, and reconcile
 - Log rotation and cleanup for runner and service diagnostics
 
@@ -470,6 +472,25 @@ The cleanup owns only `tmp/managed-job`; it does not remove old host `/tmp`
 files, other runner temporary files, or shared caches. Tools that hard-code
 `/tmp` use the host storage configured above. A single job can still exhaust storage
 before it finishes; this prevents accumulation across jobs.
+
+### Compiler cache (macOS)
+
+macOS runners get ccache on `PATH` and share one cache under
+`host-tools/ccache-store`. Xcode starts compiler tasks with its own
+environment, so the runner-local `ccache` is a small wrapper that sets the
+cache settings itself before running the pinned binary: `CCACHE_DIR` points at
+the shared store, `CCACHE_BASEDIR` at the runner root (so a result compiled on
+one runner hits on another), and `CCACHE_MAXSIZE` (default `8G`) is the limit
+beyond which ccache evicts the least recently used results. Set
+`RUNNER_CCACHE_MAX_SIZE` when provisioning to change it. Results are keyed on
+the compiler's `-v` output rather than its file timestamp, so an Xcode update
+never reuses objects from the previous compiler.
+
+ccache matches by content, not timestamps, so it survives jobs that delete and
+regenerate their native project, which a persistent Xcode DerivedData does
+not. Workflows opt in: React Native's Podfile routes the compilers through
+ccache only when `pod install` runs with `USE_CCACHE=1`. Swift sources are not
+cached.
 
 ### Configure runner CPU limits
 

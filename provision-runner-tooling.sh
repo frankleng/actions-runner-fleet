@@ -25,6 +25,8 @@ AWS_VERSION="2.36.22"
 CPULIMIT_VERSION="0.2"
 CPULIMIT_SHA256="64312f9ac569ddcadb615593cd002c94b76e93a0d4625d3ce1abb49e08e2c2da"
 CPULIMIT_MACOS_PATCH_PATH="${SCRIPT_DIR}/patches/cpulimit-0.2-macos.patch"
+CCACHE_VERSION="4.14.2"
+CCACHE_DARWIN_SHA256="cf240009630b605b775c7c5c7b7105a3b196c79f31af322c1557969aa28003fc"
 
 usage() {
   cat <<EOF
@@ -98,6 +100,14 @@ PULUMI_INSTALL_DIR="${HOST_TOOLS_DIR}/pulumi/${PULUMI_VERSION}"
 AWS_INSTALL_DIR="${HOST_TOOLS_DIR}/aws-cli/${AWS_VERSION}"
 CPULIMIT_INSTALL_DIR="${HOST_TOOLS_DIR}/cpulimit/${CPULIMIT_VERSION}"
 CPULIMIT_BIN_PATH="${CPULIMIT_INSTALL_DIR}/cpulimit"
+CCACHE_INSTALL_DIR="${HOST_TOOLS_DIR}/ccache/${CCACHE_VERSION}"
+CCACHE_BIN_PATH="${CCACHE_INSTALL_DIR}/ccache"
+# One compiler cache per host: ccache is safe for concurrent runners, and
+# Xcode jobs regenerate their native projects, so only a content-addressed
+# cache survives between builds. ccache evicts least-recently-used results to
+# stay under the size limit.
+CCACHE_STORE_DIR="${HOST_TOOLS_DIR}/ccache-store"
+CCACHE_MAX_SIZE="${RUNNER_CCACHE_MAX_SIZE:-8G}"
 if [ "${RUNNER_SERVICE_MANAGER}" = "launchd" ]; then
   AWS_BIN_PATH="${AWS_INSTALL_DIR}/aws"
   AWS_PACKAGE_URL="${RUNNER_AWS_PACKAGE_URL:-https://awscli.amazonaws.com/AWSCLIV2-${AWS_VERSION}.pkg}"
@@ -195,6 +205,7 @@ RUNNER_TOOL_WRANGLER_VERSION=${WRANGLER_VERSION}
 RUNNER_TOOL_PULUMI_VERSION=${PULUMI_VERSION}
 RUNNER_TOOL_AWS_VERSION=${AWS_VERSION}
 RUNNER_TOOL_CPULIMIT_VERSION=${CPULIMIT_VERSION}
+RUNNER_TOOL_CCACHE_VERSION=${CCACHE_VERSION}
 EOF
 }
 
@@ -628,6 +639,102 @@ install_cpulimit() {
   ensure_symlink "${CPULIMIT_BIN_PATH}" "${LOCAL_BIN_DIR}/cpulimit"
 }
 
+# Xcode builds compiler tasks a fresh environment, so the cache settings
+# cannot come from the job's environment. The runner-local ccache is a wrapper
+# that sets them itself; React Native records its path as the compiler.
+write_ccache_wrapper() {
+  local wrapper_path="${LOCAL_BIN_DIR}/ccache"
+  local temp_wrapper_path
+
+  mkdir -p "${LOCAL_BIN_DIR}"
+  temp_wrapper_path="$(mktemp "${wrapper_path}.XXXXXX")"
+  {
+    printf '#!/bin/sh\n'
+    # The base directory turns runner-specific absolute paths into relative
+    # ones, so a build on one runner hits results compiled on another.
+    printf 'export CCACHE_DIR=%q\n' "${CCACHE_STORE_DIR}"
+    printf 'export CCACHE_BASEDIR=%q\n' "${ROOT_DIR}"
+    printf 'export CCACHE_MAXSIZE=%q\n' "${CCACHE_MAX_SIZE}"
+    # Xcode's /usr/bin/clang is a launcher that keeps its timestamp across
+    # Xcode updates, so key results on the real compiler's version instead.
+    printf "export CCACHE_COMPILERCHECK='%%compiler%% -v'\n"
+    printf 'exec %q "$@"\n' "${CCACHE_BIN_PATH}"
+  } > "${temp_wrapper_path}"
+  chmod 755 "${temp_wrapper_path}"
+  # Replaces an older symlink as well as an older wrapper.
+  mv -f "${temp_wrapper_path}" "${wrapper_path}"
+}
+
+ccache_binary_runs() {
+  [ -x "$1" ] && "$1" --version >/dev/null 2>&1
+}
+
+install_ccache() {
+  local max_size
+
+  if [ "${RUNNER_SERVICE_MANAGER}" != "launchd" ]; then
+    return 0
+  fi
+
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    return 0
+  fi
+
+  mkdir -p "${CCACHE_STORE_DIR}"
+  # React Native compiles through the wrapper whenever it exists, so a binary
+  # that is missing or no longer runs would fail every compile and link.
+  # Checked on every provisioning run, not only on first download. The wrapper
+  # goes first, so if the repair below fails, builds run uncached rather than
+  # failing.
+  if ! ccache_binary_runs "${CCACHE_BIN_PATH}"; then
+    rm -f "${LOCAL_BIN_DIR}/ccache"
+    mkdir -p "${HOST_TOOLS_DIR}"
+    (
+      set -euo pipefail
+
+      local temp_dir
+      local archive_path
+      local actual_checksum
+      local staged_bin_path
+
+      temp_dir="$(mktemp -d "${HOST_TOOLS_DIR}/.ccache-${CCACHE_VERSION}.XXXXXX")"
+      trap 'rm -rf "${temp_dir}"' EXIT
+      archive_path="${temp_dir}/ccache-${CCACHE_VERSION}-darwin.tar.gz"
+      staged_bin_path="${temp_dir}/ccache-${CCACHE_VERSION}-darwin/ccache"
+
+      curl -fsSL \
+        "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}-darwin.tar.gz" \
+        -o "${archive_path}"
+      actual_checksum="$(runner_sha256 "${archive_path}" | awk '{print $1}')"
+      [ "${actual_checksum}" = "${CCACHE_DARWIN_SHA256}" ] || {
+        echo "ccache ${CCACHE_VERSION} checksum mismatch" >&2
+        exit 1
+      }
+
+      tar -xzf "${archive_path}" -C "${temp_dir}"
+      chmod u+x "${staged_bin_path}"
+      ccache_binary_runs "${staged_bin_path}" || {
+        echo "ccache ${CCACHE_VERSION} does not run on this host" >&2
+        exit 1
+      }
+      mkdir -p "${CCACHE_INSTALL_DIR}"
+      # Staged in this run's own directory, so concurrent installs never share
+      # a temporary name; each mv atomically installs an identical binary.
+      mv -f "${staged_bin_path}" "${CCACHE_BIN_PATH}"
+    ) || return 1
+  fi
+
+  # ccache's own parser decides what a size means; an unparseable one would
+  # fail every compile, and 0 means unlimited.
+  if ! max_size="$(CCACHE_DIR="${CCACHE_STORE_DIR}" CCACHE_MAXSIZE="${CCACHE_MAX_SIZE}" "${CCACHE_BIN_PATH}" --get-config max_size 2>/dev/null)" ||
+    [ "${max_size}" = "0" ]; then
+    echo "RUNNER_CCACHE_MAX_SIZE must be a nonzero ccache size such as 8G or 512Mi (received '${CCACHE_MAX_SIZE}')" >&2
+    exit 1
+  fi
+
+  write_ccache_wrapper
+}
+
 write_manifest() {
   if [ "${DRY_RUN}" -eq 1 ]; then
     return 0
@@ -668,6 +775,7 @@ install_wrangler
 install_pulumi
 install_aws
 install_cpulimit
+install_ccache
 write_manifest
 if [ "${DRY_RUN}" -eq 0 ]; then
   write_env_files

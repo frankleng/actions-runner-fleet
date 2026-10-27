@@ -59,6 +59,10 @@ printf '%s\n' "${env_output}" | grep -q "RUNNER_TOOL_CACHE=${tool_cache_dir}"
 printf '%s\n' "${env_output}" | grep -q "PNPM_HOME=${temp_dir}/tools/pnpm-global"
 printf '%s\n' "${env_output}" | grep -q "COREPACK_HOME=${host_tools_dir}/corepack"
 printf '%s\n' "${env_output}" | grep -q "PULUMI_HOME=${host_tools_dir}/pulumi-home"
+if printf '%s\n' "${env_output}" | grep -q '^CCACHE_'; then
+  echo "expected ccache settings in the ccache wrapper, not the job environment"
+  exit 1
+fi
 printf '%s\n' "${env_output}" | grep -q "PATH=${temp_dir}/tools/bin:${temp_dir}/tools/pnpm-global:${temp_dir}/tools/pnpm-global/bin:${tool_cache_dir}/node/24.19.0/${RUNNER_NODE_ARCH}/bin:"
 if printf '%s\n' "${env_output}" | grep -Fq "${host_home}/Library/pnpm"; then
   echo "expected runner-local PATH to exclude the host pnpm directory"
@@ -86,6 +90,7 @@ printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_WRANGLER_VERSION=4.69.
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_PULUMI_VERSION=3.143.0"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_AWS_VERSION=2.36.22"
 printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_CPULIMIT_VERSION=0.2"
+printf '%s\n' "${manifest_output}" | grep -q "RUNNER_TOOL_CCACHE_VERSION=4.14.2"
 
 mkdir -p "${temp_dir}/job-hooks"
 cp "${ROOT_DIR}/overlay/runner-job-temp.sh" "${temp_dir}/job-hooks/runner-job-started.sh"
@@ -168,3 +173,91 @@ if [ ! -f "${env_check_dir}/provisioned" ] || [ ! -f "${env_check_dir}/configure
   exit 1
 fi
 rm -rf "${env_check_dir}"
+
+# Xcode starts compiler tasks with its own environment, so the ccache wrapper
+# must carry the cache settings itself. A stub binary stands in for the pinned
+# download, and an empty environment stands in for Xcode's.
+if [ "${RUNNER_SERVICE_MANAGER}" = "launchd" ]; then
+  ccache_check_dir="$(mktemp -d)"
+  ccache_host_tools="${ccache_check_dir}/host-tools"
+  ccache_stub="${ccache_host_tools}/ccache/4.14.2/ccache"
+  mkdir -p "$(dirname "${ccache_stub}")" "${ccache_check_dir}/runner/tools/bin" "${ccache_check_dir}/no-network"
+  # Stands in for ccache's size parser: "lots" is invalid and "0" is unlimited.
+  cat > "${ccache_stub}" <<'STUB'
+#!/bin/sh
+case "$1" in
+  --version) exit 0 ;;
+  --get-config)
+    case "${CCACHE_MAXSIZE}" in
+      lots) exit 1 ;;
+      0) echo 0 ;;
+      *) echo "${CCACHE_MAXSIZE}" ;;
+    esac
+    exit 0
+    ;;
+esac
+printf '%s\n' "dir=${CCACHE_DIR}" "base=${CCACHE_BASEDIR}" "max=${CCACHE_MAXSIZE}" "check=${CCACHE_COMPILERCHECK}" "args=$*"
+STUB
+  chmod +x "${ccache_stub}"
+  # Any attempt to download fails, so a broken binary cannot be replaced here.
+  printf '#!/bin/sh\nexit 1\n' > "${ccache_check_dir}/no-network/curl"
+  chmod +x "${ccache_check_dir}/no-network/curl"
+  # An older provisioning run left a plain symlink; the wrapper must replace it.
+  ln -s "${ccache_stub}" "${ccache_check_dir}/runner/tools/bin/ccache"
+
+  install_ccache_for_test() (
+    source "${ROOT_DIR}/platform.sh"
+    eval "$(awk '/^write_ccache_wrapper\(\) \{/,/^\}/; /^ccache_binary_runs\(\) \{/,/^\}/; /^install_ccache\(\) \{/,/^\}/' "${SCRIPT_PATH}")"
+    PATH="${ccache_check_dir}/no-network:${PATH}"
+    DRY_RUN=0
+    ROOT_DIR="${ccache_check_dir}/runner"
+    HOST_TOOLS_DIR="${ccache_host_tools}"
+    LOCAL_BIN_DIR="${ROOT_DIR}/tools/bin"
+    CCACHE_VERSION="4.14.2"
+    CCACHE_DARWIN_SHA256="unused"
+    CCACHE_INSTALL_DIR="${HOST_TOOLS_DIR}/ccache/${CCACHE_VERSION}"
+    CCACHE_BIN_PATH="${CCACHE_INSTALL_DIR}/ccache"
+    CCACHE_STORE_DIR="${HOST_TOOLS_DIR}/ccache-store"
+    CCACHE_MAX_SIZE="$1"
+    install_ccache
+  )
+
+  for rejected_size in lots 0; do
+    if install_ccache_for_test "${rejected_size}" >/dev/null 2>&1; then
+      echo "expected provisioning to reject ccache size '${rejected_size}'"
+      exit 1
+    fi
+  done
+  [ -L "${ccache_check_dir}/runner/tools/bin/ccache" ] || {
+    echo "a rejected size must leave the existing ccache entry untouched"
+    exit 1
+  }
+
+  install_ccache_for_test 3G
+  [ ! -L "${ccache_check_dir}/runner/tools/bin/ccache" ]
+  [ -d "${ccache_host_tools}/ccache-store" ]
+  wrapper_output="$(env -i "${ccache_check_dir}/runner/tools/bin/ccache" clang -c a.c)"
+  [ "${wrapper_output}" = "dir=${ccache_host_tools}/ccache-store
+base=${ccache_check_dir}/runner
+max=3G
+check=%compiler% -v
+args=clang -c a.c" ] || {
+    printf 'unexpected ccache wrapper environment:\n%s\n' "${wrapper_output}"
+    exit 1
+  }
+
+  # A binary that no longer runs must be replaced before the wrapper is
+  # rewritten. With no download possible, provisioning fails and removes the
+  # wrapper written above, so builds fall back to running uncached.
+  # Fails only its health check, so nothing else can stop provisioning first.
+  printf '#!/bin/sh\n[ "$1" = --version ] && exit 1\necho 3G\n' > "${ccache_stub}"
+  if install_ccache_for_test 3G >/dev/null 2>&1; then
+    echo "expected provisioning to fail when the installed ccache does not run"
+    exit 1
+  fi
+  [ ! -e "${ccache_check_dir}/runner/tools/bin/ccache" ] || {
+    echo "a broken ccache binary must not keep a wrapper"
+    exit 1
+  }
+  rm -rf "${ccache_check_dir}"
+fi
