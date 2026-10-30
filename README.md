@@ -18,6 +18,21 @@ Slot setup enables and starts the background controller automatically. It starts
 at boot on Linux (with login lingering) and Windows, or at login on macOS. See
 [automatic scaling](#automatic-runner-and-cpu-scaling) for configuration.
 
+## Set up with a coding agent
+
+Point a coding agent (Claude Code, Codex, Cursor, or similar) at this
+repository from the machine that will host the runners:
+
+```text
+Set up GitHub Actions self-hosted runners on this machine using
+https://github.com/frankleng/actions-runner-fleet. Follow its AGENTS.md.
+```
+
+[AGENTS.md](AGENTS.md) walks the agent through host checks, the questions it
+must ask you (scope, repositories, labels), GitHub access, an autoscaled
+install, and verification. It hands you the few steps that need your password
+or an interactive login.
+
 ## What gets installed
 
 - GitHub Actions Runner `2.336.0` for Linux x64, macOS arm64, or Windows x64,

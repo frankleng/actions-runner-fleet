@@ -15,6 +15,7 @@
 !runnerctl-app/tests/
 !tests/
 !.gitignore
+!AGENTS.md
 !CLAUDE.md
 !README.md
 !autoscale.example.json

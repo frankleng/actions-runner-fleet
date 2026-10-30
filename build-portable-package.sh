@@ -44,6 +44,7 @@ cp "${ROOT_DIR}/runnerctl" "${package_root}/runnerctl"
 cp "${ROOT_DIR}/runner-target.sh" "${package_root}/runner-target.sh"
 cp "${ROOT_DIR}/platform.sh" "${package_root}/platform.sh"
 cp "${ROOT_DIR}/patches/cpulimit-0.2-macos.patch" "${package_root}/patches/cpulimit-0.2-macos.patch"
+cp "${ROOT_DIR}/AGENTS.md" "${package_root}/AGENTS.md"
 cp "${ROOT_DIR}/CLAUDE.md" "${package_root}/CLAUDE.md"
 cp "${ROOT_DIR}/README.md" "${package_root}/README.md"
 cp "${ROOT_DIR}/docs/images/runnerctl-dashboard-demo.png" \
