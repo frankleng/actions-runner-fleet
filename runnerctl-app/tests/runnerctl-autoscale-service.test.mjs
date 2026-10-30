@@ -70,16 +70,19 @@ test('launchd dead agents report stopped, start without killing, and oversized q
     await fs.writeFile(path.join(root, '.cpu-quota'), '999999');
     const stub = path.join(root, 'launchctl');
     await fs.writeFile(stub, `#!/bin/sh
-if [ "$1" = list ]; then echo '- 1 ${label}'; else echo "$*" >> '${root}/calls'; fi
+if [ "$1" = list ]; then echo '- 1 ${label}'; exit 0; fi
+echo "$*" >> '${root}/calls'
+# Only the system-domain service is loaded; no copy exists in another domain.
+case "$1:$2" in print:system/*|print-disabled:*|enable:*|kickstart:*) exit 0 ;; print:*) exit 1 ;; esac
 `, { mode: 0o700 });
-    const env = { ...process.env, PATH: process.env.PATH + ':/opt/Program Files (x86)', HOME: path.join(root, 'home with spaces'), RUNNER_LAUNCHCTL_BIN: stub, RUNNER_LAUNCH_PATH: path.join(root, 'agents'), RUNNER_LAUNCHD_USER_HOME: root };
+    const env = { ...process.env, PATH: process.env.PATH + ':/opt/Program Files (x86)', HOME: path.join(root, 'home with spaces'), RUNNER_LAUNCHCTL_BIN: stub, RUNNER_LAUNCHD_TEST_SKIP_ROOT: '1', RUNNER_LAUNCH_PATH: path.join(root, 'agents'), RUNNER_LAUNCHD_USER_HOME: root };
     const status = await exec('bash', [path.join(root, 'svc.sh'), 'status'], { env });
     assert.ok(status.stdout.includes('Stopped'));
     assert.ok(!status.stdout.includes('Started:'));
     assert.ok(status.stderr.includes('host ceiling'));
     await exec('bash', [path.join(root, 'svc.sh'), 'start'], { env });
     const calls = await fs.readFile(path.join(root, 'calls'), 'utf8');
-    assert.match(calls, /kickstart gui\/\d+\/actions.runner/);
+    assert.match(calls, /kickstart system\/actions.runner/);
     assert.ok(!calls.includes('-k'));
     const template = await fs.readFile(new URL('../../overlay/bin/actions.runner.plist.template', import.meta.url), 'utf8');
     assert.match(template, /<key>KeepAlive<\/key>\s*<true\/>/);
