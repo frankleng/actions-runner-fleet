@@ -478,7 +478,8 @@ fi
     await writeFile(join(root, 'manage-runners.sh'), '#!/bin/sh\nhead -c 1100000 /dev/zero\n', { mode: 0o700 });
     await writeFile(join(root, 'test-bin/loginctl'), '#!/bin/sh\necho no\n', { mode: 0o700 });
     const prepared = await exec(process.execPath, [...args, '--prepare', '--no-enable'], { env });
-    assert.ok(prepared.stderr.includes('Boot startup is not verified'));
+    // Login lingering is a systemd concept; other hosts do not warn about it.
+    assert.equal(prepared.stderr.includes('Boot startup is not verified'), process.platform === 'linux');
     assert.deepEqual(JSON.parse(await readFile(join(root, 'autoscale.json'), 'utf8')).runners, ['ci-ephemeral-1', 'ci-ephemeral-2']);
 
   } finally { await rm(root, { recursive: true, force: true }); }
