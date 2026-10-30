@@ -1,5 +1,7 @@
 # Runner fleet project memory
 
+To set up runners on this host, follow @AGENTS.md.
+
 ## Live resource questions
 
 When asked for current GitHub Actions runner resource usage, run this command

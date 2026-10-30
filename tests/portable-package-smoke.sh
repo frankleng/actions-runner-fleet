@@ -47,6 +47,7 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 [ ! -s "${package_root}/runners.tsv" ]
 [ -f "${package_root}/fleet.tsv" ]
 [ -f "${package_root}/fleet.example.tsv" ]
+[ -f "${package_root}/AGENTS.md" ]
 [ -f "${package_root}/CLAUDE.md" ]
 [ -f "${package_root}/overlay/autoscale-worker.mjs" ]
 [ -f "${package_root}/runner-target.sh" ]
