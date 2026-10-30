@@ -1,0 +1,178 @@
+# Every push to main builds, tests, and publishes the next release. Pull
+# requests run the same build and tests without publishing.
+#
+# Releases bump the patch version. A commit in the push whose message has a
+# "Release-Bump: minor" or "Release-Bump: major" trailer bumps that part instead.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} kit
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: macos-15
+            platform: macos-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: runnerctl-app/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Resolve runner archive
+        id: runner
+        run: |
+          source ./platform.sh
+          [ "${RUNNER_PLATFORM}" = "${{ matrix.platform }}" ]
+          echo "basename=${RUNNER_ARCHIVE_BASENAME}" >> "${GITHUB_OUTPUT}"
+          echo "url=${RUNNER_ARCHIVE_URL}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.runner.outputs.basename }}
+          key: runner-archive-${{ steps.runner.outputs.basename }}
+
+      - name: Download runner archive
+        # build-portable-package.sh verifies the pinned checksum.
+        run: |
+          [ -f "${{ steps.runner.outputs.basename }}" ] ||
+            curl -fsSL --retry 3 -o "${{ steps.runner.outputs.basename }}" "${{ steps.runner.outputs.url }}"
+
+      - name: Install dependencies
+        run: pnpm --dir runnerctl-app install --frozen-lockfile
+
+      - name: Node tests
+        run: pnpm --dir runnerctl-app test
+
+      - name: Package smoke test
+        run: /bin/bash tests/portable-package-smoke.sh
+
+      - name: Security audit
+        run: ./security-audit.sh
+
+      - name: Build kit
+        run: ./build-portable-package.sh dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kit-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # Releases are numbered in push order; never run two at once.
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: kit-*
+          path: dist
+          merge-multiple: true
+
+      - name: Choose version
+        id: version
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname --merged HEAD | head -n 1)"
+          previous="${previous:-v0.0.0}"
+
+          # A rerun of this commit republishes its existing release.
+          existing="$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          if [ -n "${existing}" ]; then
+            previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname --merged HEAD^ | head -n 1)"
+            echo "tag=${existing}" >> "${GITHUB_OUTPUT}"
+            echo "previous=${previous:-v0.0.0}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ -n "${BEFORE}" ] && ! [[ "${BEFORE}" =~ ^0+$ ]] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            range="${BEFORE}..HEAD"
+          else
+            range="${previous}..HEAD"
+            [ "${previous}" != v0.0.0 ] || range=HEAD
+          fi
+          bumps="$(git log --format='%(trailers:key=Release-Bump,valueonly)' "${range}" | tr '[:upper:]' '[:lower:]')"
+
+          IFS=. read -r major minor patch <<< "${previous#v}"
+          if grep -qx '[[:space:]]*major[[:space:]]*' <<< "${bumps}"; then
+            major=$((major + 1)); minor=0; patch=0
+          elif grep -qx '[[:space:]]*minor[[:space:]]*' <<< "${bumps}"; then
+            minor=$((minor + 1)); patch=0
+          else
+            patch=$((patch + 1))
+          fi
+          echo "tag=v${major}.${minor}.${patch}" >> "${GITHUB_OUTPUT}"
+          echo "previous=${previous}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber
+            exit 0
+          fi
+
+          range="${PREVIOUS}..HEAD"
+          [ "${PREVIOUS}" != v0.0.0 ] || range=HEAD
+          {
+            echo "## Changes"
+            echo
+            git log --no-merges --format='- %s (%h)' "${range}"
+            echo
+            echo "## Downloads"
+            echo
+            echo "- \`linux-x64\`: Ubuntu/Linux x86_64 hosts"
+            echo "- \`macos-arm64\`: Apple-silicon macOS hosts"
+            echo
+            echo "Verify the downloaded archive with its attached \`.sha256\` file before extraction."
+            if [ "${PREVIOUS}" != v0.0.0 ]; then
+              echo
+              echo "**Full changelog:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREVIOUS}...${TAG}"
+            fi
+          } > release-notes.md
+
+          gh release create "${TAG}" dist/* \
+            --target "${GITHUB_SHA}" \
+            --title "Actions Runner Fleet ${TAG}" \
+            --notes-file release-notes.md \
+            --latest

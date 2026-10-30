@@ -72,10 +72,15 @@ dashboard also uses `clang` once to build a small local disk-I/O reader.
 
 ## Fastest setup: use the latest release
 
-Open this repository's **Releases** page and download:
+Every push to `main` publishes a release with a kit for each supported host.
+Open this repository's **Releases** page and download the kit for your host and
+its checksum, for example on Apple-silicon macOS:
 
 - `actions-runner-fleet-kit-macos-arm64-2.336.0.tar.gz`
 - `actions-runner-fleet-kit-macos-arm64-2.336.0.tar.gz.sha256`
+
+Ubuntu/Linux x86_64 hosts use the matching `linux-x64` kit. The examples below
+use the macOS kit; substitute `linux-x64` and `sha256sum -c` on Linux.
 
 Authenticated GitHub CLI users can download the latest release instead:
 
@@ -905,6 +910,22 @@ The builder:
 4. Rejects live credentials, registrations, workspaces, logs, environment
    files, host-downloaded tools, and source-home paths.
 5. Writes a `.tar.gz` and matching `.sha256` under `dist/`.
+
+## Releases
+
+`.github/workflows/release.yml` builds and tests the `linux-x64` and
+`macos-arm64` kits on GitHub-hosted runners for every pull request and every
+push to `main`. On `main` it then tags the next version and publishes a release
+with both kits, their checksums, and the commit list since the previous release.
+
+Each release bumps the patch version. To bump the minor or major version
+instead, add a trailer to any commit in the push:
+
+```text
+Release-Bump: minor
+```
+
+`runnerctl-app/package.json` keeps its own version; CI does not rewrite it.
 
 ## Windows hosts
 
