@@ -1,5 +1,8 @@
 # Live state is private by default. Add new public source paths explicitly.
 *
+!.github/
+!.github/workflows/
+!.github/workflows/release.yml
 !docs/
 !docs/images/
 !overlay/
