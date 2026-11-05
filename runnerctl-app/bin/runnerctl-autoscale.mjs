@@ -12,7 +12,8 @@ import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, pla
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
 import { filePrivate, restrictToOwner, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
 import { checkDue, checkForUpdate, readUpdateState, writeUpdateState, readyTarget, rollSlot, diagnoseBlockedSlot, orphanDecision, pruneImages,
-  bootstrapVersion, runnerPlatform, rollSupported, compareVersions, runnerFilesVersion, SLOT_UPDATE_JOURNAL } from '../lib/runnerctl-runner-update.mjs';
+  bootstrapVersion, runnerPlatform, rollSupported, compareVersions, runnerFilesVersion, clearRecoveredGeneration, finishRecovery,
+  SLOT_UPDATE_JOURNAL, SLOT_RECOVERY_JOURNAL } from '../lib/runnerctl-runner-update.mjs';
 import { acquireLock } from '../../overlay/autoscale-lock.mjs';
 
 const exec = promisify(execFile);
@@ -126,6 +127,11 @@ async function localRunners(c) {
     const phase = (await readJson(path.join(directory, '.autoscale-state.json'), { phase: 'ready' })).phase;
     if (!['running', 'ready', 'blocked'].includes(phase)) throw new AutoscaleError('Invalid slot state');
     const runnerVersion = await runnerFilesVersion(directory);
+    if (await fs.access(path.join(directory, SLOT_RECOVERY_JOURNAL)).then(() => true, () => false)) {
+      // A proven recovery was interrupted; the next maintenance step finishes it.
+      result.set(name, { directory, running: status === 'running', quota, active: true, phase, unavailable: true, runnerVersion, recoveryPending: true });
+      continue;
+    }
     if (phase === 'blocked') {
       // Only a listener GitHub refused for a deprecated runner, proven from the
       // slot's own diagnostics, is a candidate for automatic recovery.
@@ -219,9 +225,9 @@ function saveUpdateState(next) {
   return updateSaved;
 }
 // Release checks run beside polls, so a download never holds up CPU control.
-function startUpdateCheck(c, tokenValue, deprecationSeen) {
+function startUpdateCheck(c, tokenValue, signals) {
   if (!updatePlatform || updateTask || quitting) return;
-  const due = checkDue(updateState, c, Date.now(), { deprecationSeen });
+  const due = checkDue(updateState, c, Date.now(), signals);
   if (!due) return;
   const before = updateState.target?.version ?? null;
   updateTask = checkForUpdate(updateState, c, { root, token: tokenValue, forced: due === 'forced', p: updatePlatform, signal: updateAbort.signal })
@@ -245,10 +251,6 @@ async function rollToTarget(slot, target) {
     throw error;
   }
 }
-async function writeSlotPhase(directory, phase) {
-  await fs.writeFile(path.join(directory, '.autoscale-state.tmp'), JSON.stringify({ phase }), { mode: 0o600 });
-  await fs.rename(path.join(directory, '.autoscale-state.tmp'), path.join(directory, '.autoscale-state.json'));
-}
 // A deprecation-blocked slot ran no job, and its one-use credentials are dead.
 // It never replays them: its orphan registration is removed, its parked
 // supervisor stopped, and the consumed generation cleared so the slot can take
@@ -257,25 +259,36 @@ async function recoverDeprecated(c, api, name, slot, remote) {
   const decision = orphanDecision(name, slot.deprecated.agentId, remote);
   if (decision.action === 'keep') return false;
   if (decision.action === 'delete') await api.remove(c, decision.id);
+  await withStoppedWorker(slot, async () => {
+    const again = await diagnoseBlockedSlot(slot.directory);
+    if (again.cause !== 'deprecated-runner' || again.agentId !== slot.deprecated.agentId) throw new AutoscaleError('Slot evidence changed');
+    await clearRecoveredGeneration(slot.directory, again.agentId);
+  });
+  Object.assign(slot, { active: false, phase: 'ready', unavailable: false, running: false, id: undefined, deprecated: undefined });
+  return true;
+}
+// Stop the slot's supervisor and hold its lock: the worker holds it while it
+// lives, so taking it proves no worker (and so no listener) runs.
+async function withStoppedWorker(slot, fn) {
   await command('./svc.sh', ['stop'], slot.directory);
-  // The worker holds this lock while it lives; taking it proves it is gone.
   let release;
   try { release = await acquireLock(slot.directory, '.autoscale-worker.lock'); }
   catch { throw new AutoscaleError('Slot supervisor still running'); }
-  try {
-    const again = await diagnoseBlockedSlot(slot.directory);
-    if (again.cause !== 'deprecated-runner' || again.agentId !== slot.deprecated.agentId) throw new AutoscaleError('Slot evidence changed');
-    for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-inflight.json']) await fs.rm(path.join(slot.directory, leaf), { force: true });
-    await writeSlotPhase(slot.directory, 'ready');
-  } finally { await release(); }
-  Object.assign(slot, { active: false, phase: 'ready', unavailable: false, running: false, id: undefined, deprecated: undefined });
-  return true;
+  try { return await fn(); } finally { await release(); }
 }
 // Generation-boundary work before the poll's registrations: finish interrupted
 // rolls, recover deprecation-blocked slots, and update idle outdated slots.
 async function maintainRunnerFiles(c, api, local, target) {
   let budget = ROLLS_PER_POLL;
   let interrupted = 0;
+  for (const slot of local.values()) {
+    if (!slot.recoveryPending || quitting) continue;
+    try {
+      await withStoppedWorker(slot, () => finishRecovery(slot.directory));
+      Object.assign(slot, { active: false, phase: 'ready', unavailable: false, running: false, id: undefined, recoveryPending: false });
+      console.error('Finished an interrupted deprecated-runner recovery without replaying credentials');
+    } catch { console.error('An interrupted deprecated-runner recovery could not be finished; inspect .autoscale-recovery.json'); }
+  }
   for (const slot of local.values()) {
     if (!slot.updatePending || quitting) continue;
     try { await rollToTarget(slot, target); Object.assign(slot, { unavailable: false, active: false, updatePending: false }); budget--; }
@@ -305,11 +318,15 @@ async function maintainRunnerFiles(c, api, local, target) {
     try { await rollToTarget(slot, target); }
     catch { console.error('Runner update failed for an idle slot; it retries before its next registration'); }
   }
-  if (Date.now() - lastPruneAt >= PRUNE_INTERVAL_MS) {
+  // Pruning never overlaps an update check, which is what publishes targets,
+  // and keeps the target as published now, not as this poll first saw it.
+  if (!updateTask && Date.now() - lastPruneAt >= PRUNE_INTERVAL_MS) {
     lastPruneAt = Date.now();
     try {
+      const published = updateState.target?.version;
       const registry = parseRegistry(await fs.readFile(path.join(root, 'runners.tsv'), 'utf8'));
-      const removed = await pruneImages(root, updatePlatform, registry.map(r => path.resolve(r.directory)), [target.version, await bootstrapVersion(root)]);
+      const removed = await pruneImages(root, updatePlatform, registry.map(r => path.resolve(r.directory)),
+        [target.version, published, await bootstrapVersion(root)], { floor: published });
       if (removed.length) console.error(`Removed ${removed.length} unused runner image(s)`);
     } catch { console.error('Unused runner images could not be pruned'); }
   }
@@ -481,8 +498,8 @@ try {
         finally { poll.tokenSource = tokenSource; }
         let target = null;
         if (apply && !quitting) {
-          startUpdateCheck(c, tokenValue, !!refused);
           target = updatePlatform && c.runnerUpdates !== 'off' ? await readyTarget(updateState, root) : null;
+          startUpdateCheck(c, tokenValue, { deprecationSeen: !!refused, targetMissing: !!updateState.target && !target });
           await resolveReservations(c, api, local);
           await maintainRunnerFiles(c, api, local, target);
           unavailable = [...local.values()].filter(r => r.unavailable).length;

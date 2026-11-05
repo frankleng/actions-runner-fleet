@@ -830,7 +830,11 @@ fresh installs; the background controller keeps autoscale slots current:
   their version, and `runnerctl health` reports `runner-update-refused`.
 - **Image.** A verified archive is kept beside the bootstrap one and extracted
   to `actions-runner-<platform>-<version>.image` through a staging directory
-  and one rename, like `manage-runners.sh`. The target version is recorded in
+  and one rename, like `manage-runners.sh`. An image holding anything but
+  files, directories, and relative symlinks that stay inside it is refused, and
+  kit files replace a link at their destination instead of writing through it.
+  A target whose image goes missing is rebuilt from its recorded checksum, even
+  when the release check answers 304. The target version is recorded in
   the private `.autoscale-runner-update.json` (mode `0600`, ignored by Git, the
   security audit, and the package builder like other `.autoscale*` state).
 - **Slot roll.** A slot takes the new files only between generations: no
@@ -845,7 +849,8 @@ fresh installs; the background controller keeps autoscale slots current:
   forward. A journal that cannot be completed keeps the slot out of service
   (`slot-update-interrupted`), and the worker never starts a listener while it
   exists. Once no runner directory uses an older image, it is deleted; the
-  target and bootstrap images stay.
+  target, anything newer, and the bootstrap image stay, and pruning never
+  overlaps a release check.
 - **No wasted registrations.** After GitHub refuses a version, the controller
   registers no slot still on it.
 
@@ -871,8 +876,9 @@ and no job log started after the handoff, that log reports the deprecation of
 the version on disk, and it shows no job message. Once a verified newer
 runner is ready, it removes the orphan registration if GitHub lists it as
 offline and idle under the same id (none listed counts as removed), stops the
-parked supervisor, confirms its lock is free, deletes the dead credentials and
-handoff, marks the slot ready, updates its files, and lets it take a fresh JIT
+parked supervisor, confirms its lock is free, writes `.autoscale-recovery.json`,
+deletes the dead credentials and handoff, marks the slot ready (a crash in
+between is finished from that journal on the next poll), updates its files, and lets it take a fresh JIT
 registration. Credentials are never replayed. Every other blocked slot,
 including one whose listener had started a job when it was refused, stays
 blocked for the manual steps under [Troubleshooting](#troubleshooting).

@@ -201,28 +201,42 @@ require_overlay() {
   done
 }
 
+# Kit files replace whatever is at the destination, a symlink included; cp alone
+# would write through a link planted by runner files and land outside the slot.
+install_kit_file() {
+  rm -f "$2"
+  cp "$1" "$2"
+}
+
 copy_overlay() {
-  local runner_dir="$1"
+  local runner_dir="$1" kit_dir
 
   validate_service_path "${runner_dir}"
   require_overlay
+  for kit_dir in bin job-hooks; do
+    if [ -L "${runner_dir}/${kit_dir}" ]; then
+      echo "refusing to install kit files through a symlinked ${kit_dir}/ in ${runner_dir}" >&2
+      exit 1
+    fi
+  done
   mkdir -p "${runner_dir}/bin" "${runner_dir}/job-hooks"
+  rm -f "${runner_dir}/.kit-root"
   printf '%s\n' "${ROOT_DIR}" > "${runner_dir}/.kit-root"
-  cp "${OVERLAY_DIR}/env.sh" "${runner_dir}/env.sh"
+  install_kit_file "${OVERLAY_DIR}/env.sh" "${runner_dir}/env.sh"
   if [ "${RUNNER_SERVICE_MANAGER}" = "systemd-user" ]; then
-    cp "${OVERLAY_DIR}/svc-systemd-user.sh" "${runner_dir}/svc.sh"
+    install_kit_file "${OVERLAY_DIR}/svc-systemd-user.sh" "${runner_dir}/svc.sh"
   else
-    cp "${OVERLAY_DIR}/svc.sh" "${runner_dir}/svc.sh"
+    install_kit_file "${OVERLAY_DIR}/svc.sh" "${runner_dir}/svc.sh"
   fi
-  cp "${OVERLAY_DIR}/runsvc.sh" "${runner_dir}/bin/runsvc.sh"
-  cp "${OVERLAY_DIR}/autoscale-lock.mjs" "${runner_dir}/bin/autoscale-lock.mjs"
-  cp "${OVERLAY_DIR}/autoscale-worker.mjs" "${runner_dir}/bin/autoscale-worker.mjs"
-  cp "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-started.sh"
-  cp "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
+  install_kit_file "${OVERLAY_DIR}/runsvc.sh" "${runner_dir}/bin/runsvc.sh"
+  install_kit_file "${OVERLAY_DIR}/autoscale-lock.mjs" "${runner_dir}/bin/autoscale-lock.mjs"
+  install_kit_file "${OVERLAY_DIR}/autoscale-worker.mjs" "${runner_dir}/bin/autoscale-worker.mjs"
+  install_kit_file "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-started.sh"
+  install_kit_file "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
   chmod u+x "${runner_dir}/job-hooks/runner-job-started.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
-  cp "${OVERLAY_DIR}/bin/actions.runner.plist.template" "${runner_dir}/bin/actions.runner.plist.template"
-  cp "${OVERLAY_DIR}/bin/actions.runner.agent.plist.template" "${runner_dir}/bin/actions.runner.agent.plist.template"
-  cp "${OVERLAY_DIR}/bin/actions.runner.service.template" "${runner_dir}/bin/actions.runner.service.template"
+  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.plist.template" "${runner_dir}/bin/actions.runner.plist.template"
+  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.agent.plist.template" "${runner_dir}/bin/actions.runner.agent.plist.template"
+  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.service.template" "${runner_dir}/bin/actions.runner.service.template"
   chmod u+x "${runner_dir}/env.sh" "${runner_dir}/svc.sh" "${runner_dir}/bin/runsvc.sh"
 }
 

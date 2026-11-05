@@ -376,6 +376,8 @@ sync_runtime_files() {
   load_runtime_environment
   render_plist
   # Replace by rename: a running listener's bash reads runsvc.sh incrementally.
+  # Never write through a leftover link at the temporary name.
+  rm -f "${RUNNER_ROOT}/runsvc.sh.tmp" || failed "failed to replace runsvc.sh.tmp"
   cp "${RUNSVC_SOURCE_PATH}" "${RUNNER_ROOT}/runsvc.sh.tmp" || failed "failed to copy runsvc.sh"
   chmod u+x "${RUNNER_ROOT}/runsvc.sh.tmp" || failed "failed to chmod runsvc.sh"
   mv "${RUNNER_ROOT}/runsvc.sh.tmp" "${RUNNER_ROOT}/runsvc.sh" || failed "failed to install runsvc.sh"

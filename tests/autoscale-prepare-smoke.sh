@@ -26,7 +26,17 @@ export RUNNER_LOGINCTL_BIN="${temp_dir}/missing-loginctl"
 export RUNNER_IMAGE_DIR="${temp_dir}/image"
 export RUNNER_PROVISION_SCRIPT_PATH="${temp_dir}/provision"
 export AUTOSCALE_SERVICE_LOG="${temp_dir}/services.log"
+# Runner files that link kit-file names outside the slot must not redirect kit writes.
+printf 'outside\n' > "${temp_dir}/outside-worker"
+printf 'outside\n' > "${temp_dir}/outside-env"
+ln -s "${temp_dir}/outside-worker" "${temp_dir}/image/bin/autoscale-worker.mjs"
+ln -s "${temp_dir}/outside-env" "${temp_dir}/image/env.sh"
 "${temp_dir}/kit/manage-runners.sh" prepare-autoscale test-slot https://github.com/example-org > "${temp_dir}/setup.log"
+[ "$(cat "${temp_dir}/outside-worker")" = outside ]
+[ "$(cat "${temp_dir}/outside-env")" = outside ]
+[ ! -L "${temp_dir}/kit/.runners/test-slot/bin/autoscale-worker.mjs" ]
+[ ! -L "${temp_dir}/kit/.runners/test-slot/env.sh" ]
+cmp "${temp_dir}/kit/overlay/autoscale-worker.mjs" "${temp_dir}/kit/.runners/test-slot/bin/autoscale-worker.mjs"
 slot="${temp_dir}/kit/.runners/test-slot"
 [ -f "${slot}/.autoscale-slot.json" ]
 [ ! -e "${slot}/.runner" ]

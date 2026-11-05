@@ -183,6 +183,8 @@ install_service() {
   ensure_linger
   (cd "${RUNNER_ROOT}" && ./env.sh)
   # Replace by rename: a running listener's bash reads runsvc.sh incrementally.
+  # Never write through a leftover link at the temporary name.
+  rm -f "${RUNNER_ROOT}/runsvc.sh.tmp"
   cp "${RUNSVC_SOURCE_PATH}" "${RUNNER_ROOT}/runsvc.sh.tmp"
   chmod u+x "${RUNNER_ROOT}/runsvc.sh.tmp"
   mv "${RUNNER_ROOT}/runsvc.sh.tmp" "${RUNNER_ROOT}/runsvc.sh"

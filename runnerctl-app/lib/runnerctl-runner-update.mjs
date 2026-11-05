@@ -6,7 +6,7 @@
 // archive becomes an image next to the bootstrap one (<archive>.image). Slots
 // take the new runner files only between generations: never while a listener
 // or job runs, and never touching their per-generation state.
-import { promises as fs, createWriteStream } from 'node:fs';
+import { promises as fs, createWriteStream, constants as fsConstants } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -21,6 +21,9 @@ export const UPDATE_STATE_FILE = '.autoscale-runner-update.json';
 // Slot-local files of a roll in progress. They match .autoscale*, which Git,
 // the security audit, and the package builder already treat as private state.
 export const SLOT_UPDATE_JOURNAL = '.autoscale-update.json';
+// Written once a deprecation-blocked slot is proven and stopped, before its dead
+// generation is cleared; a crash mid-clear is finished from it, not re-proven.
+export const SLOT_RECOVERY_JOURNAL = '.autoscale-recovery.json';
 const SLOT_UPDATE_NEW = '.autoscale-update-new';
 const SLOT_UPDATE_OLD = '.autoscale-update-old';
 // Release checks: a few a day, 304s are free, and a deprecation report forces
@@ -97,8 +100,12 @@ export function releaseCandidate(release, p) {
 }
 
 /** Whether the controller should ask GitHub for a release now. */
-export function checkDue(state, c, now, { deprecationSeen = false } = {}) {
+export function checkDue(state, c, now, { deprecationSeen = false, targetMissing = false } = {}) {
   if (c.runnerUpdates === 'off') return false;
+  // The recorded target's image is gone or invalid: rebuild it soon, even
+  // though the release check itself may only answer 304.
+  if (targetMissing && !(state.error && now - state.error.lastAt < FAILURE_RETRY_MS) &&
+      !(now - (state.forcedAt ?? -Infinity) < FORCED_CHECK_INTERVAL_MS)) return 'forced';
   const pin = c.runnerVersion ?? null;
   // A changed pin or mode is a different question: ask now.
   if ((state.pin ?? null) !== pin) return true;
@@ -211,7 +218,42 @@ export async function imageEntries(imageDir) {
   const names = (await fs.readdir(imageDir)).sort();
   if (!names.includes('bin') || !names.includes('externals')) throw new UpdateRefusal('image-incomplete');
   if (names.some(n => FORBIDDEN.test(n) || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(n))) throw new UpdateRefusal('image-unexpected-entry');
+  await assertContained(imageDir);
   return names.filter(n => !KIT_OWNED.has(n));
+}
+
+/**
+ * Every entry is a regular file, a directory, or a relative symlink that
+ * stays inside the image (the runner ships npm/npx/corepack links in its
+ * Node.js externals). A link that leaves the image, or any other file type,
+ * refuses the image: cloning preserves links, and a later write through one
+ * would land outside the slot.
+ */
+export async function assertContained(imageDir) {
+  const root = path.resolve(imageDir);
+  const walk = async directory => {
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      const full = path.join(directory, entry.name);
+      if (entry.isDirectory()) { await walk(full); continue; }
+      if (entry.isFile()) continue;
+      if (!entry.isSymbolicLink()) throw new UpdateRefusal('image-unexpected-file-type');
+      const target = await fs.readlink(full);
+      const resolved = path.resolve(path.dirname(full), target);
+      if (path.isAbsolute(target) || (resolved !== root && !resolved.startsWith(root + path.sep))) throw new UpdateRefusal('image-escaping-symlink');
+    }
+  };
+  await walk(root);
+}
+
+/** Put a kit file at `to`, replacing whatever is there (a symlink included) without following it. */
+export async function replaceFile(from, to, mode = null) {
+  const temp = path.join(path.dirname(to), `.autoscale-copy.${randomBytes(6).toString('hex')}`);
+  try {
+    await fs.copyFile(from, temp, fsConstants.COPYFILE_EXCL);
+    if (mode !== null) await fs.chmod(temp, mode);
+    // rename replaces the directory entry; it never writes through a link.
+    await fs.rename(temp, to);
+  } finally { await fs.rm(temp, { force: true }); }
 }
 
 const BLANK_STATE = { version: 1 };
@@ -246,7 +288,13 @@ export async function checkForUpdate(state, c, { root, token, now = Date.now(), 
     if (answer.status === 304) {
       // Same release as last time. A failed verification stays refused until the release changes.
       next.error = null;
-      if (next.refusal || !next.pendingCandidate) return next;
+      if (next.refusal) return next;
+      if (!next.pendingCandidate) {
+        // Nothing new upstream, but a target whose image is missing is rebuilt
+        // from the checksum it was verified with.
+        if (!next.target || await readyTarget(next, root)) return next;
+        next.pendingCandidate = targetCandidate(next.target, p);
+      }
     } else {
       next.etag = answer.etag;
       next.refusal = null;
@@ -265,7 +313,9 @@ export async function checkForUpdate(state, c, { root, token, now = Date.now(), 
     }
     const candidate = next.pendingCandidate;
     // Never move backwards: a lower latest or pin leaves newer slots alone.
-    if (next.target && compareVersions(candidate.version, next.target.version) <= 0) {
+    // The same version is rebuilt only when its image is missing.
+    const order = next.target ? compareVersions(candidate.version, next.target.version) : 1;
+    if (order < 0 || (order === 0 && await readyTarget(next, root))) {
       next.pendingCandidate = null;
       next.error = null;
       return next;
@@ -288,6 +338,13 @@ export async function checkForUpdate(state, c, { root, token, now = Date.now(), 
     next.error = { kind, ...(error?.status ? { status: error.status } : {}), since: same ? state.error.since : now, lastAt: now };
     return next;
   }
+}
+
+/** The download that rebuilds a recorded target, verified against its recorded checksum. */
+export function targetCandidate(target, p) {
+  if (!VERSION.test(target?.version ?? '') || !/^[0-9a-f]{64}$/.test(target?.sha256 ?? '')) throw new UpdateRefusal('invalid-target');
+  const name = archiveName(p, target.version);
+  return { version: target.version, sha256: target.sha256, name, url: `https://github.com/actions/runner/releases/download/v${target.version}/${name}` };
 }
 
 /** The image every outdated slot should take now, or null. */
@@ -330,7 +387,7 @@ export async function rollSlot(directory, { image, version, overlayDir }, { run 
   try { journal = JSON.parse(await fs.readFile(at(SLOT_UPDATE_JOURNAL), 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw new Error('Unreadable runner update journal'); }
   if (!journal) {
-    for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-request.json', '.autoscale-inflight.json', '.autoscale-reservation.json']) {
+    for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-request.json', '.autoscale-inflight.json', '.autoscale-reservation.json', SLOT_RECOVERY_JOURNAL]) {
       if (await exists(at(leaf))) throw new Error('Slot holds a generation; runner files change only between generations');
     }
     const entries = await imageEntries(image);
@@ -342,9 +399,9 @@ export async function rollSlot(directory, { image, version, overlayDir }, { run 
     for (const [source, leaf] of OVERLAY_BIN) {
       const from = path.join(overlayDir, source);
       if (!await exists(from)) continue;
-      const to = path.join(at(SLOT_UPDATE_NEW), 'bin', leaf);
-      await fs.copyFile(from, to);
-      if (leaf.endsWith('.sh')) await fs.chmod(to, 0o755);
+      const bin = path.join(at(SLOT_UPDATE_NEW), 'bin');
+      if (!(await fs.lstat(bin)).isDirectory()) throw new Error('Staged bin/ is not a directory');
+      await replaceFile(from, path.join(bin, leaf), leaf.endsWith('.sh') ? 0o755 : null);
     }
     if (await runnerFilesVersion(at(SLOT_UPDATE_NEW)) !== version) throw new Error('Staged runner files have the wrong version');
     journal = { version: 1, to: version, entries };
@@ -400,7 +457,7 @@ export async function diagnoseBlockedSlot(directory) {
   try {
     const phase = JSON.parse(await fs.readFile(at('.autoscale-state.json'), 'utf8')).phase;
     if (phase !== 'blocked') return unknown;
-    for (const leaf of ['.autoscale-request.json', '.autoscale-request.tmp', '.autoscale-reservation.json', SLOT_UPDATE_JOURNAL]) {
+    for (const leaf of ['.autoscale-request.json', '.autoscale-request.tmp', '.autoscale-reservation.json', SLOT_UPDATE_JOURNAL, SLOT_RECOVERY_JOURNAL]) {
       if (await exists(at(leaf))) return unknown;
     }
     const inflightStat = await fs.stat(at('.autoscale-inflight.json'));
@@ -425,6 +482,34 @@ export async function diagnoseBlockedSlot(directory) {
 }
 
 /**
+ * Clear a proven deprecation-blocked generation. The caller has removed its
+ * registration, stopped the slot's supervisor, and holds the worker lock. The
+ * journal goes first, so an interruption leaves a slot finishRecovery()
+ * completes; the consumed credentials are only ever deleted, never reused.
+ */
+export async function clearRecoveredGeneration(directory, agentId) {
+  if (!Number.isSafeInteger(agentId) || agentId < 1) throw new Error('Invalid registration id');
+  await writePrivateJson(path.join(directory, SLOT_RECOVERY_JOURNAL), { version: 1, agentId });
+  return finishRecovery(directory);
+}
+/** Finish a journaled recovery: delete the dead generation, mark the slot ready, drop the journal. Caller holds the worker lock. */
+export async function finishRecovery(directory) {
+  const at = leaf => path.join(directory, leaf);
+  let journal;
+  try { journal = JSON.parse(await fs.readFile(at(SLOT_RECOVERY_JOURNAL), 'utf8')); }
+  catch { throw new Error('Unreadable recovery journal'); }
+  if (journal?.version !== 1 || !Number.isSafeInteger(journal.agentId)) throw new Error('Invalid recovery journal');
+  // A new handoff or roll beside the journal is not ours to clear.
+  for (const leaf of ['.autoscale-request.json', '.autoscale-reservation.json', SLOT_UPDATE_JOURNAL]) {
+    if (await exists(at(leaf))) throw new Error('Recovery journal beside newer slot state');
+  }
+  for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-inflight.json']) await fs.rm(at(leaf), { force: true });
+  await writePrivateJson(at('.autoscale-state.json'), { phase: 'ready' });
+  await fs.unlink(at(SLOT_RECOVERY_JOURNAL));
+  return journal.agentId;
+}
+
+/**
  * Whether the orphan registration of a deprecation-blocked generation may be
  * removed: 'delete' it, treat it as already 'gone', or 'keep' the slot
  * blocked because something else holds the name or it is not idle and offline.
@@ -444,11 +529,14 @@ export async function bootstrapVersion(root) {
 }
 
 /**
- * Remove images no runner directory uses. Keeps the target and bootstrap
- * images, and keeps everything when any directory's version is unknown or a
- * roll is unfinished.
+ * Remove images no runner directory uses. Keeps the listed versions (target
+ * and bootstrap), every image at or above `floor` (the current target, so an
+ * image a concurrent update just selected is never removed), and everything
+ * when any directory's version is unknown or a roll is unfinished. The caller
+ * must not publish a new target while this runs.
  */
-export async function pruneImages(root, p, directories, keep) {
+export async function pruneImages(root, p, directories, keep, { floor = null } = {}) {
+  if (!floor || !VERSION.test(floor)) return [];
   const versions = new Set(keep.filter(Boolean));
   for (const directory of directories) {
     if (await exists(path.join(directory, SLOT_UPDATE_JOURNAL))) return [];
@@ -460,7 +548,7 @@ export async function pruneImages(root, p, directories, keep) {
   const removed = [];
   for (const name of await fs.readdir(root)) {
     const match = pattern.exec(name);
-    if (!match || versions.has(match[1])) continue;
+    if (!match || versions.has(match[1]) || compareVersions(match[1], floor) >= 0) continue;
     await fs.rm(path.join(root, name), { recursive: true, force: true });
     removed.push(match[1]);
   }

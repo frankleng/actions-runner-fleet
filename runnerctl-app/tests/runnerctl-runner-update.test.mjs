@@ -9,7 +9,7 @@ import path from 'node:path';
 import { validateConfig } from '../lib/runnerctl-autoscale.mjs';
 import { findProblems } from '../lib/runnerctl-health.mjs';
 import { releaseCandidate, checkDue, checkForUpdate, rollSlot, diagnoseBlockedSlot, orphanDecision, pruneImages, compareVersions, runnerFilesVersion,
-  readyTarget, CHECK_INTERVAL_MS, FORCED_CHECK_INTERVAL_MS, UpdateRefusal } from '../lib/runnerctl-runner-update.mjs';
+  readyTarget, buildImage, clearRecoveredGeneration, finishRecovery, CHECK_INTERVAL_MS, FORCED_CHECK_INTERVAL_MS, UpdateRefusal } from '../lib/runnerctl-runner-update.mjs';
 
 const exec = promisify(execFile);
 const linux = { name: 'linux-x64', ext: 'tar.gz' };
@@ -29,10 +29,11 @@ async function runnerFiles(directory, version, marker = version) {
   await fs.writeFile(path.join(directory, 'externals/node24/bin/node'), `node ${marker}`);
   for (const leaf of ['config.sh', 'run.sh', 'safe_sleep.sh', 'env.sh']) await fs.writeFile(path.join(directory, leaf), `${leaf} ${marker}`);
 }
-async function archive(version, marker = version) {
+async function archive(version, marker = version, extra = async () => {}) {
   const dir = await tempDir('runner-release-');
   const content = path.join(dir, 'content');
   await runnerFiles(content, version, marker);
+  await extra(content);
   const file = path.join(dir, `actions-runner-linux-x64-${version}.tar.gz`);
   await exec('tar', ['-czf', file, '-C', content, '.']);
   const bytes = await fs.readFile(file);
@@ -313,12 +314,12 @@ test('unused images are pruned; images a runner directory uses, the target and b
   const root = await tempDir('runner-prune-');
   for (const version of ['2.330.0', OLD, '2.337.0', NEW]) await fs.mkdir(path.join(root, `actions-runner-linux-x64-${version}.image`));
   const directory = await slot(root, 'runner-1', OLD);
-  assert.deepEqual((await pruneImages(root, linux, [directory], [NEW, '2.337.0'])).sort(compareVersions), ['2.330.0']);
+  assert.deepEqual((await pruneImages(root, linux, [directory], [NEW, '2.337.0'], { floor: NEW })).sort(compareVersions), ['2.330.0']);
   // Unknown versions prune nothing.
   const unknown = await slot(root, 'runner-2', OLD);
   await fs.rm(path.join(unknown, 'bin/Runner.Listener.deps.json'));
   await fs.mkdir(path.join(root, 'actions-runner-linux-x64-2.300.0.image'));
-  assert.deepEqual(await pruneImages(root, linux, [directory, unknown], [NEW]), []);
+  assert.deepEqual(await pruneImages(root, linux, [directory, unknown], [NEW], { floor: NEW }), []);
 });
 
 test('controller recovers a deprecation-blocked slot without replaying credentials and leaves other causes blocked', { timeout: 60000 }, async () => {
@@ -414,4 +415,107 @@ esac
   // A fresh registration follows on current files only, never a replay of the consumed one.
   assert.ok(ops.some(op => op.startsWith('register ')));
   assert.ok(!second.stdout.includes('private-test-value') && !second.stderr.includes('private-test-value'));
+});
+
+test('a target whose image disappeared is rebuilt even when the release answers 304', async () => {
+  const root = await tempDir('runner-update-root-');
+  const { bytes, sha256 } = await archive(NEW);
+  const gh = mockGithub(release(NEW, sha256, sha256), bytes);
+  const c = config();
+  let state = await checkForUpdate({ version: 1 }, c, { root, now: 1000, fetchImpl: gh.fetchImpl, p: linux });
+  const image = path.join(root, `actions-runner-linux-x64-${NEW}.image`);
+  await fs.rm(image, { recursive: true });
+  await fs.rm(path.join(root, `actions-runner-linux-x64-${NEW}.tar.gz`));
+  assert.equal(await readyTarget(state, root), null);
+  // The controller asks soon, and the 304 answer still rebuilds from the recorded checksum.
+  assert.equal(checkDue(state, c, 2000, { targetMissing: true }), 'forced');
+  state = await checkForUpdate(state, c, { root, now: 2000, forced: true, fetchImpl: gh.fetchImpl, p: linux });
+  assert.equal(gh.calls.filter(call => call.url.includes('/releases/latest')).at(-1).etag, '"v1"');
+  assert.equal(state.target.version, NEW);
+  assert.deepEqual(await readyTarget(state, root), { version: NEW, image });
+  // The rebuild is verified against the recorded checksum, not trusted blindly.
+  await fs.rm(image, { recursive: true });
+  await fs.rm(path.join(root, `actions-runner-linux-x64-${NEW}.tar.gz`));
+  const tampered = await archive(NEW, 'tampered');
+  const bad = mockGithub(release(NEW, sha256, sha256), tampered.bytes);
+  const refused = await checkForUpdate({ ...state, etag: '"v1"' }, c, { root, now: 3000, fetchImpl: bad.fetchImpl, p: linux });
+  assert.equal(refused.refusal.reason, 'archive-checksum-mismatch');
+  assert.equal(await exists(image), false);
+});
+
+test('pruning never removes the current target or a newer image a concurrent update selected', async () => {
+  const root = await tempDir('runner-prune-');
+  for (const version of ['2.330.0', OLD, NEW, '2.339.0']) await fs.mkdir(path.join(root, `actions-runner-linux-x64-${version}.image`));
+  const directory = await slot(root, 'runner-1', OLD);
+  // The poll still holds an older target in hand; the published one is newer.
+  assert.deepEqual(await pruneImages(root, linux, [directory], [OLD], { floor: NEW }), ['2.330.0']);
+  for (const version of [OLD, NEW, '2.339.0']) assert.equal(await exists(path.join(root, `actions-runner-linux-x64-${version}.image`)), true);
+  // Without a published target, nothing is pruned.
+  await fs.mkdir(path.join(root, 'actions-runner-linux-x64-2.330.0.image'));
+  assert.deepEqual(await pruneImages(root, linux, [directory], [OLD]), []);
+});
+
+test('an image with a symlink leaving it is refused; links inside it are kept and never written through', async () => {
+  const root = await tempDir('runner-symlink-');
+  const outside = path.join(root, 'outside-file');
+  await fs.writeFile(outside, 'outside');
+  // Escaping links: absolute, and relative past the root.
+  for (const [label, target] of [['absolute', outside], ['relative', '../../../outside-file']]) {
+    const { bytes } = await archive(NEW, NEW, async content => fs.symlink(target, path.join(content, 'bin/autoscale-worker.mjs')));
+    const archivePath = path.join(root, `${label}.tar.gz`);
+    await fs.writeFile(archivePath, bytes);
+    const image = path.join(root, `${label}.image`);
+    await assert.rejects(buildImage(archivePath, image, NEW), error => error instanceof UpdateRefusal && error.reason === 'image-escaping-symlink', label);
+    assert.equal(await exists(image), false);
+  }
+  // A link already inside an image (built before this check) also stops a roll.
+  const overlayDir = await overlay(root);
+  const escaping = path.join(root, 'escaping-image');
+  await runnerFiles(escaping, NEW);
+  await fs.symlink(outside, path.join(escaping, 'bin/autoscale-worker.mjs'));
+  const directory = await slot(root, 'runner-1', OLD);
+  await assert.rejects(rollSlot(directory, { image: escaping, version: NEW, overlayDir }), /image-escaping-symlink/);
+  assert.equal(await fs.readFile(outside, 'utf8'), 'outside');
+  assert.equal(await runnerFilesVersion(directory), OLD);
+  // npm-style links inside the image are fine, and an overlay file at a linked name replaces the link.
+  const { bytes } = await archive(NEW, NEW, async content => {
+    await fs.symlink('../lib/npm-cli.js', path.join(content, 'externals/node24/bin/npm'));
+    await fs.symlink('../config.sh', path.join(content, 'bin/autoscale-worker.mjs'));
+  });
+  await fs.writeFile(path.join(root, 'inside.tar.gz'), bytes);
+  const image = await buildImage(path.join(root, 'inside.tar.gz'), path.join(root, 'inside.image'), NEW);
+  const other = await slot(root, 'runner-2', OLD);
+  assert.equal(await rollSlot(other, { image, version: NEW, overlayDir }), NEW);
+  assert.equal(await fs.readFile(path.join(other, 'config.sh'), 'utf8'), `config.sh ${NEW}`);
+  assert.equal((await fs.lstat(path.join(other, 'bin/autoscale-worker.mjs'))).isSymbolicLink(), false);
+  assert.equal(await fs.readFile(path.join(other, 'bin/autoscale-worker.mjs'), 'utf8'), 'overlay autoscale-worker.mjs');
+  assert.equal((await fs.lstat(path.join(other, 'externals/node24/bin/npm'))).isSymbolicLink(), true);
+});
+
+test('a recovery interrupted after its journal finishes on the next poll without replaying credentials', async () => {
+  const root = await tempDir('runner-recovery-');
+  const directory = await blockedSlot(root, 'runner-1', OLD, { agentId: 11 });
+  assert.equal((await diagnoseBlockedSlot(directory)).cause, 'deprecated-runner');
+  // Crash after the journal and the in-flight handoff were removed, before ready was written.
+  await fs.writeFile(path.join(directory, '.autoscale-recovery.json'), JSON.stringify({ version: 1, agentId: 11 }));
+  await fs.rm(path.join(directory, '.autoscale-inflight.json'));
+  // The evidence is gone, but the journal is not re-proven from it, and nothing rolls meanwhile.
+  assert.deepEqual(await diagnoseBlockedSlot(directory), { cause: 'unknown' });
+  await assert.rejects(rollSlot(directory, { image: directory, version: NEW, overlayDir: root }), /between generations/);
+  assert.equal(await finishRecovery(directory), 11);
+  for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-inflight.json', '.autoscale-recovery.json']) {
+    assert.equal(await exists(path.join(directory, leaf)), false, leaf);
+  }
+  assert.equal(JSON.parse(await fs.readFile(path.join(directory, '.autoscale-state.json'), 'utf8')).phase, 'ready');
+  // A full recovery journals first, then clears.
+  const fresh = await blockedSlot(root, 'runner-2', OLD, { agentId: 12 });
+  assert.equal(await clearRecoveredGeneration(fresh, 12), 12);
+  assert.equal(JSON.parse(await fs.readFile(path.join(fresh, '.autoscale-state.json'), 'utf8')).phase, 'ready');
+  assert.equal(await exists(path.join(fresh, '.credentials')), false);
+  // A new handoff beside a stale journal is left alone.
+  const guarded = await blockedSlot(root, 'runner-3', OLD, { agentId: 13 });
+  await fs.writeFile(path.join(guarded, '.autoscale-recovery.json'), JSON.stringify({ version: 1, agentId: 13 }));
+  await fs.writeFile(path.join(guarded, '.autoscale-request.json'), '{}');
+  await assert.rejects(finishRecovery(guarded), /newer slot state/);
+  assert.equal(await exists(path.join(guarded, '.autoscale-request.json')), true);
 });
