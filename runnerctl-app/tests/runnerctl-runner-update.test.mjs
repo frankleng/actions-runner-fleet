@@ -440,7 +440,9 @@ test('a target whose image disappeared is rebuilt even when the release answers 
   const tampered = await archive(NEW, 'tampered');
   const bad = mockGithub(release(NEW, sha256, sha256), tampered.bytes);
   const refused = await checkForUpdate({ ...state, etag: '"v1"' }, c, { root, now: 3000, fetchImpl: bad.fetchImpl, p: linux });
-  assert.equal(refused.refusal.reason, 'archive-checksum-mismatch');
+  // Repairing the current target is retried, never refused: its checksum is already verified.
+  assert.equal(refused.error.kind, 'target-repair');
+  assert.equal(refused.target.version, NEW);
   assert.equal(await exists(image), false);
 });
 
@@ -735,4 +737,125 @@ test('special files never block validation', { timeout: 20000 }, async () => {
   await fs.rm(path.join(blocked, '.autoscale-inflight.json'));
   await exec('mkfifo', [path.join(blocked, '.autoscale-inflight.json')]);
   assert.deepEqual(await settle(diagnoseBlockedSlot(blocked), 'diagnoseBlockedSlot'), { cause: 'unknown' });
+});
+
+test('a refused newer release never stops repairing the verified current target', async () => {
+  const root = await tempDir('runner-update-root-');
+  const current = await archive(NEW);
+  const newer = '2.339.0';
+  let latest = release(NEW, current.sha256, current.sha256);
+  let tag = '"v1"';
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, etag: options.headers?.['If-None-Match'] ?? null });
+    if (url.includes('/releases/latest')) {
+      if (options.headers?.['If-None-Match'] === tag) return new Response(null, { status: 304 });
+      return new Response(JSON.stringify(latest), { status: 200, headers: { etag: tag } });
+    }
+    if (url.includes(`/v${NEW}/`)) return new Response(current.bytes);
+    return new Response('not found', { status: 404 });
+  };
+  const c = config();
+  let state = await checkForUpdate({ version: 1 }, c, { root, now: 1000, fetchImpl, p: linux });
+  assert.equal(state.target.version, NEW);
+  // A newer release is published without an asset digest: refused, and that sticks.
+  latest = release(newer, 'd'.repeat(64), null);
+  tag = '"v2"';
+  state = await checkForUpdate(state, c, { root, now: 2000, fetchImpl, p: linux });
+  assert.equal(state.refusal.reason, 'missing-asset-digest');
+  // Then the current target's image is lost; the next check answers 304 for the refused release.
+  await fs.rm(path.join(root, `actions-runner-linux-x64-${NEW}.image`), { recursive: true });
+  assert.equal(await readyTarget(state, root), null);
+  assert.equal(checkDue(state, c, 3000, { targetMissing: true }), 'forced');
+  state = await checkForUpdate(state, c, { root, now: 3000, forced: true, fetchImpl, p: linux });
+  assert.equal(calls.filter(call => call.url.includes('/releases/latest')).at(-1).etag, '"v2"');
+  assert.equal(state.refusal.reason, 'missing-asset-digest');
+  assert.ok(await readyTarget(state, root));
+  assert.equal(state.target.version, NEW);
+});
+
+test('a download that fails verification is retried without the release ETag', async () => {
+  const root = await tempDir('runner-update-root-');
+  const good = await archive(NEW);
+  const tampered = await archive(NEW, 'tampered');
+  let bytes = tampered.bytes;
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, etag: options.headers?.['If-None-Match'] ?? null });
+    if (url.includes('/releases/latest')) {
+      if (options.headers?.['If-None-Match'] === '"v1"') return new Response(null, { status: 304 });
+      return new Response(JSON.stringify(release(NEW, good.sha256, good.sha256)), { status: 200, headers: { etag: '"v1"' } });
+    }
+    return new Response(bytes);
+  };
+  const c = config();
+  let state = await checkForUpdate({ version: 1 }, c, { root, now: 1000, fetchImpl, p: linux });
+  assert.equal(state.refusal.reason, 'archive-checksum-mismatch');
+  assert.equal(state.etag, null);
+  // Retried at the forced-check interval, not every poll, and never sticky.
+  assert.equal(checkDue(state, c, 1000 + FORCED_CHECK_INTERVAL_MS / 2), false);
+  assert.equal(checkDue(state, c, 1000 + FORCED_CHECK_INTERVAL_MS), true);
+  bytes = good.bytes;
+  state = await checkForUpdate(state, c, { root, now: 1000 + FORCED_CHECK_INTERVAL_MS, fetchImpl, p: linux });
+  assert.equal(calls.filter(call => call.url.includes('/releases/latest')).at(-1).etag, null);
+  assert.equal(state.refusal, null);
+  assert.equal(state.target.version, NEW);
+  assert.ok(await readyTarget(state, root));
+  // Unacceptable metadata stays refused by ETag.
+  const sticky = await checkForUpdate({ version: 1 }, c, { root: await tempDir('runner-update-root-'), now: 1000,
+    fetchImpl: mockGithub(release(NEW, good.sha256, null), good.bytes).fetchImpl, p: linux });
+  assert.equal(sticky.refusal.retry, undefined);
+  assert.equal(sticky.etag, '"v1"');
+});
+
+test('rolling back a version-1 journal removes the entries the update added', async () => {
+  const root = await tempDir('runner-v1-rollback-');
+  const outside = path.join(root, 'outside-file');
+  await fs.writeFile(outside, 'outside');
+  const directory = await journaledRoll(root, 'runner-1', async staged => {
+    await fs.writeFile(path.join(staged, 'added.sh'), 'new entry');
+    await fs.symlink(outside, path.join(staged, 'externals/escape'));
+  });
+  const journalPath = path.join(directory, '.autoscale-update.json');
+  const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'));
+  await fs.writeFile(journalPath, JSON.stringify({ ...journal, entries: [...journal.entries, 'added.sh'] }));
+  await assert.rejects(rollSlot(directory, { overlayDir: root }), /image-escaping-symlink/);
+  assert.equal(await exists(path.join(directory, 'added.sh')), false);
+  assert.equal(await runnerFilesVersion(directory), OLD);
+  for (const leaf of ['config.sh', 'run.sh', 'safe_sleep.sh']) assert.equal(await fs.readFile(path.join(directory, leaf), 'utf8'), `${leaf} ${OLD}`);
+  assert.equal(await exists(journalPath), false);
+});
+
+test('private journal writes never follow a link at the temporary name', async () => {
+  const root = await tempDir('runner-tmp-link-');
+  const outside = path.join(root, 'outside-file');
+  await fs.writeFile(outside, 'outside');
+  const image = path.join(root, 'image');
+  await runnerFiles(image, NEW);
+  const directory = await slot(root, 'runner-1', OLD);
+  await fs.symlink(outside, path.join(directory, '.autoscale-update.json.tmp'));
+  assert.equal(await rollSlot(directory, { image, version: NEW, overlayDir: await overlay(root) }), NEW);
+  assert.equal(await fs.readFile(outside, 'utf8'), 'outside');
+  // Recovery journals too.
+  const blocked = await blockedSlot(root, 'runner-2', OLD, { agentId: 21 });
+  await fs.symlink(outside, path.join(blocked, '.autoscale-recovery.json.tmp'));
+  await fs.symlink(outside, path.join(blocked, '.autoscale-state.json.tmp'));
+  assert.equal(await clearRecoveredGeneration(blocked, 21), 21);
+  assert.equal(await fs.readFile(outside, 'utf8'), 'outside');
+});
+
+test('pruning removes downloaded archives no kept version uses', async () => {
+  const root = await tempDir('runner-prune-');
+  for (const version of ['2.330.0', OLD, NEW]) {
+    await fs.mkdir(path.join(root, `actions-runner-linux-x64-${version}.image`));
+    await fs.writeFile(path.join(root, `actions-runner-linux-x64-${version}.tar.gz`), 'archive');
+  }
+  await fs.writeFile(path.join(root, 'actions-runner-linux-x64-2.331.0.tar.gz'), 'archive');
+  const directory = await slot(root, 'runner-1', OLD);
+  assert.deepEqual((await pruneImages(root, linux, [directory], [NEW], { floor: NEW })).sort(compareVersions), ['2.330.0', '2.331.0']);
+  for (const version of ['2.330.0', '2.331.0']) assert.equal(await exists(path.join(root, `actions-runner-linux-x64-${version}.tar.gz`)), false, version);
+  for (const version of [OLD, NEW]) {
+    assert.equal(await exists(path.join(root, `actions-runner-linux-x64-${version}.tar.gz`)), true, version);
+    assert.equal(await exists(path.join(root, `actions-runner-linux-x64-${version}.image`)), true, version);
+  }
 });

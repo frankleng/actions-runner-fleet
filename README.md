@@ -828,6 +828,11 @@ fresh installs; the background controller keeps autoscale slots current:
   (`<!-- BEGIN SHA linux-x64 -->…`) and the asset's `digest`. A missing or
   mismatched checksum refuses the release: nothing is extracted, slots keep
   their version, and `runnerctl health` reports `runner-update-refused`.
+  Unacceptable published metadata or contents stay refused until the release
+  changes. A download that does not match the published checksums is retried
+  every 15 minutes with a fresh request (no ETag). A refusal applies only to
+  that release: the current target is always repaired from its recorded
+  checksum when its image goes missing or bad.
 - **Image.** A verified archive is kept beside the bootstrap one and extracted
   to `actions-runner-<platform>-<version>.image` through a staging directory
   and one rename, like `manage-runners.sh`. An image is refused unless every
@@ -860,9 +865,9 @@ fresh installs; the background controller keeps autoscale slots current:
   point. A crash before it leaves the old version; after it, the next poll rolls
   forward. A journal that cannot be completed keeps the slot out of service
   (`slot-update-interrupted`), and the worker never starts a listener while it
-  exists. Once no runner directory uses an older image, it is deleted; the
-  target, anything newer, and the bootstrap image stay, and pruning never
-  overlaps a release check.
+  exists. Once no runner directory uses an older version, its image and
+  downloaded archive are deleted; the target, anything newer, and the
+  bootstrap version stay, and pruning never overlaps a release check.
 - **No wasted registrations.** After GitHub refuses a version, the controller
   registers no slot still on it.
 

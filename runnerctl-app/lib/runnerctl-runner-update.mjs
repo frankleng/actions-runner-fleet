@@ -48,6 +48,10 @@ const OVERLAY_BIN = [['runsvc.sh', 'runsvc.sh'], ['autoscale-lock.mjs', 'autosca
   ['bin/actions.runner.agent.plist.template', 'actions.runner.agent.plist.template'],
   ['bin/actions.runner.service.template', 'actions.runner.service.template']];
 
+// Refusals of our own download, retried at the forced-check interval; every
+// other refusal (unacceptable metadata or contents) sticks to its release.
+const RETRIED_REFUSALS = new Set(['archive-checksum-mismatch', 'archive-too-large', 'insecure-download']);
+
 /** A verification or release problem that keeps the current runner version. */
 export class UpdateRefusal extends Error {
   constructor(reason, version = null) { super(reason); this.reason = reason; this.version = version; }
@@ -112,6 +116,8 @@ export function checkDue(state, c, now, { deprecationSeen = false, targetMissing
   if (!Number.isFinite(state.checkedAt)) return true;
   if (state.error && now - state.error.lastAt < FAILURE_RETRY_MS) return false;
   if (state.error) return true;
+  // Our own download failed verification: fetch the release again later.
+  if (state.refusal?.retry) return now - state.refusal.at >= FORCED_CHECK_INTERVAL_MS;
   if (deprecationSeen && !(state.target && state.deprecated && compareVersions(state.target.version, state.deprecated.version) > 0) &&
       !(now - (state.forcedAt ?? -Infinity) < FORCED_CHECK_INTERVAL_MS)) return 'forced';
   return now - state.checkedAt >= CHECK_INTERVAL_MS;
@@ -345,7 +351,25 @@ export async function writeUpdateState(root, state) {
  * state records the target only once its image exists. Failures keep the
  * current target and are recorded for `runnerctl health`.
  */
-export async function checkForUpdate(state, c, { root, token, now = Date.now(), forced = false, fetchImpl = fetch, run = exec, p = runnerPlatform(), signal }) {
+export async function checkForUpdate(state, c, options) {
+  const next = await checkRelease(state, c, options);
+  // The verified current target is repaired from its recorded checksum whatever
+  // the release check decided: a refusal of some other release, or a 304,
+  // never stands in the way.
+  const { root, now = Date.now(), fetchImpl = fetch, run = exec, p = runnerPlatform(), signal } = options;
+  if (!next.target || await readyTarget(next, root)) return next;
+  try {
+    const current = targetCandidate(next.target, p);
+    const archive = await downloadVerified(current, root, { fetchImpl, signal });
+    const image = await buildImage(archive, path.join(root, imageName(p, current.version)), current.version, { run });
+    return { ...next, target: { ...next.target, image: path.basename(image), imageId: await imageIdentity(image), at: now } };
+  } catch (error) {
+    // Transient: retried after the failure backoff; the recorded checksum never changes.
+    const kind = 'target-repair';
+    return { ...next, error: { kind, ...(error?.status ? { status: error.status } : {}), since: state.error?.kind === kind ? state.error.since : now, lastAt: now } };
+  }
+}
+async function checkRelease(state, c, { root, token, now = Date.now(), forced = false, fetchImpl = fetch, run = exec, p = runnerPlatform(), signal }) {
   const next = { ...state, version: 1, pin: c.runnerVersion ?? null, platform: p.name };
   if (forced) next.forcedAt = now;
   try {
@@ -354,15 +378,10 @@ export async function checkForUpdate(state, c, { root, token, now = Date.now(), 
     const answer = await fetchRelease({ token, pin: next.pin, etag: sameQuestion ? state.etag : null, fetchImpl, signal });
     next.checkedAt = now;
     if (answer.status === 304) {
-      // Same release as last time. A failed verification stays refused until the release changes.
+      // Same release as last time. Unacceptable release metadata or contents stay
+      // refused until the release changes (download mismatches clear the ETag).
       next.error = null;
-      if (next.refusal) return next;
-      if (!next.pendingCandidate) {
-        // Nothing new upstream, but a target whose image is missing is rebuilt
-        // from the checksum it was verified with.
-        if (!next.target || await readyTarget(next, root)) return next;
-        next.pendingCandidate = targetCandidate(next.target, p);
-      }
+      if (next.refusal || !next.pendingCandidate) return next;
     } else {
       next.etag = answer.etag;
       next.refusal = null;
@@ -398,6 +417,9 @@ export async function checkForUpdate(state, c, { root, token, now = Date.now(), 
   } catch (error) {
     if (error instanceof UpdateRefusal) {
       next.refusal = { version: error.version, reason: error.reason, at: now };
+      // A download that did not match the published checksums says nothing
+      // about the release: drop the ETag so the next check fetches it afresh.
+      if (RETRIED_REFUSALS.has(error.reason)) Object.assign(next.refusal, { retry: true }), next.etag = null;
       next.pendingCandidate = null;
       next.error = null;
       return next;
@@ -434,7 +456,10 @@ async function cloneTree(source, dest, run) {
 }
 const exists = file => fs.access(file).then(() => true, () => false);
 async function writePrivateJson(file, value) {
-  await fs.writeFile(`${file}.tmp`, JSON.stringify(value), { mode: 0o600 });
+  // Exclusive create never follows or reuses whatever sits at the temporary name.
+  await fs.rm(`${file}.tmp`, { force: true });
+  const handle = await fs.open(`${file}.tmp`, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
+  try { await handle.writeFile(JSON.stringify(value)); } finally { await handle.close(); }
   await fs.rename(`${file}.tmp`, file);
 }
 
@@ -487,9 +512,21 @@ export async function rollSlot(directory, { image, version, overlayDir }, { run 
     await writePrivateJson(at(SLOT_UPDATE_JOURNAL), journal);
   }
   const entryName = e => typeof e === 'string' && !FORBIDDEN.test(e) && !KIT_OWNED.has(e) && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(e);
-  // Version 1 journals predate `added`; with none recorded, a rollback that
-  // finds an entry without its old copy fails closed.
-  if (journal?.version === 1) journal = { ...journal, version: 2, added: [] };
+  // Version 1 journals predate `added`. Swaps move the slot's own entry aside
+  // before the staged one moves in, so an entry with no kept old copy was
+  // added by the update: staged and not yet in place, or in place and no
+  // longer staged. The result is recorded before anything else happens.
+  if (journal?.version === 1 && Array.isArray(journal.entries) && journal.entries.every(e => typeof e === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(e))) {
+    const present = async leaf => fs.lstat(leaf).then(() => true, () => false);
+    const added = [];
+    for (const entry of journal.entries) {
+      if (await present(path.join(at(SLOT_UPDATE_OLD), entry))) continue;
+      const staged = await present(path.join(at(SLOT_UPDATE_NEW), entry));
+      if (staged !== await present(at(entry))) added.push(entry);
+    }
+    journal = { ...journal, version: 2, added };
+    await writePrivateJson(at(SLOT_UPDATE_JOURNAL), journal);
+  }
   if (journal?.version !== 2 || !VERSION.test(journal.to ?? '') || !Array.isArray(journal.entries) || !Array.isArray(journal.added) ||
       !journal.entries.every(entryName) || !journal.added.every(e => journal.entries.includes(e))) {
     throw new Error('Invalid runner update journal');
@@ -706,15 +743,17 @@ export async function pruneImages(root, p, directories, keep, { floor = null } =
     if (!version) return [];
     versions.add(version);
   }
-  const pattern = new RegExp(`^actions-runner-${p.name}-(\\d+\\.\\d+\\.\\d+)\\.image$`);
-  const removed = [];
+  // Images and their downloaded archives go together: an archive is kept only
+  // for a version that is still kept.
+  const pattern = new RegExp(`^actions-runner-${p.name}-(\\d+\\.\\d+\\.\\d+)\\.(image|${p.ext.replace('.', '\\.')})$`);
+  const removed = new Set();
   for (const name of await fs.readdir(root)) {
     const match = pattern.exec(name);
     if (!match || versions.has(match[1]) || compareVersions(match[1], floor) >= 0) continue;
     await fs.rm(path.join(root, name), { recursive: true, force: true });
-    removed.push(match[1]);
+    removed.add(match[1]);
   }
-  return removed;
+  return [...removed];
 }
 
 /** Health problems from the update state and the slots' deprecation evidence. */
