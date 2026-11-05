@@ -309,7 +309,7 @@ test('CLI dry-run is read-only, applies quotas before starts, and strips service
   try {
     await mkdir(join(root, 'runnerctl-app/bin'), { recursive: true });
     await mkdir(join(root, 'runnerctl-app/lib'), { recursive: true });
-    for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs', 'lib/runnerctl-platform.mjs']) {
+    for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs', 'lib/runnerctl-platform.mjs', 'lib/runnerctl-runner-update.mjs']) {
       await copyFile(new URL(`../${file}`, import.meta.url), join(root, 'runnerctl-app', file));
     }
     await mkdir(join(root, 'overlay'));
@@ -669,7 +669,7 @@ test('the background controller records GitHub auth failures and its token sourc
   try {
     await mkdir(join(root, 'runnerctl-app/bin'), { recursive: true });
     await mkdir(join(root, 'runnerctl-app/lib'), { recursive: true });
-    for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs', 'lib/runnerctl-platform.mjs']) {
+    for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs', 'lib/runnerctl-platform.mjs', 'lib/runnerctl-runner-update.mjs']) {
       await copyFile(new URL(`../${file}`, import.meta.url), join(root, 'runnerctl-app', file));
     }
     await mkdir(join(root, 'overlay'));

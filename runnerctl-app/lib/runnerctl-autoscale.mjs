@@ -28,9 +28,13 @@ export function validateConfig(raw, hardware) {
     cooldownSeconds: 120, lowLoad: 0.6, highLoad: 1,
     minFreeMemoryPercent: 10, cpuBudgetPercent: 80, pressureCpuBudgetPercent: 30,
     minCpuQuotaPercent: hardwareMinCpuQuota(hardware?.cpus), maxCpuQuotaPercent: 800, pressureQueueGraceSeconds: 60 };
-  const allowed = new Set([...Object.keys(defaults), 'scope', 'target', 'repositories', 'runners', 'labels', 'runnerGroupId', 'baselineRunners']);
+  const allowed = new Set([...Object.keys(defaults), 'scope', 'target', 'repositories', 'runners', 'labels', 'runnerGroupId', 'baselineRunners',
+    'runnerUpdates', 'runnerVersion']);
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !allowed.has(k))) fail();
-  const c = { ...defaults, baselineRunners: [], ...raw };
+  const c = { ...defaults, baselineRunners: [], runnerUpdates: 'auto', runnerVersion: null, ...raw };
+  // Runner updates: "auto" follows the latest release (or runnerVersion when
+  // pinned), "off" leaves every slot on the runner it has.
+  if (!['auto', 'off'].includes(c.runnerUpdates) || (c.runnerVersion !== null && (typeof c.runnerVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(c.runnerVersion)))) fail();
   const automatic = key => raw[key] === undefined || raw[key] === 'auto';
   if (!Array.isArray(c.baselineRunners)) fail();
   if (automatic('maxRunners')) {
@@ -275,7 +279,7 @@ export function decodeJit(c, name, data) {
   }
   if (metadata.ephemeral !== true || metadata.agentName !== name || metadata.agentId !== data.runner.id ||
       metadata.workFolder !== '_work' || metadata.gitHubUrl?.replace(/\/+$/, '').toLowerCase() !== `https://github.com/${c.target}`.toLowerCase()) throw new AutoscaleError('Invalid JIT identity');
-  // Update only between generations by preparing the kit; an updater exit must not replay JIT credentials.
+  // The controller rolls runner files between generations; an in-job updater exit must not replay JIT credentials.
   metadata.disableUpdate = true;
   files['.runner'] = JSON.stringify(metadata);
   return files;

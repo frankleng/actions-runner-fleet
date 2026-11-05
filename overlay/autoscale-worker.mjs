@@ -46,7 +46,9 @@ try {
   if (await exists('.runner') || await exists('.credentials') || await exists('.credentials_rsaparams')) throw new Error('Unfinished registration');
   await state('ready');
   while (!stopping) {
-    if (!await exists(request)) { await sleep(1000); continue; }
+    // The controller replaces runner files only between generations; never
+    // start a listener from a half-swapped bin/ or externals/.
+    if (!await exists(request) || await exists('.autoscale-update.json')) { await sleep(1000); continue; }
     await fs.rename(request, inflight);
     await state('running');
     const files = JSON.parse(await fs.readFile(inflight, 'utf8'));

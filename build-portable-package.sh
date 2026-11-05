@@ -81,6 +81,7 @@ runnerctl-app/lib/runnerctl-core.mjs
 runnerctl-app/lib/runnerctl-health.mjs
 runnerctl-app/lib/runnerctl-metrics.mjs
 runnerctl-app/lib/runnerctl-platform.mjs
+runnerctl-app/lib/runnerctl-runner-update.mjs
 runnerctl-app/lib/runnerctl-stats.mjs
 runnerctl-app/lib/runnerctl-table.mjs
 runnerctl-app/native/runnerctl-procstats.c

@@ -1,6 +1,8 @@
 # Shared Windows host-to-artifact mapping, the counterpart of platform.sh.
 # Dot-source this file; do not execute it. Compatible with Windows PowerShell 5.1.
-$RunnerVersion = if ($env:RUNNER_VERSION) { $env:RUNNER_VERSION } else { '2.336.0' }
+# Windows slots do not update automatically; bump this pinned version (and its
+# checksum from the release) to move them (README: Runner updates).
+$RunnerVersion = if ($env:RUNNER_VERSION) { $env:RUNNER_VERSION } else { '2.338.2' }
 
 $hostArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 if ($hostArchitecture -ne 'AMD64') {
@@ -9,7 +11,7 @@ if ($hostArchitecture -ne 'AMD64') {
 
 $RunnerPlatform = 'win-x64'
 $RunnerArchiveBasename = "actions-runner-win-x64-$RunnerVersion.zip"
-$RunnerArchiveSha256 = 'd59123a43003e357b0805b5d0f611d0bd2f65ab67d51bd070dd4e7a0f685c162'
+$RunnerArchiveSha256 = 'a1f17aa987fc8158bc7521d284912267a0d01b7c2c4684b33c86783b5e8221cc'
 $RunnerNodePlatform = 'win-x64'
 $RunnerNodeArch = 'x64'
 $RunnerPulumiPlatform = 'windows-x64'

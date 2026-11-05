@@ -35,8 +35,9 @@ or an interactive login.
 
 ## What gets installed
 
-- GitHub Actions Runner `2.336.0` for Linux x64, macOS arm64, or Windows x64,
-  verified by SHA-256
+- GitHub Actions Runner `2.338.2` for Linux x64, macOS arm64, or Windows x64,
+  verified by SHA-256; autoscale slots on Linux and macOS then follow newer
+  verified releases ([Runner updates](#runner-updates))
 - One isolated directory and background service per runner (a lingering systemd
   user service on Linux, a system LaunchDaemon on macOS, or a per-user scheduled
   task on Windows); runner binaries are copy-on-write clones
@@ -91,8 +92,8 @@ Every push to `main` publishes a release with a kit for each supported host.
 Open this repository's **Releases** page and download the kit for your host and
 its checksum, for example on Apple-silicon macOS:
 
-- `actions-runner-fleet-kit-macos-arm64-2.336.0.tar.gz`
-- `actions-runner-fleet-kit-macos-arm64-2.336.0.tar.gz.sha256`
+- `actions-runner-fleet-kit-macos-arm64-2.338.2.tar.gz`
+- `actions-runner-fleet-kit-macos-arm64-2.338.2.tar.gz.sha256`
 
 Ubuntu/Linux x86_64 hosts use the matching `linux-x64` kit. The examples below
 use the macOS kit; substitute `linux-x64` and `sha256sum -c` on Linux.
@@ -106,9 +107,9 @@ cd actions-runner-download
 gh release download \
   --repo "$GITHUB_REPOSITORY" \
   --pattern 'actions-runner-fleet-kit-macos-arm64-*.tar.gz*'
-shasum -a 256 -c actions-runner-fleet-kit-macos-arm64-2.336.0.tar.gz.sha256
-tar -xzf actions-runner-fleet-kit-macos-arm64-2.336.0.tar.gz
-mv actions-runner-fleet-kit-macos-arm64-2.336.0 ../actions-runner
+shasum -a 256 -c actions-runner-fleet-kit-macos-arm64-2.338.2.tar.gz.sha256
+tar -xzf actions-runner-fleet-kit-macos-arm64-2.338.2.tar.gz
+mv actions-runner-fleet-kit-macos-arm64-2.338.2 ../actions-runner
 cd ../actions-runner
 ```
 
@@ -619,8 +620,8 @@ Use `--prepare --no-enable` for preparation without activation. Existing matchin
 left alone, so setup can resume after provisioning additional names. A failed
 local provisioning step may require `./runnerctl --cli install-service NAME`
 to complete installation. Run the controller as the user that owns these
-services. Keep the kit and runner software up to date between generations;
-automatic in-job runner updates are disabled for this pool.
+services. The runner's own in-job updater stays disabled; the controller
+updates slots itself between generations (see [Runner updates](#runner-updates)).
 
 Authenticate `gh` for `github.com`, or provide a token through the
 `RUNNER_AUTOSCALE_TOKEN` environment variable using your secret manager. For
@@ -741,6 +742,8 @@ hosts can claim queued jobs first.
 | `pressureCpuBudgetPercent` | 30 | Pool CPU budget under host pressure |
 | `pressureQueueGraceSeconds` | 60 | Under CPU pressure, how long a queued job waits before it gets a runner anyway |
 | `minCpuQuotaPercent` / `maxCpuQuotaPercent` | `auto` / 800 | Per-runner quota bounds; 100% means one logical CPU. The automatic floor is an eighth of the host, between 100% and 400%, and never above the ceiling |
+| `runnerUpdates` | `auto` | `auto` moves slots to newer verified runner releases; `off` leaves every slot on the runner it has ([Runner updates](#runner-updates)) |
+| `runnerVersion` | none | Pin slots to this exact release (for example `"2.338.2"`) instead of the latest; slots never move backwards |
 
 The CPU budget is divided among the runners expected to work: busy ones plus
 those about to take queued jobs. Idle warm listeners use no CPU, so they do not
@@ -806,6 +809,80 @@ API references: [workflow runs](https://docs.github.com/en/rest/actions/workflow
 [workflow jobs](https://docs.github.com/en/rest/actions/workflow-jobs), and
 [JIT runner configuration](https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-an-organization).
 
+### Runner updates
+
+GitHub deprecates old runner versions and then refuses their listeners
+(`Runner version vX is deprecated and cannot receive messages`). The pinned
+version in `platform.sh` and `platform.ps1` is only the bootstrap version for
+fresh installs; the background controller keeps autoscale slots current:
+
+- **Discovery.** Every four hours, and at once (at most every 15 minutes) when a
+  slot's listener reports the deprecation error, the controller asks
+  `GET /repos/actions/runner/releases/latest` with the same token it polls
+  with. The ETag makes an unchanged answer free of rate limit. Drafts and
+  prereleases are ignored. With `runnerVersion` it asks for that tag instead.
+- **Verification.** It downloads the platform archive from
+  `https://github.com/actions/runner/releases/download/...` (the URL is built
+  from the version, never taken from the API) and trusts it only when its
+  SHA-256 equals both the release-notes checksum
+  (`<!-- BEGIN SHA linux-x64 -->…`) and the asset's `digest`. A missing or
+  mismatched checksum refuses the release: nothing is extracted, slots keep
+  their version, and `runnerctl health` reports `runner-update-refused`.
+- **Image.** A verified archive is kept beside the bootstrap one and extracted
+  to `actions-runner-<platform>-<version>.image` through a staging directory
+  and one rename, like `manage-runners.sh`. The target version is recorded in
+  the private `.autoscale-runner-update.json` (mode `0600`, ignored by Git, the
+  security audit, and the package builder like other `.autoscale*` state).
+- **Slot roll.** A slot takes the new files only between generations: no
+  handoff, credentials, listener, or job. Idle slots update a few per poll, and
+  any outdated slot updates right before its next registration. Only the
+  archive's entries move (`bin/`, `externals/`, `config.sh`, `run.sh`,
+  `run-helper.*`, `safe_sleep.sh`); the kit's overlay is laid onto the new
+  `bin/` first, and `env.sh`, `svc.sh`, `runsvc.sh`, `.autoscale*` lifecycle
+  files, job hooks, tools, `_work`, `_diag`, `.env` and `.path` stay. New files
+  are staged inside the slot; the journal `.autoscale-update.json` is the commit
+  point. A crash before it leaves the old version; after it, the next poll rolls
+  forward. A journal that cannot be completed keeps the slot out of service
+  (`slot-update-interrupted`), and the worker never starts a listener while it
+  exists. Once no runner directory uses an older image, it is deleted; the
+  target and bootstrap images stay.
+- **No wasted registrations.** After GitHub refuses a version, the controller
+  registers no slot still on it.
+
+Set `"runnerUpdates": "off"` to stop all of this, or `"runnerVersion":
+"2.338.2"` to hold slots on one release; the next poll applies either. Updated
+worker scripts take effect when a slot's supervisor next restarts.
+
+Windows slots stay on the version pinned in `platform.ps1`: each slot's
+supervisor runs `node.exe` from the slot's own `externals`, which Windows will
+not rename while it runs. To move Windows slots, bump `$RunnerVersion` and
+`$RunnerArchiveSha256` (verified against both release checksums), run
+`.\prepare.ps1`, and recreate the slots while idle. The controller still stops
+registering slots on a version GitHub refuses, and health reports them.
+
+#### Recovering from a deprecated runner version
+
+When GitHub deprecates the running version, every listener exits with the error
+above and its slot parks as blocked (`Autoscale slot blocked; inspect local
+runner diagnostics. No generation will be replayed.`). The controller recovers
+such a slot by itself only when the slot's own files prove that cause: it is
+blocked with its consumed handoff and nothing newer, exactly one listener log
+and no job log started after the handoff, that log reports the deprecation of
+the version on disk, and it shows no job message. Once a verified newer
+runner is ready, it removes the orphan registration if GitHub lists it as
+offline and idle under the same id (none listed counts as removed), stops the
+parked supervisor, confirms its lock is free, deletes the dead credentials and
+handoff, marks the slot ready, updates its files, and lets it take a fresh JIT
+registration. Credentials are never replayed. Every other blocked slot,
+including one whose listener had started a job when it was refused, stays
+blocked for the manual steps under [Troubleshooting](#troubleshooting).
+
+```bash
+cat .autoscale-runner-update.json   # target, refusal, or error; never a token
+./runnerctl health --dry-run        # slot-blocked details name deprecated slots
+journalctl --user -u 'runnerctl-autoscale-*' -n 50 --no-pager | grep -i runner
+```
+
 ## Health alerts
 
 `runnerctl health` checks every registered runner, every autoscale slot, and
@@ -814,6 +891,11 @@ the autoscale controller. It looks for:
 - services that are not active
 - service units with unfilled `{{...}}` placeholders, which fail at boot with `status=217/USER`
 - slots parked as blocked, or holding an unresolved registration reservation
+- a runner update that was interrupted mid-roll (`slot-update-interrupted`), a
+  release refused by checksum verification (`runner-update-refused`), release
+  checks or downloads that keep failing (`runner-update-failing`), and slots
+  refused for a deprecated runner with no verified update ready
+  (`runner-deprecated`, on the shorter autoscaler threshold)
 - persistent runners that are offline or unregistered at GitHub
 - a stopped autoscale controller
 - a running controller whose GitHub calls fail authentication (HTTP 401/403) or
@@ -1123,6 +1205,27 @@ scripts need Linux or macOS.
   controller's labels have queued while none of its runners is online. Check the
   controller journal for registration or slot errors (blocked or quarantined
   slots), and `./runnerctl autoscale --dry-run`.
+- **Health alert `runner-deprecated` or `runner-update-refused`:** GitHub
+  refuses the slots' runner version and no verified newer runner is ready.
+  `cat .autoscale-runner-update.json` shows whether updates are `off`, the
+  release was refused (and why), or downloads fail. Never bypass verification;
+  a refused release usually means GitHub has not yet published both checksums,
+  and the next check retries. See
+  [Recovering from a deprecated runner version](#recovering-from-a-deprecated-runner-version).
+- **A slot stays `slot-blocked` after a deprecation:** its listener had taken a
+  job, or its evidence is incomplete, so it is left for you. Confirm no listener,
+  job, or job child process remains (`pgrep -af .runners/NAME/`), delete its
+  registration if GitHub still lists it (`gh api -X DELETE
+  orgs/ORG/actions/runners/ID`, the id from `.autoscale-generation.json`), run
+  `./svc.sh stop` in the slot, remove `.runner`, `.credentials`,
+  `.credentials_rsaparams` and `.autoscale-inflight.json`, write
+  `{"phase":"ready"}` to `.autoscale-state.json`, and leave it stopped: the
+  controller updates its files and starts it before its next registration.
+- **Health alert `slot-update-interrupted`:** a runner file roll stopped after
+  its commit point and the controller could not finish it. Inspect
+  `.autoscale-update.json`, `.autoscale-update-new/` and `.autoscale-update-old/`
+  in the slot; with the slot idle, either move the staged entries into place or
+  restore the old ones, then delete the journal and both directories.
 - **Health alert `autoscaler-stale`:** the controller service is active but has
   not finished a poll for several intervals, so it is probably hung; inspect its
   journal, then restart it with `./runnerctl autoscale --enable`. Right after an

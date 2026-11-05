@@ -11,6 +11,9 @@ import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, pla
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
 import { filePrivate, restrictToOwner, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
+import { checkDue, checkForUpdate, readUpdateState, writeUpdateState, readyTarget, rollSlot, diagnoseBlockedSlot, orphanDecision, pruneImages,
+  bootstrapVersion, runnerPlatform, rollSupported, compareVersions, runnerFilesVersion, SLOT_UPDATE_JOURNAL } from '../lib/runnerctl-runner-update.mjs';
+import { acquireLock } from '../../overlay/autoscale-lock.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -122,7 +125,21 @@ async function localRunners(c) {
     const generation = await readJson(path.join(directory, '.autoscale-generation.json'));
     const phase = (await readJson(path.join(directory, '.autoscale-state.json'), { phase: 'ready' })).phase;
     if (!['running', 'ready', 'blocked'].includes(phase)) throw new AutoscaleError('Invalid slot state');
-    if (phase === 'blocked') throw new AutoscaleError('Slot blocked; inspect its local lifecycle files');
+    const runnerVersion = await runnerFilesVersion(directory);
+    if (phase === 'blocked') {
+      // Only a listener GitHub refused for a deprecated runner, proven from the
+      // slot's own diagnostics, is a candidate for automatic recovery.
+      const diagnosis = await diagnoseBlockedSlot(directory);
+      if (diagnosis.cause !== 'deprecated-runner') throw new AutoscaleError('Slot blocked; inspect its local lifecycle files');
+      result.set(name, { directory, running: status === 'running', quota, active: true, phase, unavailable: true, runnerVersion, deprecated: diagnosis });
+      continue;
+    }
+    if (await fs.access(path.join(directory, SLOT_UPDATE_JOURNAL)).then(() => true, () => false)) {
+      // A runner roll was interrupted; only finishing it returns the slot to service.
+      if (inflight || request || runner || phase !== 'ready') throw new AutoscaleError('Slot blocked; inspect its local lifecycle files');
+      result.set(name, { directory, running: status === 'running', quota, id: generation?.id, active: true, phase, unavailable: true, runnerVersion, updatePending: true });
+      continue;
+    }
     const reservationPath = path.join(directory, '.autoscale-reservation.json');
     if (await readJson(reservationPath)) {
       // Only a reservation with nothing handed to the slot can be resolved automatically.
@@ -130,7 +147,7 @@ async function localRunners(c) {
         await fs.access(path.join(directory, '.credentials_rsaparams')).then(() => true, () => false);
       if (inflight || request || runner || credentials || phase !== 'ready') throw new AutoscaleError('Slot blocked; inspect its local lifecycle files');
       const { mtimeMs } = await fs.stat(reservationPath);
-      result.set(name, { directory, running: status === 'running', quota, id: generation?.id, active: false, phase,
+      result.set(name, { directory, running: status === 'running', quota, id: generation?.id, active: false, phase, runnerVersion,
         unavailable: true, reservation: { path: reservationPath, createdAt: mtimeMs } });
       continue;
     }
@@ -138,7 +155,7 @@ async function localRunners(c) {
     if (active && status === 'stopped') throw new AutoscaleError('Active generation has no running service; manual recovery required');
     if (runner && runner.ephemeral !== true) throw new AutoscaleError('Persistent registration in an ephemeral slot');
     const id = runner?.agentId ?? (inflight || request ? JSON.parse((inflight || request)['.runner']).agentId : generation?.id);
-    result.set(name, { directory, running: status === 'running', quota, id, active, phase });
+    result.set(name, { directory, running: status === 'running', quota, id, active, phase, runnerVersion });
     } catch {
       // Unknown slots consume capacity conservatively, but never receive commands.
       result.set(name, { active: true, phase: 'blocked', unavailable: true });
@@ -185,6 +202,118 @@ async function resolveReservations(c, api, local) {
   if (resolved) console.error(`${resolved} ambiguous registration(s) resolved; slot(s) returned to service`);
   if (pending) console.error(`${pending} ambiguous registration(s) awaiting resolution`);
 }
+// Runner updates. Windows slots stay on the pinned version (see README).
+const updatePlatform = rollSupported() ? runnerPlatform() : null;
+const overlayDir = path.join(root, 'overlay');
+const ROLLS_PER_POLL = 4;
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+let updateState = { version: 1 };
+let updateTask = null;
+let lastPruneAt = 0;
+const updateAbort = new AbortController();
+// Writes are serialized; each writes the newest state.
+let updateSaved = Promise.resolve();
+function saveUpdateState(next) {
+  updateState = next;
+  updateSaved = updateSaved.then(() => writeUpdateState(root, updateState)).catch(() => console.error('Could not write runner update state'));
+  return updateSaved;
+}
+// Release checks run beside polls, so a download never holds up CPU control.
+function startUpdateCheck(c, tokenValue, deprecationSeen) {
+  if (!updatePlatform || updateTask || quitting) return;
+  const due = checkDue(updateState, c, Date.now(), { deprecationSeen });
+  if (!due) return;
+  const before = updateState.target?.version ?? null;
+  updateTask = checkForUpdate(updateState, c, { root, token: tokenValue, forced: due === 'forced', p: updatePlatform, signal: updateAbort.signal })
+    .then(async next => {
+      // Deprecation evidence may have arrived meanwhile.
+      await saveUpdateState({ ...next, deprecated: updateState.deprecated ?? null });
+      if (next.target && next.target.version !== before) console.error(`Runner ${next.target.version} verified; slots take it between generations`);
+      if (next.refusal) console.error('Runner update refused; keeping the current runner version (see runnerctl health)');
+      else if (next.error) console.error('Runner update check failed; retrying later');
+    })
+    .catch(() => console.error('Runner update check failed; retrying later'))
+    .finally(() => { updateTask = null; });
+}
+const versionDeprecated = version => !!(version && updateState.deprecated && compareVersions(version, updateState.deprecated.version) <= 0);
+const outdated = (slot, target) => !!(target && slot.runnerVersion && compareVersions(slot.runnerVersion, target.version) < 0);
+async function rollToTarget(slot, target) {
+  try { slot.runnerVersion = await rollSlot(slot.directory, { image: target?.image, version: target?.version, overlayDir }); }
+  catch (error) {
+    // Past the journal the slot is neither version; keep it out of service.
+    if (await fs.access(path.join(slot.directory, SLOT_UPDATE_JOURNAL)).then(() => true, () => false)) Object.assign(slot, { unavailable: true, updatePending: true });
+    throw error;
+  }
+}
+async function writeSlotPhase(directory, phase) {
+  await fs.writeFile(path.join(directory, '.autoscale-state.tmp'), JSON.stringify({ phase }), { mode: 0o600 });
+  await fs.rename(path.join(directory, '.autoscale-state.tmp'), path.join(directory, '.autoscale-state.json'));
+}
+// A deprecation-blocked slot ran no job, and its one-use credentials are dead.
+// It never replays them: its orphan registration is removed, its parked
+// supervisor stopped, and the consumed generation cleared so the slot can take
+// a fresh JIT registration once its runner files are current.
+async function recoverDeprecated(c, api, name, slot, remote) {
+  const decision = orphanDecision(name, slot.deprecated.agentId, remote);
+  if (decision.action === 'keep') return false;
+  if (decision.action === 'delete') await api.remove(c, decision.id);
+  await command('./svc.sh', ['stop'], slot.directory);
+  // The worker holds this lock while it lives; taking it proves it is gone.
+  let release;
+  try { release = await acquireLock(slot.directory, '.autoscale-worker.lock'); }
+  catch { throw new AutoscaleError('Slot supervisor still running'); }
+  try {
+    const again = await diagnoseBlockedSlot(slot.directory);
+    if (again.cause !== 'deprecated-runner' || again.agentId !== slot.deprecated.agentId) throw new AutoscaleError('Slot evidence changed');
+    for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-inflight.json']) await fs.rm(path.join(slot.directory, leaf), { force: true });
+    await writeSlotPhase(slot.directory, 'ready');
+  } finally { await release(); }
+  Object.assign(slot, { active: false, phase: 'ready', unavailable: false, running: false, id: undefined, deprecated: undefined });
+  return true;
+}
+// Generation-boundary work before the poll's registrations: finish interrupted
+// rolls, recover deprecation-blocked slots, and update idle outdated slots.
+async function maintainRunnerFiles(c, api, local, target) {
+  let budget = ROLLS_PER_POLL;
+  let interrupted = 0;
+  for (const slot of local.values()) {
+    if (!slot.updatePending || quitting) continue;
+    try { await rollToTarget(slot, target); Object.assign(slot, { unavailable: false, active: false, updatePending: false }); budget--; }
+    catch { interrupted++; }
+  }
+  if (interrupted) console.error(`${interrupted} slot(s) hold an interrupted runner update; inspect .autoscale-update.json and the slot's bin/`);
+  if (c.runnerUpdates !== 'off' && target) {
+    const deprecated = [...local.entries()].filter(([, s]) => s.deprecated && compareVersions(target.version, s.deprecated.version) > 0);
+    if (deprecated.length) {
+      const remote = await api(runnerListEndpoint(c), 'runners');
+      let recovered = 0;
+      for (const [name, slot] of deprecated) {
+        if (quitting || budget <= 0) break;
+        try { if (await recoverDeprecated(c, api, name, slot, remote)) recovered++; }
+        catch { continue; }
+        budget--;
+        try { await rollToTarget(slot, target); } catch { console.error('Runner update failed for a recovered slot; it updates before its next registration'); }
+      }
+      if (recovered) console.error(`${recovered} slot(s) recovered from a deprecated runner version without replaying credentials`);
+    }
+  }
+  if (c.runnerUpdates === 'off' || !target) return;
+  for (const slot of local.values()) {
+    if (quitting || budget <= 0) break;
+    if (slot.unavailable || slot.active || slot.phase !== 'ready' || slot.reservation || !outdated(slot, target)) continue;
+    budget--;
+    try { await rollToTarget(slot, target); }
+    catch { console.error('Runner update failed for an idle slot; it retries before its next registration'); }
+  }
+  if (Date.now() - lastPruneAt >= PRUNE_INTERVAL_MS) {
+    lastPruneAt = Date.now();
+    try {
+      const registry = parseRegistry(await fs.readFile(path.join(root, 'runners.tsv'), 'utf8'));
+      const removed = await pruneImages(root, updatePlatform, registry.map(r => path.resolve(r.directory)), [target.version, await bootstrapVersion(root)]);
+      if (removed.length) console.error(`Removed ${removed.length} unused runner image(s)`);
+    } catch { console.error('Unused runner images could not be pruned'); }
+  }
+}
 let cachedToken;
 // Which source the last token came from (env, file, gh); never the value.
 let tokenSource = null;
@@ -228,8 +357,8 @@ async function recordHealth(poll) {
     healthWritten = { state: health, at: poll.at };
   } catch { console.error('Could not write autoscaler health state'); }
 }
-process.on('SIGTERM', () => { quitting = true; sleeper?.abort(); });
-process.on('SIGINT', () => { quitting = true; sleeper?.abort(); });
+process.on('SIGTERM', () => { quitting = true; sleeper?.abort(); updateAbort.abort(); });
+process.on('SIGINT', () => { quitting = true; sleeper?.abort(); updateAbort.abort(); });
 let c;
 try {
   const initialRaw = JSON.parse(await fs.readFile(configPath, 'utf8'));
@@ -297,6 +426,13 @@ try {
     const reportHealth = apply && watch;
     // A restart keeps the failure clocks running, so a crash loop still alerts.
     if (reportHealth) health = await readJson(healthPath).catch(() => null);
+    if (apply) {
+      updateState = await readUpdateState(root);
+      // Leftovers of an interrupted download or extraction; this controller holds the kit lock.
+      for (const leaf of await fs.readdir(root)) {
+        if (/^\.autoscale-runner-(download|image)\./.test(leaf)) await fs.rm(path.join(root, leaf), { recursive: true, force: true });
+      }
+    }
     do {
       let localReport;
       let api;
@@ -311,6 +447,11 @@ try {
         }
         catch { console.error('Config reload rejected; retaining previous configuration'); }
         const local = await localRunners(c);
+        // GitHub refused a listener for its runner version: remember the
+        // version so no further registration is spent on it.
+        const refused = [...local.values()].filter(s => s.deprecated).map(s => s.deprecated.version)
+          .sort(compareVersions).at(-1);
+        if (apply && refused && !versionDeprecated(refused)) await saveUpdateState({ ...updateState, deprecated: { version: refused, seenAt: Date.now() } });
         for (const name of state.failedStarts || []) {
           const slot = local.get(name);
           if (slot) { slot.unavailable = true; slot.active = true; slot.phase = 'blocked'; }
@@ -335,10 +476,15 @@ try {
           pressure: policy.pressure, cpuQuotaPercent: policy.quota };
         // Local CPU control is complete before any authentication or GitHub calls.
         if (Date.now() < githubNotBefore) throw Object.assign(new AutoscaleError('GitHub reads paused near the token rate limit; local CPU control continues'), { githubKind: 'rate-limit' });
-        try { api = githubClient(await token(), fetch, etags); }
+        let tokenValue;
+        try { tokenValue = await token(); api = githubClient(tokenValue, fetch, etags); }
         finally { poll.tokenSource = tokenSource; }
+        let target = null;
         if (apply && !quitting) {
+          startUpdateCheck(c, tokenValue, !!refused);
+          target = updatePlatform && c.runnerUpdates !== 'off' ? await readyTarget(updateState, root) : null;
           await resolveReservations(c, api, local);
+          await maintainRunnerFiles(c, api, local, target);
           unavailable = [...local.values()].filter(r => r.unavailable).length;
         }
         const data = await snapshot(c, api, local);
@@ -362,6 +508,13 @@ try {
             if (quitting) break;
             const slot = local.get(name);
             if (slot.unavailable) continue;
+            // Runner files change only here, between generations, before the next registration.
+            if (outdated(slot, target)) {
+              try { await rollToTarget(slot, target); }
+              catch { console.error('Runner update failed before a registration; slot skipped this poll'); continue; }
+            }
+            // A version GitHub refuses would only burn a one-use registration.
+            if (versionDeprecated(slot.runnerVersion)) continue;
             try {
             // Start only the parked supervisor, never a reused listener identity.
             if (!slot.running) await command('./svc.sh', ['start'], slot.directory);
@@ -383,7 +536,8 @@ try {
         console.log(JSON.stringify({ mode: apply ? 'apply' : 'dry-run', queued: p.queued, waiting: p.waiting, active: p.active, unavailable,
           busy: p.busy, desired: p.desired, pressure: p.pressure, cpuQuotaPercent: p.quota,
           loadPerCpu: Math.round(host.load * 100) / 100, plannedStarts: p.start.length,
-          retiring: p.retiring, started, ...(Number.isFinite(api.rate.remaining) ? { rateRemaining: api.rate.remaining } : {}) }));
+          retiring: p.retiring, started, ...(Number.isFinite(api.rate.remaining) ? { rateRemaining: api.rate.remaining } : {}),
+          ...(target ? { runnerTarget: target.version, outdated: [...local.values()].filter(s => outdated(s, target)).length } : {}) }));
       } catch (error) {
         const failure = githubFailure(error);
         if (failure) Object.assign(poll, { outcome: 'failed', failure });
@@ -406,6 +560,8 @@ try {
   console.error(error instanceof AutoscaleError ? error.message : 'Autoscaler setup failed; check the config file and local filesystem permissions.');
   process.exitCode = 1;
 } finally {
+  // A signal already aborted any download; a one-off poll lets its check finish.
+  await updateTask;
   if (releaseLock) await releaseLock();
   if (configureAfter) {
     try {

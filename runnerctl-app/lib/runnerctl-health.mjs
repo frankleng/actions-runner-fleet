@@ -1,6 +1,7 @@
 // Fleet health: turn per-runner facts into problems, and decide when a problem
 // has lasted long enough to alert. Everything here is pure so it can be tested
 // without systemd, GitHub, or a webhook.
+import { runnerUpdateProblems } from './runnerctl-runner-update.mjs';
 
 export const DEFAULT_THRESHOLD_MS = 30 * 60 * 1000;
 // Autoscaler outages stop every job for the org, so they alert sooner.
@@ -67,8 +68,10 @@ export function autoscalerHealthProblems(health, { now, thresholdMs = DEFAULT_AU
 /**
  * facts: [{ name, kind: 'persistent'|'ephemeral', org, unitActive, unitUnrendered,
  *   phase, reservedSince, github: 'online'|'offline'|'missing'|'unknown' }]
- * autoscaler: { configured, active, org, health? } — health is the controller's
+ * autoscaler: { configured, active, org, health?, runnerUpdate? } — health is the controller's
  *   parsed report, or null when missing; omit it to skip those checks.
+ *   runnerUpdate is the controller's .autoscale-runner-update.json, when present.
+ * Ephemeral facts may carry blockedCause ('deprecated-runner') and updateInterrupted.
  * options: { now, autoscaleThresholdMs, thresholdMs } for the controller report.
  */
 export function findProblems(facts, autoscaler, options = {}) {
@@ -78,7 +81,12 @@ export function findProblems(facts, autoscaler, options = {}) {
     if (f.unitUnrendered) add('unrendered-unit', f.name, f.org, 'service unit contains unfilled {{...}} placeholders; it fails at boot with status=217/USER');
     if (!f.unitActive) add('service-down', f.name, f.org, 'runner service is not active');
     if (f.kind === 'ephemeral') {
-      if (f.phase === 'blocked') add('slot-blocked', f.name, f.org, 'autoscale slot is parked as blocked and will not receive work');
+      if (f.phase === 'blocked') {
+        add('slot-blocked', f.name, f.org, f.blockedCause === 'deprecated-runner'
+          ? 'GitHub refused this slot\'s listener for a deprecated runner version before any job; the controller recovers it once a verified newer runner is ready'
+          : 'autoscale slot is parked as blocked and will not receive work');
+      }
+      if (f.updateInterrupted) add('slot-update-interrupted', f.name, f.org, 'a runner file update was interrupted; the slot stays out of service until the controller completes it');
       if (f.reservedSince != null) add('slot-reserved', f.name, f.org, 'ambiguous registration reservation has not been resolved', new Date(f.reservedSince).toISOString());
     } else if (f.github === 'offline') {
       add('runner-offline', f.name, f.org, 'persistent runner is offline at GitHub');
@@ -88,6 +96,12 @@ export function findProblems(facts, autoscaler, options = {}) {
       // A failed check is not a healthy runner: expired tokens and a locked keyring look like this.
       add('runner-unverified', f.name, f.org, 'could not confirm the runner is online at GitHub (token or API failure)');
     }
+  }
+  // Runner updates: refused or failing releases, and deprecated runners with no update ready.
+  const deprecatedSlots = facts.filter(f => f.phase === 'blocked' && f.blockedCause === 'deprecated-runner').length;
+  for (const { kind, detail, startedAt, urgent } of runnerUpdateProblems(autoscaler.runnerUpdate, { deprecatedSlots })) {
+    add(kind, 'runnerctl-autoscale', autoscaler.org ?? null, detail, startedAt != null ? iso(startedAt) : undefined,
+      { ...(startedAt != null ? { startedAt } : {}), ...(urgent ? { thresholdMs: options.autoscaleThresholdMs ?? DEFAULT_AUTOSCALE_THRESHOLD_MS } : {}) });
   }
   if (autoscaler.configured && !autoscaler.active) add('autoscaler-down', 'runnerctl-autoscale', autoscaler.org ?? null, 'autoscale controller service is not active');
   const autoscaleHold = kind => problems.push({ key: `hold:${kind}:runnerctl-autoscale`, kind, runner: 'runnerctl-autoscale',
@@ -188,6 +202,13 @@ const CHECKS = {
   'unrendered-unit': runner => [`grep -n '{{' ~/.config/systemd/user/actions.runner.*${runner}.service`, `./manage-runners.sh reconcile ${runner}   # re-renders from the kit template (changes files)`],
   'service-down': runner => [`systemctl --user status 'actions.runner.*${runner}.service'`, `journalctl --user -u 'actions.runner.*${runner}.service' -n 80 --no-pager`],
   'slot-blocked': runner => [`cat .runners/${runner}/.autoscale-state.json`, `ls -la .runners/${runner}/   # never print .credentials*, .runner or .autoscale-request/inflight`],
+  'slot-update-interrupted': runner => [`ls -la .runners/${runner}/ .runners/${runner}/.autoscale-update-new .runners/${runner}/.autoscale-update-old`,
+    `cat .runners/${runner}/.autoscale-update.json`, `journalctl --user -u 'runnerctl-autoscale-*' -n 100 --no-pager`],
+  'runner-update-refused': () => [`cat .autoscale-runner-update.json   # refusal reason and version`,
+    `gh api repos/actions/runner/releases/latest --jq '.tag_name, (.assets[] | [.name, .digest] | @tsv)'`],
+  'runner-update-failing': () => [`cat .autoscale-runner-update.json`, `journalctl --user -u 'runnerctl-autoscale-*' -n 100 --no-pager`],
+  'runner-deprecated': () => [`cat .autoscale-runner-update.json   # runnerUpdates off, refused, or still downloading?`,
+    `grep -h 'is deprecated' .runners/*/_diag/Runner_*.log | tail -3`, `# README: Recovering from a deprecated runner version`],
   'slot-reserved': runner => [`ls -la --time-style=full-iso .runners/${runner}/.autoscale-reservation.json`, `journalctl --user -u 'runnerctl-autoscale-*' -n 100 --no-pager`],
   'runner-offline': runner => [`systemctl --user status 'actions.runner.*${runner}.service'`, `journalctl --user -u 'actions.runner.*${runner}.service' -n 80 --no-pager`],
   'runner-unverified': () => [`gh auth status   # a locked keyring or expired token hides runner status`, `./runnerctl health --dry-run`],

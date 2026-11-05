@@ -22,5 +22,6 @@
     "X64"
   ],
   "runnerGroupId": 1,
-  "baselineRunners": []
+  "baselineRunners": [],
+  "runnerUpdates": "auto"
 }

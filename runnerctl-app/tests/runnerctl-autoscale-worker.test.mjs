@@ -125,6 +125,23 @@ test('failed generation remains blocked across supervisor restart and is never r
   } finally { await f.cleanup(); }
 });
 
+test('a handoff waits while runner files are mid-update, then starts once', { timeout: 10000 }, async () => {
+  const f = await setup();
+  try {
+    f.launch();
+    await until(() => f.phase('ready'));
+    await fs.writeFile(f.file('.autoscale-update.json'), '{}');
+    await f.request();
+    await sleep(1500);
+    assert.equal(await f.exists('accepted'), false);
+    assert.equal(await f.exists('.autoscale-request.json'), true);
+    assert.equal(await f.phase('ready'), true);
+    await fs.rm(f.file('.autoscale-update.json'));
+    await until(() => f.exists('accepted'));
+    assert.equal(await fs.readFile(f.file('starts'), 'utf8'), 'started\n');
+  } finally { await f.cleanup(); }
+});
+
 test('persistent handoff is rejected before a listener can start', { timeout: 10000 }, async () => {
   const f = await setup();
   try {

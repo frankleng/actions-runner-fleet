@@ -38,6 +38,16 @@ chmod +x "${temp_dir}/security-audit.sh"
   fi
   grep -Fq "machine-local or credential-bearing path" audit.err
   git rm --cached -q .autoscale-inflight.json
+  # Runner update state and a slot's roll journal are private like other .autoscale* state.
+  for state_file in .autoscale-runner-update.json .autoscale-update.json; do
+    printf '%s\n' '{}' > "${state_file}"
+    git add "${state_file}"
+    if ./security-audit.sh >audit.err 2>&1; then
+      echo "expected security audit to reject ${state_file}"
+      exit 1
+    fi
+    git rm --cached -q "${state_file}"
+  done
 
   {
     printf '%s\n' "# intentionally fake credential-shaped test data"

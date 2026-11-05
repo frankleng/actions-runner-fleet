@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { parseRegistry } from '../lib/runnerctl-core.mjs';
 import { acquireLock } from '../../overlay/autoscale-lock.mjs';
 import { filePrivate, kitTaskCommandLine, POWERSHELL_ARGS, serviceActive, windowsPowerShell, windowsTaskState } from '../lib/runnerctl-platform.mjs';
+import { diagnoseBlockedSlot, SLOT_UPDATE_JOURNAL, UPDATE_STATE_FILE } from '../lib/runnerctl-runner-update.mjs';
 import { findProblems, planAlert, groupByOrg, githubRunnerPath, renderAlertMarkdown, realProblems, DEFAULT_THRESHOLD_MS, DEFAULT_AUTOSCALE_THRESHOLD_MS } from '../lib/runnerctl-health.mjs';
 
 const exec = promisify(execFile);
@@ -120,6 +121,8 @@ async function gatherFacts() {
       fact.phase = (await readJson(path.join(directory, '.autoscale-state.json'), { phase: 'ready' })).phase;
       const reservation = await fs.stat(path.join(directory, '.autoscale-reservation.json')).catch(() => null);
       if (reservation) fact.reservedSince = reservation.mtimeMs;
+      if (fact.phase === 'blocked') fact.blockedCause = (await diagnoseBlockedSlot(directory)).cause;
+      if (await exists(path.join(directory, SLOT_UPDATE_JOURNAL))) fact.updateInterrupted = true;
     } else {
       // Read only the identity fields; this file is never printed.
       const runner = await readJson(path.join(directory, '.runner'));
@@ -134,8 +137,9 @@ async function gatherFacts() {
   const configured = windows ? await windowsTaskState(autoscaleUnit) !== null : await exists(path.join(unitDir, autoscaleUnit));
   // The controller's own report; unreadable counts as missing, which health reports.
   const health = await readJson(path.join(root, '.autoscale-health.json')).catch(() => null);
+  const runnerUpdate = await readJson(path.join(root, UPDATE_STATE_FILE)).catch(() => null);
   const autoscaler = { configured, active: await serviceActive(autoscaleUnit),
-    org: autoscaleConfig?.target?.split('/')[0] ?? null, health };
+    org: autoscaleConfig?.target?.split('/')[0] ?? null, health, runnerUpdate };
   return { facts, autoscaler, githubChecked: !!token };
 }
 

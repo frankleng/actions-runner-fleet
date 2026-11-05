@@ -1,13 +1,15 @@
 #!/bin/bash
 
 # Shared host-to-artifact mapping. Source this file; do not execute it.
-RUNNER_VERSION="${RUNNER_VERSION:-2.336.0}"
+# RUNNER_VERSION is the bootstrap version for fresh installs; the autoscale
+# controller moves slots to newer verified releases (README: Runner updates).
+RUNNER_VERSION="${RUNNER_VERSION:-2.338.2}"
 
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64)
     RUNNER_PLATFORM="macos-arm64"
     RUNNER_ARCHIVE_BASENAME="actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
-    RUNNER_ARCHIVE_SHA256="8e8839c49b7060b6b2154f4931f815df330c27f167d53ef2239ee3dfce28b079"
+    RUNNER_ARCHIVE_SHA256="25a065af409ffa317ab4d5a3b614dd15fc9c40f2172bc1b35a1b1258e919a388"
     RUNNER_NODE_PLATFORM="darwin-arm64"
     RUNNER_NODE_ARCH="arm64"
     RUNNER_PULUMI_PLATFORM="darwin-arm64"
@@ -17,7 +19,7 @@ case "$(uname -s):$(uname -m)" in
   Linux:x86_64)
     RUNNER_PLATFORM="linux-x64"
     RUNNER_ARCHIVE_BASENAME="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
-    RUNNER_ARCHIVE_SHA256="04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
+    RUNNER_ARCHIVE_SHA256="baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40"
     RUNNER_NODE_PLATFORM="linux-x64"
     RUNNER_NODE_ARCH="x64"
     RUNNER_PULUMI_PLATFORM="linux-x64"

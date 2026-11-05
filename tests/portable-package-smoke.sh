@@ -50,6 +50,10 @@ package_root="${extract_dir}/${PACKAGE_NAME}"
 [ -f "${package_root}/AGENTS.md" ]
 [ -f "${package_root}/CLAUDE.md" ]
 [ -f "${package_root}/overlay/autoscale-worker.mjs" ]
+[ -f "${package_root}/runnerctl-app/lib/runnerctl-runner-update.mjs" ]
+# The bundled runner is the pinned bootstrap version; slots update from there.
+[ "$(cat "${package_root}/VERSION")" = "${RUNNER_VERSION}" ]
+[ -f "${package_root}/${RUNNER_ARCHIVE_BASENAME}" ]
 [ -f "${package_root}/runner-target.sh" ]
 [ -f "${package_root}/patches/cpulimit-0.2-macos.patch" ]
 [ -f "${package_root}/docs/images/runnerctl-dashboard-demo.png" ]
