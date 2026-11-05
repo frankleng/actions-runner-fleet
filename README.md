@@ -830,11 +830,15 @@ fresh installs; the background controller keeps autoscale slots current:
   their version, and `runnerctl health` reports `runner-update-refused`.
 - **Image.** A verified archive is kept beside the bootstrap one and extracted
   to `actions-runner-<platform>-<version>.image` through a staging directory
-  and one rename, like `manage-runners.sh`. An image holding anything but
-  files, directories, and relative symlinks that stay inside it is refused, and
-  kit files replace a link at their destination instead of writing through it.
-  A target whose image goes missing is rebuilt from its recorded checksum, even
-  when the release check answers 304. The target version is recorded in
+  and one rename, like `manage-runners.sh`. An image is refused unless every
+  entry is a file, a directory, or a relative symlink whose fully resolved real
+  path is a file inside it (2.338.2 ships six such links: `npm`, `npx` and
+  `corepack`); directory links and links that leave it or dangle are refused.
+  Kit files replace a link at their destination instead of writing through it.
+  A target whose image is missing, holds another version, or fails these checks
+  is moved aside and rebuilt from an archive verified against its recorded
+  checksum (a damaged local archive is downloaded again), even when the release
+  check answers 304; a local problem never becomes a sticky refusal. The target version is recorded in
   the private `.autoscale-runner-update.json` (mode `0600`, ignored by Git, the
   security audit, and the package builder like other `.autoscale*` state).
 - **Slot roll.** A slot takes the new files only between generations: no
@@ -842,7 +846,8 @@ fresh installs; the background controller keeps autoscale slots current:
   any outdated slot updates right before its next registration. Only the
   archive's entries move (`bin/`, `externals/`, `config.sh`, `run.sh`,
   `run-helper.*`, `safe_sleep.sh`); the kit's overlay is laid onto the new
-  `bin/` first, and `env.sh`, `svc.sh`, `runsvc.sh`, `.autoscale*` lifecycle
+  `bin/` first, and the staged copy itself passes the image checks before
+  anything is swapped, and `env.sh`, `svc.sh`, `runsvc.sh`, `.autoscale*` lifecycle
   files, job hooks, tools, `_work`, `_diag`, `.env` and `.path` stay. New files
   are staged inside the slot; the journal `.autoscale-update.json` is the commit
   point. A crash before it leaves the old version; after it, the next poll rolls
@@ -876,10 +881,13 @@ and no job log started after the handoff, that log reports the deprecation of
 the version on disk, and it shows no job message. Once a verified newer
 runner is ready, it removes the orphan registration if GitHub lists it as
 offline and idle under the same id (none listed counts as removed), stops the
-parked supervisor, confirms its lock is free, writes `.autoscale-recovery.json`,
-deletes the dead credentials and handoff, marks the slot ready (a crash in
-between is finished from that journal on the next poll), updates its files, and lets it take a fresh JIT
-registration. Credentials are never replayed. Every other blocked slot,
+parked supervisor, confirms its lock is free, writes `.autoscale-recovery.json`
+(the registration id and a hash of the handoff), deletes the dead credentials
+and then the handoff, and marks the slot ready. A crash in between is finished
+from that journal on the next poll, but only for files that provably belong to
+that generation; a newer handoff, generation, credentials, roll or running
+phase leaves everything in place for manual recovery. Then it updates the
+slot's files and lets it take a fresh JIT registration. Credentials are never replayed. Every other blocked slot,
 including one whose listener had started a job when it was refused, stays
 blocked for the manual steps under [Troubleshooting](#troubleshooting).
 

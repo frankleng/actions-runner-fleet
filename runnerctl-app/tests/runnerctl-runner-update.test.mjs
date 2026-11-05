@@ -235,8 +235,8 @@ test('an interrupted roll finishes on the new version, and an unprovable one fai
 });
 
 const stamp = ms => new Date(ms).toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15) + '-utc.log';
-async function blockedSlot(root, name, version, { agentId = 11, log = 'deprecated', worker = false, extraLog = false } = {}) {
-  const directory = await slot(root, name, version);
+async function blockedSlot(root, dirName, version, { agentId = 11, log = 'deprecated', worker = false, extraLog = false, name = dirName } = {}) {
+  const directory = await slot(root, dirName, version);
   const runner = JSON.stringify({ agentName: name, agentId, ephemeral: true, gitHubUrl: 'https://github.com/example-org' });
   await fs.writeFile(path.join(directory, '.autoscale-inflight.json'), JSON.stringify({ '.runner': runner, '.credentials': 'private-credential', '.credentials_rsaparams': 'private-key' }), { mode: 0o600 });
   await fs.writeFile(path.join(directory, '.runner'), runner, { mode: 0o600 });
@@ -465,7 +465,7 @@ test('an image with a symlink leaving it is refused; links inside it are kept an
     const archivePath = path.join(root, `${label}.tar.gz`);
     await fs.writeFile(archivePath, bytes);
     const image = path.join(root, `${label}.image`);
-    await assert.rejects(buildImage(archivePath, image, NEW), error => error instanceof UpdateRefusal && error.reason === 'image-escaping-symlink', label);
+    await assert.rejects(buildImage(archivePath, image, NEW), error => error instanceof UpdateRefusal && ['image-escaping-symlink', 'image-dangling-symlink'].includes(error.reason), label);
     assert.equal(await exists(image), false);
   }
   // A link already inside an image (built before this check) also stops a roll.
@@ -479,6 +479,8 @@ test('an image with a symlink leaving it is refused; links inside it are kept an
   assert.equal(await runnerFilesVersion(directory), OLD);
   // npm-style links inside the image are fine, and an overlay file at a linked name replaces the link.
   const { bytes } = await archive(NEW, NEW, async content => {
+    await fs.mkdir(path.join(content, 'externals/node24/lib'));
+    await fs.writeFile(path.join(content, 'externals/node24/lib/npm-cli.js'), 'npm');
     await fs.symlink('../lib/npm-cli.js', path.join(content, 'externals/node24/bin/npm'));
     await fs.symlink('../config.sh', path.join(content, 'bin/autoscale-worker.mjs'));
   });
@@ -492,14 +494,22 @@ test('an image with a symlink leaving it is refused; links inside it are kept an
   assert.equal((await fs.lstat(path.join(other, 'externals/node24/bin/npm'))).isSymbolicLink(), true);
 });
 
+// The journal clearRecoveredGeneration writes: generation id plus a hash of the handoff.
+async function recoveryJournal(directory, agentId) {
+  const inflight = await fs.readFile(path.join(directory, '.autoscale-inflight.json'));
+  await fs.writeFile(path.join(directory, '.autoscale-recovery.json'),
+    JSON.stringify({ version: 2, agentId, handoffSha256: createHash('sha256').update(inflight).digest('hex') }));
+}
+
 test('a recovery interrupted after its journal finishes on the next poll without replaying credentials', async () => {
   const root = await tempDir('runner-recovery-');
   const directory = await blockedSlot(root, 'runner-1', OLD, { agentId: 11 });
   assert.equal((await diagnoseBlockedSlot(directory)).cause, 'deprecated-runner');
-  // Crash after the journal and the in-flight handoff were removed, before ready was written.
-  await fs.writeFile(path.join(directory, '.autoscale-recovery.json'), JSON.stringify({ version: 1, agentId: 11 }));
-  await fs.rm(path.join(directory, '.autoscale-inflight.json'));
-  // The evidence is gone, but the journal is not re-proven from it, and nothing rolls meanwhile.
+  // Crash after the journal and part of the clear, before the handoff and ready state.
+  await recoveryJournal(directory, 11);
+  await fs.rm(path.join(directory, '.runner'));
+  await fs.rm(path.join(directory, '.credentials'));
+  // The journal is not re-proven from evidence, and nothing rolls meanwhile.
   assert.deepEqual(await diagnoseBlockedSlot(directory), { cause: 'unknown' });
   await assert.rejects(rollSlot(directory, { image: directory, version: NEW, overlayDir: root }), /between generations/);
   assert.equal(await finishRecovery(directory), 11);
@@ -512,10 +522,125 @@ test('a recovery interrupted after its journal finishes on the next poll without
   assert.equal(await clearRecoveredGeneration(fresh, 12), 12);
   assert.equal(JSON.parse(await fs.readFile(path.join(fresh, '.autoscale-state.json'), 'utf8')).phase, 'ready');
   assert.equal(await exists(path.join(fresh, '.credentials')), false);
+  await assert.rejects(clearRecoveredGeneration(await blockedSlot(root, 'runner-2b', OLD, { agentId: 14 }), 15), /another generation/);
   // A new handoff beside a stale journal is left alone.
   const guarded = await blockedSlot(root, 'runner-3', OLD, { agentId: 13 });
-  await fs.writeFile(path.join(guarded, '.autoscale-recovery.json'), JSON.stringify({ version: 1, agentId: 13 }));
+  await recoveryJournal(guarded, 13);
   await fs.writeFile(path.join(guarded, '.autoscale-request.json'), '{}');
   await assert.rejects(finishRecovery(guarded), /newer slot state/);
   assert.equal(await exists(path.join(guarded, '.autoscale-request.json')), true);
+});
+
+test('a recovery journal never deletes another generation\'s credentials or handoff', async () => {
+  const root = await tempDir('runner-recovery-');
+  const keepsAll = async (directory, label) => {
+    await assert.rejects(finishRecovery(directory), /newer slot state/, label);
+    for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-inflight.json', '.autoscale-recovery.json']) {
+      assert.equal(await exists(path.join(directory, leaf)), true, `${label}: ${leaf}`);
+    }
+  };
+  // A journal for agent 11 beside agent 12's generation (no request or reservation left).
+  const replaced = await blockedSlot(root, 'runner-1', OLD, { agentId: 11 });
+  await recoveryJournal(replaced, 11);
+  const other = await blockedSlot(root, 'other', OLD, { agentId: 12, name: 'runner-1' });
+  for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-inflight.json']) {
+    await fs.copyFile(path.join(other, leaf), path.join(replaced, leaf));
+  }
+  await keepsAll(replaced, 'newer handoff');
+  // The same handoff, but the controller has since recorded a newer generation.
+  const published = await blockedSlot(root, 'runner-2', OLD, { agentId: 21 });
+  await recoveryJournal(published, 21);
+  await fs.writeFile(path.join(published, '.autoscale-generation.json'), JSON.stringify({ id: 22 }));
+  await keepsAll(published, 'newer generation');
+  // Credentials that differ from the journaled handoff.
+  const swapped = await blockedSlot(root, 'runner-3', OLD, { agentId: 31 });
+  await recoveryJournal(swapped, 31);
+  await fs.writeFile(path.join(swapped, '.credentials'), 'another-credential');
+  await keepsAll(swapped, 'foreign credentials');
+  // Credentials left with no handoff to prove them.
+  const orphaned = await blockedSlot(root, 'runner-4', OLD, { agentId: 41 });
+  await recoveryJournal(orphaned, 41);
+  await fs.rm(path.join(orphaned, '.autoscale-inflight.json'));
+  await assert.rejects(finishRecovery(orphaned), /newer slot state/);
+  assert.equal(await exists(path.join(orphaned, '.credentials')), true);
+  // A running generation is never cleared.
+  const running = await blockedSlot(root, 'runner-5', OLD, { agentId: 51 });
+  await recoveryJournal(running, 51);
+  await fs.writeFile(path.join(running, '.autoscale-state.json'), JSON.stringify({ phase: 'running' }));
+  await keepsAll(running, 'running');
+});
+
+test('symlink chains that resolve outside the image, and directory links, are refused', async () => {
+  const root = await tempDir('runner-chain-');
+  const outside = path.join(root, 'outside-file');
+  await fs.writeFile(outside, 'outside');
+  const cases = {
+    // Each hop stays inside lexically; the real path does not.
+    'file-chain': async content => {
+      await fs.symlink('..', path.join(content, 'externals/up'));
+      await fs.symlink('../externals/up/../outside-file', path.join(content, 'bin/escape'));
+    },
+    // Sol's case: a directory link whose chain leaves the image.
+    'directory-chain': async content => {
+      await fs.symlink('..', path.join(content, 'externals/up'));
+      await fs.rm(path.join(content, 'externals/node24/bin'), { recursive: true });
+      await fs.symlink('../up/../outside', path.join(content, 'externals/node24/bin'));
+    },
+    // Even a directory link that stays inside is refused.
+    'directory-inside': async content => fs.symlink('node24', path.join(content, 'externals/node-current')),
+  };
+  for (const [label, extra] of Object.entries(cases)) {
+    const { bytes } = await archive(NEW, NEW, extra);
+    const archivePath = path.join(root, `${label}.tar.gz`);
+    await fs.writeFile(archivePath, bytes);
+    const image = path.join(root, `${label}.image`);
+    await assert.rejects(buildImage(archivePath, image, NEW),
+      error => error instanceof UpdateRefusal && ['image-escaping-symlink', 'image-directory-symlink', 'image-dangling-symlink'].includes(error.reason), label);
+    assert.equal(await exists(image), false, label);
+  }
+  assert.equal(await fs.readFile(outside, 'utf8'), 'outside');
+});
+
+test('an existing target image with the wrong version is replaced and rebuilt on a 304', async () => {
+  const root = await tempDir('runner-update-root-');
+  const { bytes, sha256 } = await archive(NEW);
+  const gh = mockGithub(release(NEW, sha256, sha256), bytes);
+  const c = config();
+  let state = await checkForUpdate({ version: 1 }, c, { root, now: 1000, fetchImpl: gh.fetchImpl, p: linux });
+  const image = path.join(root, `actions-runner-linux-x64-${NEW}.image`);
+  // The image directory now holds other files; the archive was damaged too.
+  await fs.rm(image, { recursive: true });
+  await runnerFiles(image, OLD);
+  await fs.writeFile(path.join(root, `actions-runner-linux-x64-${NEW}.tar.gz`), 'damaged');
+  assert.equal(await readyTarget(state, root), null);
+  state = await checkForUpdate(state, c, { root, now: 2000, forced: true, fetchImpl: gh.fetchImpl, p: linux });
+  assert.equal(state.refusal ?? null, null);
+  assert.deepEqual(await readyTarget(state, root), { version: NEW, image });
+  assert.equal(await runnerFilesVersion(image), NEW);
+  // The rebuild downloaded a fresh archive and verified it against the recorded checksum.
+  assert.equal(createHash('sha256').update(await fs.readFile(path.join(root, `actions-runner-linux-x64-${NEW}.tar.gz`))).digest('hex'), sha256);
+  assert.deepEqual((await fs.readdir(root)).filter(n => n.startsWith('.autoscale-runner-image.')), []);
+  // An image that would fail a roll's containment check is not ready either.
+  await fs.symlink('..', path.join(image, 'externals/up'));
+  assert.equal(await readyTarget(state, root), null);
+});
+
+test('a roll checks the staged copy, so an image changed after its check installs nothing', async () => {
+  const root = await tempDir('runner-toctou-');
+  const outside = path.join(root, 'outside-file');
+  await fs.writeFile(outside, 'outside');
+  const image = path.join(root, 'image');
+  await runnerFiles(image, NEW);
+  const overlayDir = await overlay(root);
+  const directory = await slot(root, 'runner-1', OLD);
+  // The image passes its own check; an escaping link appears in it right after (here, while it is cloned).
+  const run = async (file, args, options) => {
+    if (args.at(-2) === path.join(image, 'externals')) await fs.symlink(outside, path.join(image, 'externals/escape')).catch(() => {});
+    return exec(file, args, options);
+  };
+  await assert.rejects(rollSlot(directory, { image, version: NEW, overlayDir }, { run }), /image-escaping-symlink/);
+  assert.equal(await runnerFilesVersion(directory), OLD);
+  assert.equal(await exists(path.join(directory, 'externals/escape')), false);
+  for (const leaf of ['.autoscale-update.json', '.autoscale-update-new']) assert.equal(await exists(path.join(directory, leaf)), false, leaf);
+  assert.equal(await fs.readFile(outside, 'utf8'), 'outside');
 });

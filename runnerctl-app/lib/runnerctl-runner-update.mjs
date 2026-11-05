@@ -151,9 +151,10 @@ export async function downloadVerified(candidate, root, { fetchImpl = fetch, sig
     throw new UpdateRefusal('invalid-download-url', candidate.version);
   }
   const dest = path.join(root, candidate.name);
-  if (await fs.access(dest).then(() => true, () => false)) {
-    if (await sha256File(dest) === candidate.sha256) return dest;
-    throw new UpdateRefusal('existing-archive-mismatch', candidate.version);
+  if (await fs.lstat(dest).then(() => true, () => false)) {
+    if ((await fs.lstat(dest)).isFile() && await sha256File(dest) === candidate.sha256) return dest;
+    // A damaged local copy is replaced by a fresh, verified download.
+    await fs.rm(dest, { recursive: true, force: true });
   }
   const temp = path.join(root, `.autoscale-runner-download.${randomBytes(6).toString('hex')}`);
   try {
@@ -197,9 +198,13 @@ export async function runnerFilesVersion(directory) {
  * hold the expected version.
  */
 export async function buildImage(archive, imageDir, version, { run = exec } = {}) {
-  if (await fs.access(imageDir).then(() => true, () => false)) {
-    if (await runnerFilesVersion(imageDir) !== version) throw new UpdateRefusal('image-mismatch', version);
-    return imageDir;
+  if (await fs.lstat(imageDir).then(() => true, () => false)) {
+    if (await imageValid(imageDir, version)) return imageDir;
+    // A local image problem is never a reason to refuse the release: move the
+    // bad image aside (a name startup cleanup removes) and rebuild it.
+    const stale = path.join(path.dirname(imageDir), `.autoscale-runner-image.stale.${randomBytes(6).toString('hex')}`);
+    await fs.rename(imageDir, stale);
+    await fs.rm(stale, { recursive: true, force: true });
   }
   const staging = await fs.mkdtemp(path.join(path.dirname(imageDir), '.autoscale-runner-image.'));
   try {
@@ -213,6 +218,15 @@ export async function buildImage(archive, imageDir, version, { run = exec } = {}
   return imageDir;
 }
 
+/** Whether an existing image holds `version` and passes every check a roll makes. */
+export async function imageValid(imageDir, version) {
+  try {
+    if (!(await fs.lstat(imageDir)).isDirectory() || await runnerFilesVersion(imageDir) !== version) return false;
+    await imageEntries(imageDir);
+    return true;
+  } catch { return false; }
+}
+
 /** Top-level archive entries a roll replaces; refuses an image that would replace slot state. */
 export async function imageEntries(imageDir) {
   const names = (await fs.readdir(imageDir)).sort();
@@ -223,23 +237,31 @@ export async function imageEntries(imageDir) {
 }
 
 /**
- * Every entry is a regular file, a directory, or a relative symlink that
- * stays inside the image (the runner ships npm/npx/corepack links in its
- * Node.js externals). A link that leaves the image, or any other file type,
+ * Every entry is a regular file, a directory, or a relative symlink whose
+ * fully resolved real path is a regular file inside the image (2.338.2 ships
+ * six: npm, npx and corepack in externals/node20 and node24). A link that
+ * leaves the image, dangles, or names a directory, and any other file type,
  * refuses the image: cloning preserves links, and a later write through one
  * would land outside the slot.
  */
 export async function assertContained(imageDir) {
-  const root = path.resolve(imageDir);
+  const root = await fs.realpath(imageDir);
+  const inside = real => real.startsWith(root + path.sep);
+  // readdir's types come from lstat: a link is never descended into.
   const walk = async directory => {
     for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
       const full = path.join(directory, entry.name);
       if (entry.isDirectory()) { await walk(full); continue; }
       if (entry.isFile()) continue;
       if (!entry.isSymbolicLink()) throw new UpdateRefusal('image-unexpected-file-type');
-      const target = await fs.readlink(full);
-      const resolved = path.resolve(path.dirname(full), target);
-      if (path.isAbsolute(target) || (resolved !== root && !resolved.startsWith(root + path.sep))) throw new UpdateRefusal('image-escaping-symlink');
+      if (path.isAbsolute(await fs.readlink(full))) throw new UpdateRefusal('image-escaping-symlink');
+      // realpath follows the whole chain, so `up -> ..` hops cannot hide an escape.
+      let real;
+      try { real = await fs.realpath(full); } catch { throw new UpdateRefusal('image-dangling-symlink'); }
+      if (!inside(real)) throw new UpdateRefusal('image-escaping-symlink');
+      // The runner ships only file links (npm, npx, corepack); a directory link
+      // would let later copies and renames reach through it.
+      if (!(await fs.stat(real)).isFile()) throw new UpdateRefusal('image-directory-symlink');
     }
   };
   await walk(root);
@@ -352,7 +374,7 @@ export async function readyTarget(state, root) {
   const t = state.target;
   if (!t || !VERSION.test(t.version ?? '') || typeof t.image !== 'string' || t.image !== path.basename(t.image)) return null;
   const image = path.join(root, t.image);
-  if (await runnerFilesVersion(image) !== t.version) return null;
+  if (!await imageValid(image, t.version)) return null;
   return { version: t.version, image };
 }
 
@@ -404,6 +426,13 @@ export async function rollSlot(directory, { image, version, overlayDir }, { run 
       await replaceFile(from, path.join(bin, leaf), leaf.endsWith('.sh') ? 0o755 : null);
     }
     if (await runnerFilesVersion(at(SLOT_UPDATE_NEW)) !== version) throw new Error('Staged runner files have the wrong version');
+    // Check what will be installed, not only the image it came from: the image
+    // could change between its check and the clone.
+    try { await assertContained(at(SLOT_UPDATE_NEW)); }
+    catch (error) {
+      await fs.rm(at(SLOT_UPDATE_NEW), { recursive: true, force: true });
+      throw error;
+    }
     journal = { version: 1, to: version, entries };
     await writePrivateJson(at(SLOT_UPDATE_JOURNAL), journal);
   }
@@ -484,26 +513,66 @@ export async function diagnoseBlockedSlot(directory) {
 /**
  * Clear a proven deprecation-blocked generation. The caller has removed its
  * registration, stopped the slot's supervisor, and holds the worker lock. The
- * journal goes first, so an interruption leaves a slot finishRecovery()
- * completes; the consumed credentials are only ever deleted, never reused.
+ * journal goes first and names the generation (its registration id) and its
+ * handoff (a SHA-256 of the in-flight file, never its content), so an
+ * interruption leaves a slot finishRecovery() completes for that generation
+ * only. The consumed credentials are only ever deleted, never reused.
  */
 export async function clearRecoveredGeneration(directory, agentId) {
   if (!Number.isSafeInteger(agentId) || agentId < 1) throw new Error('Invalid registration id');
-  await writePrivateJson(path.join(directory, SLOT_RECOVERY_JOURNAL), { version: 1, agentId });
+  const inflight = await fs.readFile(path.join(directory, '.autoscale-inflight.json'));
+  if (handoffAgentId(inflight) !== agentId) throw new Error('Handoff belongs to another generation');
+  await writePrivateJson(path.join(directory, SLOT_RECOVERY_JOURNAL),
+    { version: 2, agentId, handoffSha256: createHash('sha256').update(inflight).digest('hex') });
   return finishRecovery(directory);
 }
-/** Finish a journaled recovery: delete the dead generation, mark the slot ready, drop the journal. Caller holds the worker lock. */
+function handoffAgentId(bytes) {
+  try { return JSON.parse(JSON.parse(bytes.toString('utf8'))['.runner']).agentId; } catch { return null; }
+}
+/**
+ * Finish a journaled recovery: delete the journaled generation's files, mark
+ * the slot ready, drop the journal. Caller holds the worker lock. Anything
+ * that cannot be proven to belong to that generation (a newer handoff,
+ * registration, credentials, roll, or a running phase) refuses and leaves
+ * every file in place for manual recovery.
+ */
 export async function finishRecovery(directory) {
   const at = leaf => path.join(directory, leaf);
+  const read = leaf => fs.readFile(at(leaf)).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
   let journal;
   try { journal = JSON.parse(await fs.readFile(at(SLOT_RECOVERY_JOURNAL), 'utf8')); }
   catch { throw new Error('Unreadable recovery journal'); }
-  if (journal?.version !== 1 || !Number.isSafeInteger(journal.agentId)) throw new Error('Invalid recovery journal');
-  // A new handoff or roll beside the journal is not ours to clear.
-  for (const leaf of ['.autoscale-request.json', '.autoscale-reservation.json', SLOT_UPDATE_JOURNAL]) {
-    if (await exists(at(leaf))) throw new Error('Recovery journal beside newer slot state');
+  if (journal?.version !== 2 || !Number.isSafeInteger(journal.agentId) || !/^[0-9a-f]{64}$/.test(journal.handoffSha256 ?? '')) {
+    throw new Error('Invalid recovery journal');
   }
-  for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-inflight.json']) await fs.rm(at(leaf), { force: true });
+  const newer = () => new Error('Recovery journal beside newer slot state');
+  for (const leaf of ['.autoscale-request.json', '.autoscale-request.tmp', '.autoscale-reservation.json', SLOT_UPDATE_JOURNAL]) {
+    if (await exists(at(leaf))) throw newer();
+  }
+  const phase = JSON.parse((await read('.autoscale-state.json'))?.toString('utf8') ?? '{"phase":"ready"}').phase;
+  if (phase !== 'blocked' && phase !== 'ready') throw newer();
+  // The controller records each generation it hands off; a later one is not ours.
+  const generation = await read('.autoscale-generation.json');
+  if (generation && JSON.parse(generation.toString('utf8')).id !== journal.agentId) throw newer();
+  const inflight = await read('.autoscale-inflight.json');
+  let handoff = null;
+  if (inflight) {
+    if (createHash('sha256').update(inflight).digest('hex') !== journal.handoffSha256) throw newer();
+    handoff = JSON.parse(inflight.toString('utf8'));
+  }
+  // Credential files must match the journaled handoff byte for byte. They are
+  // deleted before the handoff, so with no handoff left none may remain.
+  const credentials = ['.runner', '.credentials', '.credentials_rsaparams'];
+  for (const leaf of credentials) {
+    const content = await read(leaf);
+    if (content === null) continue;
+    if (!handoff) throw newer();
+    // Windows stores the RSA key DPAPI-protected, so only its owner is comparable there.
+    if (leaf === '.credentials_rsaparams' && process.platform === 'win32') continue;
+    if (content.toString('utf8') !== handoff[leaf]) throw newer();
+  }
+  for (const leaf of credentials) await fs.rm(at(leaf), { force: true });
+  await fs.rm(at('.autoscale-inflight.json'), { force: true });
   await writePrivateJson(at('.autoscale-state.json'), { phase: 'ready' });
   await fs.unlink(at(SLOT_RECOVERY_JOURNAL));
   return journal.agentId;
