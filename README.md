@@ -835,8 +835,13 @@ fresh installs; the background controller keeps autoscale slots current:
   path is a file inside it (2.338.2 ships six such links: `npm`, `npx` and
   `corepack`); directory links and links that leave it or dangle are refused.
   Kit files replace a link at their destination instead of writing through it.
-  A target whose image is missing, holds another version, or fails these checks
-  is moved aside and rebuilt from an archive verified against its recorded
+  Validation reads only regular files (opened without following links or
+  blocking), so a FIFO or device fails it at once, and its subprocesses have
+  timeouts. An image is trusted only as the one this code built from the
+  verified archive: the update state records its directory identity, and any
+  other image at that path (built elsewhere, replaced, or edited into failing
+  the checks) is not ready. A target whose image is missing, holds another
+  version, or fails these checks is moved aside and rebuilt from an archive verified against its recorded
   checksum (a damaged local archive is downloaded again), even when the release
   check answers 304; a local problem never becomes a sticky refusal. The target version is recorded in
   the private `.autoscale-runner-update.json` (mode `0600`, ignored by Git, the
@@ -847,7 +852,9 @@ fresh installs; the background controller keeps autoscale slots current:
   archive's entries move (`bin/`, `externals/`, `config.sh`, `run.sh`,
   `run-helper.*`, `safe_sleep.sh`); the kit's overlay is laid onto the new
   `bin/` first, and the staged copy itself passes the image checks before
-  anything is swapped, and `env.sh`, `svc.sh`, `runsvc.sh`, `.autoscale*` lifecycle
+  anything is swapped. The same check runs again on the installed entries after
+  the swap, whether fresh or resumed from the journal, while the old files are
+  still kept; a failure puts them back (a journaled, resumable rollback), and `env.sh`, `svc.sh`, `runsvc.sh`, `.autoscale*` lifecycle
   files, job hooks, tools, `_work`, `_diag`, `.env` and `.path` stay. New files
   are staged inside the slot; the journal `.autoscale-update.json` is the commit
   point. A crash before it leaves the old version; after it, the next poll rolls

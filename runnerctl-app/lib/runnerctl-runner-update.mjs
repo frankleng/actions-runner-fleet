@@ -135,9 +135,31 @@ export async function fetchRelease({ token, pin = null, etag = null, fetchImpl =
   return { status: 200, release, etag: response.headers?.get?.('etag') ?? null, key: url };
 }
 
+// Open only regular files: lstat first, then O_NOFOLLOW|O_NONBLOCK so a FIFO,
+// socket, device, or a link swapped in after the lstat can never block or redirect
+// the read, then fstat to confirm what was opened.
+const OPEN_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+async function openRegular(file, maxBytes) {
+  const before = await fs.lstat(file);
+  if (!before.isFile()) throw Object.assign(new Error('Not a regular file'), { code: 'ENOTREG' });
+  const handle = await fs.open(file, OPEN_FLAGS);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.ino !== before.ino || stat.size > maxBytes) throw Object.assign(new Error('Not a regular file'), { code: 'ENOTREG' });
+    return handle;
+  } catch (error) { await handle.close(); throw error; }
+}
+/** Read a small regular file as text; missing files reject with ENOENT, anything else that is not a regular file with ENOTREG. */
+export async function readRegular(file, maxBytes = 1024 * 1024) {
+  const handle = await openRegular(file, maxBytes);
+  try { return (await handle.readFile()).toString('utf8'); } finally { await handle.close(); }
+}
+const readJsonRegular = async (file, maxBytes) => JSON.parse(await readRegular(file, maxBytes));
 async function sha256File(file) {
   const hash = createHash('sha256');
-  for await (const chunk of (await fs.open(file)).createReadStream()) hash.update(chunk);
+  const handle = await openRegular(file, MAX_ARCHIVE_BYTES);
+  try { for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk); }
+  finally { await handle.close(); }
   return hash.digest('hex');
 }
 
@@ -186,7 +208,7 @@ export async function downloadVerified(candidate, root, { fetchImpl = fetch, sig
 /** The runner version a directory's files belong to, read from its deps manifest; null when unknown. */
 export async function runnerFilesVersion(directory) {
   try {
-    const text = await fs.readFile(path.join(directory, 'bin', 'Runner.Listener.deps.json'), 'utf8');
+    const text = await readRegular(path.join(directory, 'bin', 'Runner.Listener.deps.json'), 16 * 1024 * 1024);
     const match = /"Runner\.Listener\/(\d+\.\d+\.\d+)"/.exec(text);
     return match ? match[1] : null;
   } catch { return null; }
@@ -197,9 +219,11 @@ export async function runnerFilesVersion(directory) {
  * into a staging directory, then one rename. An existing image must already
  * hold the expected version.
  */
-export async function buildImage(archive, imageDir, version, { run = exec } = {}) {
+export async function buildImage(archive, imageDir, version, { run = exec, trusted = null } = {}) {
   if (await fs.lstat(imageDir).then(() => true, () => false)) {
-    if (await imageValid(imageDir, version)) return imageDir;
+    // Only the image this code built from the verified archive, recorded by its
+    // identity in the private update state, is reused; any other is rebuilt.
+    if (trusted && trusted.version === version && await imageReady(imageDir, trusted)) return imageDir;
     // A local image problem is never a reason to refuse the release: move the
     // bad image aside (a name startup cleanup removes) and rebuild it.
     const stale = path.join(path.dirname(imageDir), `.autoscale-runner-image.stale.${randomBytes(6).toString('hex')}`);
@@ -208,7 +232,7 @@ export async function buildImage(archive, imageDir, version, { run = exec } = {}
   }
   const staging = await fs.mkdtemp(path.join(path.dirname(imageDir), '.autoscale-runner-image.'));
   try {
-    await run('tar', ['-xzf', archive, '-C', staging], { timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 });
+    await run('tar', ['-xzf', archive, '-C', staging], { timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024, killSignal: 'SIGKILL' });
     if (await runnerFilesVersion(staging) !== version) throw new UpdateRefusal('image-mismatch', version);
     await imageEntries(staging);
     await fs.rename(staging, imageDir);
@@ -216,6 +240,20 @@ export async function buildImage(archive, imageDir, version, { run = exec } = {}
     await fs.rm(staging, { recursive: true, force: true });
   }
   return imageDir;
+}
+
+/** The identity of a built image directory: its device and inode, which a replaced directory never keeps. */
+export async function imageIdentity(imageDir) {
+  const stat = await fs.lstat(imageDir, { bigint: true });
+  if (!stat.isDirectory()) throw new Error('Image is not a directory');
+  return `${stat.dev}:${stat.ino}`;
+}
+/** Whether `imageDir` is the image recorded in `target` (same directory) and still passes every content check. */
+async function imageReady(imageDir, target) {
+  try {
+    if (typeof target?.imageId !== 'string' || await imageIdentity(imageDir) !== target.imageId) return false;
+    return await imageValid(imageDir, target.version);
+  } catch { return false; }
 }
 
 /** Whether an existing image holds `version` and passes every check a roll makes. */
@@ -244,9 +282,12 @@ export async function imageEntries(imageDir) {
  * refuses the image: cloning preserves links, and a later write through one
  * would land outside the slot.
  */
-export async function assertContained(imageDir) {
+export async function assertContained(imageDir, entries = null) {
   const root = await fs.realpath(imageDir);
-  const inside = real => real.startsWith(root + path.sep);
+  // A slot is checked only over the runner entries it installed; links there
+  // must land inside those entries, never in slot state or outside the slot.
+  const tops = entries ? entries.map(e => path.join(root, e)) : [root];
+  const inside = real => tops.some(top => real === top || real.startsWith(top + path.sep));
   // readdir's types come from lstat: a link is never descended into.
   const walk = async directory => {
     for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
@@ -264,7 +305,12 @@ export async function assertContained(imageDir) {
       if (!(await fs.stat(real)).isFile()) throw new UpdateRefusal('image-directory-symlink');
     }
   };
-  await walk(root);
+  if (!entries) return walk(root);
+  for (const top of tops) {
+    const stat = await fs.lstat(top);
+    if (stat.isDirectory()) await walk(top);
+    else if (!stat.isFile()) throw new UpdateRefusal(stat.isSymbolicLink() ? 'image-escaping-symlink' : 'image-unexpected-file-type');
+  }
 }
 
 /** Put a kit file at `to`, replacing whatever is there (a symlink included) without following it. */
@@ -281,7 +327,7 @@ export async function replaceFile(from, to, mode = null) {
 const BLANK_STATE = { version: 1 };
 export async function readUpdateState(root) {
   try {
-    const state = JSON.parse(await fs.readFile(path.join(root, UPDATE_STATE_FILE), 'utf8'));
+    const state = await readJsonRegular(path.join(root, UPDATE_STATE_FILE));
     return state?.version === 1 ? state : { ...BLANK_STATE };
   } catch { return { ...BLANK_STATE }; }
 }
@@ -343,8 +389,9 @@ export async function checkForUpdate(state, c, { root, token, now = Date.now(), 
       return next;
     }
     const archive = await downloadVerified(candidate, root, { fetchImpl, signal });
-    const image = await buildImage(archive, path.join(root, imageName(p, candidate.version)), candidate.version, { run });
-    next.target = { version: candidate.version, sha256: candidate.sha256, image: path.basename(image), at: now };
+    const trusted = next.target?.version === candidate.version && next.target.sha256 === candidate.sha256 ? next.target : null;
+    const image = await buildImage(archive, path.join(root, imageName(p, candidate.version)), candidate.version, { run, trusted });
+    next.target = { version: candidate.version, sha256: candidate.sha256, image: path.basename(image), imageId: await imageIdentity(image), at: now };
     next.pendingCandidate = null;
     next.error = null;
     return next;
@@ -374,13 +421,13 @@ export async function readyTarget(state, root) {
   const t = state.target;
   if (!t || !VERSION.test(t.version ?? '') || typeof t.image !== 'string' || t.image !== path.basename(t.image)) return null;
   const image = path.join(root, t.image);
-  if (!await imageValid(image, t.version)) return null;
+  if (!await imageReady(image, t)) return null;
   return { version: t.version, image };
 }
 
 async function cloneTree(source, dest, run) {
   for (const args of process.platform === 'darwin' ? [['-c', '-Rp'], ['-Rp']] : [['-a', '--reflink=auto'], ['-Rp']]) {
-    try { await run('cp', [...args, source, dest], { timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 }); return; }
+    try { await run('cp', [...args, source, dest], { timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024, killSignal: 'SIGKILL' }); return; }
     catch { await fs.rm(dest, { recursive: true, force: true }); }
   }
   throw new Error('copy failed');
@@ -406,7 +453,7 @@ async function writePrivateJson(file, value) {
 export async function rollSlot(directory, { image, version, overlayDir }, { run = exec } = {}) {
   const at = leaf => path.join(directory, leaf);
   let journal = null;
-  try { journal = JSON.parse(await fs.readFile(at(SLOT_UPDATE_JOURNAL), 'utf8')); }
+  try { journal = await readJsonRegular(at(SLOT_UPDATE_JOURNAL)); }
   catch (error) { if (error.code !== 'ENOENT') throw new Error('Unreadable runner update journal'); }
   if (!journal) {
     for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-request.json', '.autoscale-inflight.json', '.autoscale-reservation.json', SLOT_RECOVERY_JOURNAL]) {
@@ -433,13 +480,22 @@ export async function rollSlot(directory, { image, version, overlayDir }, { run 
       await fs.rm(at(SLOT_UPDATE_NEW), { recursive: true, force: true });
       throw error;
     }
-    journal = { version: 1, to: version, entries };
+    // Entries the slot does not have yet; a rollback removes them.
+    const added = [];
+    for (const entry of entries) if (!await fs.lstat(at(entry)).then(() => true, () => false)) added.push(entry);
+    journal = { version: 2, to: version, entries, added };
     await writePrivateJson(at(SLOT_UPDATE_JOURNAL), journal);
   }
-  if (journal?.version !== 1 || !VERSION.test(journal.to ?? '') || !Array.isArray(journal.entries) ||
-      journal.entries.some(e => typeof e !== 'string' || FORBIDDEN.test(e) || KIT_OWNED.has(e) || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(e))) {
+  const entryName = e => typeof e === 'string' && !FORBIDDEN.test(e) && !KIT_OWNED.has(e) && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(e);
+  // Version 1 journals predate `added`; with none recorded, a rollback that
+  // finds an entry without its old copy fails closed.
+  if (journal?.version === 1) journal = { ...journal, version: 2, added: [] };
+  if (journal?.version !== 2 || !VERSION.test(journal.to ?? '') || !Array.isArray(journal.entries) || !Array.isArray(journal.added) ||
+      !journal.entries.every(entryName) || !journal.added.every(e => journal.entries.includes(e))) {
     throw new Error('Invalid runner update journal');
   }
+  // A rollback that was interrupted is finished before anything else.
+  if (journal.rollback) return rollBack(directory, journal);
   await fs.mkdir(at(SLOT_UPDATE_OLD), { recursive: true, mode: 0o700 });
   for (const entry of journal.entries) {
     const current = at(entry);
@@ -456,11 +512,49 @@ export async function rollSlot(directory, { image, version, overlayDir }, { run 
     }
     await fs.rename(staged, current);
   }
-  if (await runnerFilesVersion(directory) !== journal.to) throw new Error('Runner update did not take effect');
+  // The final check runs on what is actually in place, on every path into
+  // this point (fresh or resumed), while the old files are still kept: a
+  // failure restores them. The worker starts no listener while the journal exists.
+  try {
+    await assertContained(directory, journal.entries);
+    if (await runnerFilesVersion(directory) !== journal.to) throw new Error('Runner update did not take effect');
+  } catch (error) {
+    // Report why the roll failed once the old files are back; a failed rollback reports itself.
+    try { await rollBack(directory, journal); }
+    catch (rollback) { if (rollback?.reason !== 'slot-update-rolled-back') throw rollback; }
+    throw error;
+  }
   await fs.rm(at(SLOT_UPDATE_OLD), { recursive: true, force: true });
   await fs.rm(at(SLOT_UPDATE_NEW), { recursive: true, force: true });
   await fs.unlink(at(SLOT_UPDATE_JOURNAL));
   return journal.to;
+}
+
+/**
+ * Put back the files a roll replaced. Journaled first, so an interrupted
+ * rollback resumes as a rollback; idempotent: an entry whose old copy is
+ * already back is left alone, and entries the update added are removed. With
+ * an old copy missing for an entry the slot had, it throws and keeps the
+ * journal, so the slot stays out of service.
+ */
+async function rollBack(directory, journal) {
+  const at = leaf => path.join(directory, leaf);
+  if (!journal.rollback) await writePrivateJson(at(SLOT_UPDATE_JOURNAL), { ...journal, rollback: true });
+  for (const entry of journal.entries) {
+    const old = path.join(at(SLOT_UPDATE_OLD), entry);
+    if (await fs.lstat(old).then(() => true, () => false)) {
+      await fs.rm(at(entry), { recursive: true, force: true });
+      await fs.rename(old, at(entry));
+    } else if (journal.added.includes(entry)) {
+      await fs.rm(at(entry), { recursive: true, force: true });
+    } else if (!await fs.lstat(at(entry)).then(() => true, () => false)) {
+      throw new Error('Runner update rollback lost an entry');
+    }
+  }
+  await fs.rm(at(SLOT_UPDATE_OLD), { recursive: true, force: true });
+  await fs.rm(at(SLOT_UPDATE_NEW), { recursive: true, force: true });
+  await fs.unlink(at(SLOT_UPDATE_JOURNAL));
+  throw new UpdateRefusal('slot-update-rolled-back', journal.to);
 }
 
 const logTime = name => {
@@ -484,15 +578,15 @@ export async function diagnoseBlockedSlot(directory) {
   const unknown = { cause: 'unknown' };
   const at = leaf => path.join(directory, leaf);
   try {
-    const phase = JSON.parse(await fs.readFile(at('.autoscale-state.json'), 'utf8')).phase;
+    const phase = (await readJsonRegular(at('.autoscale-state.json'))).phase;
     if (phase !== 'blocked') return unknown;
     for (const leaf of ['.autoscale-request.json', '.autoscale-request.tmp', '.autoscale-reservation.json', SLOT_UPDATE_JOURNAL, SLOT_RECOVERY_JOURNAL]) {
       if (await exists(at(leaf))) return unknown;
     }
     const inflightStat = await fs.stat(at('.autoscale-inflight.json'));
-    const handoff = JSON.parse(await fs.readFile(at('.autoscale-inflight.json'), 'utf8'));
+    const handoff = await readJsonRegular(at('.autoscale-inflight.json'));
     const metadata = JSON.parse(handoff['.runner']);
-    const slot = JSON.parse(await fs.readFile(at('.autoscale-slot.json'), 'utf8'));
+    const slot = await readJsonRegular(at('.autoscale-slot.json'));
     if (metadata.ephemeral !== true || metadata.agentName !== slot.agentName || !Number.isSafeInteger(metadata.agentId) || metadata.agentId < 1) return unknown;
     // Log names carry whole seconds; the handoff predates its listener.
     const since = Math.floor(inflightStat.mtimeMs / 1000) * 1000;
@@ -500,8 +594,7 @@ export async function diagnoseBlockedSlot(directory) {
     const runners = logs.filter(n => n.startsWith('Runner_'));
     if (runners.length !== 1 || logs.some(n => n.startsWith('Worker_'))) return unknown;
     const log = path.join(at('_diag'), runners[0]);
-    if ((await fs.stat(log)).size > MAX_DIAG_BYTES) return unknown;
-    const text = await fs.readFile(log, 'utf8');
+    const text = await readRegular(log, MAX_DIAG_BYTES);
     const deprecated = DEPRECATED.exec(text);
     if (!deprecated || JOB_EVIDENCE.test(text)) return unknown;
     // The refused version must be the one these files run.
@@ -520,7 +613,7 @@ export async function diagnoseBlockedSlot(directory) {
  */
 export async function clearRecoveredGeneration(directory, agentId) {
   if (!Number.isSafeInteger(agentId) || agentId < 1) throw new Error('Invalid registration id');
-  const inflight = await fs.readFile(path.join(directory, '.autoscale-inflight.json'));
+  const inflight = Buffer.from(await readRegular(path.join(directory, '.autoscale-inflight.json')), 'utf8');
   if (handoffAgentId(inflight) !== agentId) throw new Error('Handoff belongs to another generation');
   await writePrivateJson(path.join(directory, SLOT_RECOVERY_JOURNAL),
     { version: 2, agentId, handoffSha256: createHash('sha256').update(inflight).digest('hex') });
@@ -538,9 +631,9 @@ function handoffAgentId(bytes) {
  */
 export async function finishRecovery(directory) {
   const at = leaf => path.join(directory, leaf);
-  const read = leaf => fs.readFile(at(leaf)).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const read = leaf => readRegular(at(leaf)).then(text => Buffer.from(text, 'utf8'), error => { if (error.code === 'ENOENT') return null; throw error; });
   let journal;
-  try { journal = JSON.parse(await fs.readFile(at(SLOT_RECOVERY_JOURNAL), 'utf8')); }
+  try { journal = await readJsonRegular(at(SLOT_RECOVERY_JOURNAL)); }
   catch { throw new Error('Unreadable recovery journal'); }
   if (journal?.version !== 2 || !Number.isSafeInteger(journal.agentId) || !/^[0-9a-f]{64}$/.test(journal.handoffSha256 ?? '')) {
     throw new Error('Invalid recovery journal');
@@ -593,7 +686,7 @@ export function orphanDecision(name, agentId, remote) {
 
 /** The bootstrap version pinned in platform.sh, whose image manage-runners.sh clones for new slots. */
 export async function bootstrapVersion(root) {
-  try { return /RUNNER_VERSION="\$\{RUNNER_VERSION:-(\d+\.\d+\.\d+)\}"/.exec(await fs.readFile(path.join(root, 'platform.sh'), 'utf8'))?.[1] ?? null; }
+  try { return /RUNNER_VERSION="\$\{RUNNER_VERSION:-(\d+\.\d+\.\d+)\}"/.exec(await readRegular(path.join(root, 'platform.sh')))?.[1] ?? null; }
   catch { return null; }
 }
 

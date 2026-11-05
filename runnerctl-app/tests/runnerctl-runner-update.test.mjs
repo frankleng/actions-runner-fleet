@@ -6,10 +6,11 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { validateConfig } from '../lib/runnerctl-autoscale.mjs';
 import { findProblems } from '../lib/runnerctl-health.mjs';
 import { releaseCandidate, checkDue, checkForUpdate, rollSlot, diagnoseBlockedSlot, orphanDecision, pruneImages, compareVersions, runnerFilesVersion,
-  readyTarget, buildImage, clearRecoveredGeneration, finishRecovery, CHECK_INTERVAL_MS, FORCED_CHECK_INTERVAL_MS, UpdateRefusal } from '../lib/runnerctl-runner-update.mjs';
+  readyTarget, buildImage, imageValid, clearRecoveredGeneration, finishRecovery, CHECK_INTERVAL_MS, FORCED_CHECK_INTERVAL_MS, UpdateRefusal } from '../lib/runnerctl-runner-update.mjs';
 
 const exec = promisify(execFile);
 const linux = { name: 'linux-x64', ext: 'tar.gz' };
@@ -213,7 +214,7 @@ test('an interrupted roll finishes on the new version, and an unprovable one fai
   await fs.mkdir(path.join(directory, '.autoscale-update-old'));
   const entries = ['bin', 'config.sh', 'externals', 'run.sh', 'safe_sleep.sh'];
   for (const entry of entries) await fs.cp(path.join(image, entry), path.join(directory, '.autoscale-update-new', entry), { recursive: true });
-  await fs.writeFile(path.join(directory, '.autoscale-update.json'), JSON.stringify({ version: 1, to: NEW, entries }));
+  await fs.writeFile(path.join(directory, '.autoscale-update.json'), JSON.stringify({ version: 2, to: NEW, entries, added: [] }));
   await fs.rename(path.join(directory, 'bin'), path.join(directory, '.autoscale-update-old/bin'));
   // A listener must not start from these files.
   assert.equal(await runnerFilesVersion(directory), null);
@@ -224,12 +225,12 @@ test('an interrupted roll finishes on the new version, and an unprovable one fai
 
   // Staged files lost after the commit point: the journal stays and the slot stays out of service.
   const broken = await slot(root, 'runner-2', OLD);
-  await fs.writeFile(path.join(broken, '.autoscale-update.json'), JSON.stringify({ version: 1, to: NEW, entries: ['bin'] }));
+  await fs.writeFile(path.join(broken, '.autoscale-update.json'), JSON.stringify({ version: 2, to: NEW, entries: ['bin'], added: [] }));
   await fs.rm(path.join(broken, 'bin'), { recursive: true });
   await assert.rejects(rollSlot(broken, { overlayDir }), /lost an entry/);
   assert.equal(await exists(path.join(broken, '.autoscale-update.json')), true);
   // A journal naming slot state is never followed.
-  await fs.writeFile(path.join(broken, '.autoscale-update.json'), JSON.stringify({ version: 1, to: NEW, entries: ['_work'] }));
+  await fs.writeFile(path.join(broken, '.autoscale-update.json'), JSON.stringify({ version: 2, to: NEW, entries: ['_work'], added: [] }));
   await assert.rejects(rollSlot(broken, { overlayDir }), /Invalid runner update journal/);
   assert.equal(await fs.readFile(path.join(broken, '_work/repo/file'), 'utf8'), 'workspace');
 });
@@ -643,4 +644,95 @@ test('a roll checks the staged copy, so an image changed after its check install
   assert.equal(await exists(path.join(directory, 'externals/escape')), false);
   for (const leaf of ['.autoscale-update.json', '.autoscale-update-new']) assert.equal(await exists(path.join(directory, leaf)), false, leaf);
   assert.equal(await fs.readFile(outside, 'utf8'), 'outside');
+});
+
+// A resumable roll: journal written, staged files ready, nothing swapped yet.
+async function journaledRoll(root, name, mutateStaged = async () => {}, journal = {}) {
+  const image = path.join(root, `${name}-image`);
+  await runnerFiles(image, NEW);
+  const directory = await slot(root, name, OLD);
+  const entries = ['bin', 'config.sh', 'externals', 'run.sh', 'safe_sleep.sh'];
+  await fs.mkdir(path.join(directory, '.autoscale-update-new'));
+  for (const entry of entries) await fs.cp(path.join(image, entry), path.join(directory, '.autoscale-update-new', entry), { recursive: true });
+  await mutateStaged(path.join(directory, '.autoscale-update-new'));
+  await fs.writeFile(path.join(directory, '.autoscale-update.json'), JSON.stringify({ version: 1, to: NEW, entries, ...journal }));
+  return directory;
+}
+
+test('a link added after the staged check is caught in place and the old files come back', async () => {
+  const root = await tempDir('runner-final-check-');
+  const outside = path.join(root, 'outside-file');
+  await fs.writeFile(outside, 'outside');
+  // The escaping link appears after the journal (or a crash left it there); resuming must not install it.
+  const directory = await journaledRoll(root, 'runner-1', async staged => fs.symlink(outside, path.join(staged, 'externals/escape')));
+  await assert.rejects(rollSlot(directory, { overlayDir: root }), /image-escaping-symlink/);
+  assert.equal(await runnerFilesVersion(directory), OLD);
+  assert.equal(await fs.readFile(path.join(directory, 'externals/node24/bin/node'), 'utf8'), `node ${OLD}`);
+  assert.equal(await fs.lstat(path.join(directory, 'externals/escape')).then(() => true, () => false), false);
+  for (const leaf of ['.autoscale-update.json', '.autoscale-update-new', '.autoscale-update-old']) assert.equal(await exists(path.join(directory, leaf)), false, leaf);
+  assert.equal(await fs.readFile(outside, 'utf8'), 'outside');
+  assert.equal(await fs.readFile(path.join(directory, '_work/repo/file'), 'utf8'), 'workspace');
+  // A directory link into slot state is caught the same way.
+  const inward = await journaledRoll(root, 'runner-2', async staged => fs.symlink('../_work', path.join(staged, 'bin/work')));
+  await assert.rejects(rollSlot(inward, { overlayDir: root }));
+  assert.equal(await runnerFilesVersion(inward), OLD);
+  // An interrupted rollback resumes as a rollback, never as a roll forward.
+  const halfway = await journaledRoll(root, 'runner-3', async () => {}, { rollback: true });
+  await fs.mkdir(path.join(halfway, '.autoscale-update-old'));
+  await fs.rename(path.join(halfway, 'externals'), path.join(halfway, '.autoscale-update-old/externals'));
+  await fs.cp(path.join(halfway, '.autoscale-update-new/externals'), path.join(halfway, 'externals'), { recursive: true });
+  await assert.rejects(rollSlot(halfway, { overlayDir: root }), /rolled-back/);
+  assert.equal(await fs.readFile(path.join(halfway, 'externals/node24/bin/node'), 'utf8'), `node ${OLD}`);
+  assert.equal(await runnerFilesVersion(halfway), OLD);
+  assert.equal(await exists(path.join(halfway, '.autoscale-update.json')), false);
+});
+
+test('only an image this code built from the verified archive is trusted, with the same content checks', async () => {
+  const root = await tempDir('runner-update-root-');
+  // The verified archive carries a forbidden top-level .credentials file.
+  const { bytes, sha256 } = await archive(NEW, NEW, async content => fs.writeFile(path.join(content, '.credentials'), 'planted'));
+  const gh = mockGithub(release(NEW, sha256, sha256), bytes);
+  // A same-version image built elsewhere already sits at the target path and looks valid.
+  const image = path.join(root, `actions-runner-linux-x64-${NEW}.image`);
+  await runnerFiles(image, NEW);
+  const state = await checkForUpdate({ version: 1 }, config(), { root, now: 1000, fetchImpl: gh.fetchImpl, p: linux });
+  assert.equal(state.refusal?.reason, 'image-unexpected-entry');
+  assert.equal(state.target ?? null, null);
+  // A recorded target without this code's image identity is not ready, however valid it looks.
+  assert.equal(await readyTarget({ version: 1, target: { version: NEW, sha256, image: path.basename(image) } }, root), null);
+  // A clean release builds once and is reused by identity on the next check.
+  const clean = await archive(NEW);
+  const good = mockGithub(release(NEW, clean.sha256, clean.sha256), clean.bytes);
+  const root2 = await tempDir('runner-update-root-');
+  let built = await checkForUpdate({ version: 1 }, config(), { root: root2, now: 1000, fetchImpl: good.fetchImpl, p: linux });
+  const id = built.target.imageId;
+  assert.ok(await readyTarget(built, root2));
+  built = await checkForUpdate({ ...built, etag: null, target: built.target }, config(), { root: root2, now: 2000, fetchImpl: good.fetchImpl, p: linux });
+  assert.equal(built.target.imageId, id);
+});
+
+test('special files never block validation', { timeout: 20000 }, async () => {
+  const root = await tempDir('runner-fifo-');
+  const settle = (promise, label) => Promise.race([promise, sleep(3000).then(() => { throw new Error(`${label} blocked`); })]);
+  const image = path.join(root, 'image');
+  await runnerFiles(image, NEW);
+  await fs.rm(path.join(image, 'bin/Runner.Listener.deps.json'));
+  await exec('mkfifo', [path.join(image, 'bin/Runner.Listener.deps.json')]);
+  assert.equal(await settle(imageValid(image, NEW), 'imageValid'), false);
+  assert.equal(await settle(runnerFilesVersion(image), 'runnerFilesVersion'), null);
+  // A FIFO at the archive path is replaced by a verified download, not read.
+  const { bytes, sha256 } = await archive(NEW);
+  const gh = mockGithub(release(NEW, sha256, sha256), bytes);
+  await exec('mkfifo', [path.join(root, `actions-runner-linux-x64-${NEW}.tar.gz`)]);
+  const state = await settle(checkForUpdate({ version: 1 }, config(), { root, now: 1000, fetchImpl: gh.fetchImpl, p: linux }), 'checkForUpdate');
+  assert.equal(state.target.version, NEW);
+  assert.ok(await settle(readyTarget(state, root), 'readyTarget'));
+  // Slot files: a FIFO for the journal or blocked-slot evidence fails closed, promptly.
+  const directory = await slot(root, 'runner-1', OLD);
+  await exec('mkfifo', [path.join(directory, '.autoscale-update.json')]);
+  await assert.rejects(settle(rollSlot(directory, { overlayDir: root }), 'rollSlot'), /Unreadable runner update journal/);
+  const blocked = await blockedSlot(root, 'runner-2', OLD);
+  await fs.rm(path.join(blocked, '.autoscale-inflight.json'));
+  await exec('mkfifo', [path.join(blocked, '.autoscale-inflight.json')]);
+  assert.deepEqual(await settle(diagnoseBlockedSlot(blocked), 'diagnoseBlockedSlot'), { cause: 'unknown' });
 });
