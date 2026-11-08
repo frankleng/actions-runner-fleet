@@ -428,4 +428,91 @@ RUNNER_TEST_PROCESS_STATE="${process_state}" \
 grep -Fq "Runner\\.Listener" "${pgrep_log}"
 grep -Fq "Runner\\.Listener" "${pkill_log}"
 
+# A persistent runner's self-update leaves bin -> <runner>/bin.<version>. Kit
+# files go into that directory; a bin link that leaves the runner is refused.
+layout_registry="${temp_dir}/layout-runners.tsv"
+updated_runner="${temp_dir}/self-updated-runner"
+escaped_runner="${temp_dir}/escaped-runner"
+failing_runner="${temp_dir}/failing-runner"
+outside_dir="${temp_dir}/outside-bin"
+failing_provision_stub="${temp_dir}/failing-provision.sh"
+mkdir -p "${updated_runner}/bin.2.999.0" "${escaped_runner}" "${failing_runner}/bin" "${outside_dir}"
+ln -s "${updated_runner}/bin.2.999.0" "${updated_runner}/bin"
+ln -s "${outside_dir}" "${escaped_runner}/bin"
+for layout_runner in "${updated_runner}" "${escaped_runner}" "${failing_runner}"; do
+  printf '{"agentName":"%s","gitHubUrl":"https://github.com/example-org"}\n' \
+    "$(basename "${layout_runner}")" > "${layout_runner}/.runner"
+  RUNNER_REGISTRY_PATH="${layout_registry}" "${SCRIPT_PATH}" --cli track \
+    "$(basename "${layout_runner}")" "${layout_runner}" >/dev/null
+done
+cat > "${failing_provision_stub}" <<EOF
+#!/bin/bash
+case "\$*" in *failing-runner*) exit 1 ;; esac
+exec "${provision_stub}" "\$@"
+EOF
+chmod +x "${failing_provision_stub}"
+
+layout_env=(
+  RUNNER_REGISTRY_PATH="${layout_registry}"
+  RUNNER_PROVISION_SCRIPT_PATH="${failing_provision_stub}"
+  RUNNER_LAUNCHD_USER_HOME="${temp_dir}/launchd-user"
+  RUNNER_LAUNCH_PATH="${launch_daemons_path}"
+  RUNNER_LAUNCHCTL_BIN="${launchctl_stub}"
+  RUNNER_TEST_PROVISION_LOG="${provision_log}"
+  RUNNER_TEST_LAUNCHCTL_LOG="${launchctl_log}"
+  RUNNER_TEST_LAUNCHCTL_STATE="${launchctl_state}"
+  RUNNER_PGREP_BIN="${pgrep_stub}"
+  RUNNER_PKILL_BIN="${pkill_stub}"
+  RUNNER_TEST_PGREP_LOG="${pgrep_log}"
+  RUNNER_TEST_PKILL_LOG="${pkill_log}"
+  RUNNER_TEST_PROCESS_STATE="${process_state}"
+)
+
+env "${layout_env[@]}" "${SCRIPT_PATH}" --cli reconcile "self-updated-runner"
+[ -L "${updated_runner}/bin" ]
+[ -f "${updated_runner}/bin.2.999.0/runsvc.sh" ]
+[ -f "${updated_runner}/bin.2.999.0/autoscale-worker.mjs" ]
+[ -f "${updated_runner}/bin.2.999.0/actions.runner.plist.template" ]
+
+if env "${layout_env[@]}" "${SCRIPT_PATH}" --cli reconcile "escaped-runner" \
+  >/dev/null 2>"${temp_dir}/escaped.err"; then
+  echo "expected a bin link outside the runner to be refused"
+  exit 1
+fi
+grep -Fq "refusing to install kit files through bin/" "${temp_dir}/escaped.err"
+[ -z "$(ls -A "${outside_dir}")" ]
+
+# runsvc.sh restores dropped autoscale scripts into the linked bin.<version>
+# directory, and never through a link that leaves the runner.
+rm -f "${updated_runner}/bin.2.999.0/autoscale-worker.mjs"
+sed -n '/^kit_bin_dir() {/,/^restore_kit_bin_files$/p' "${ROOT_DIR}/overlay/runsvc.sh" \
+  > "${temp_dir}/restore-kit.sh"
+(cd "${updated_runner}" && bash -euo pipefail "${temp_dir}/restore-kit.sh")
+[ -f "${updated_runner}/bin.2.999.0/autoscale-worker.mjs" ]
+printf '%s\n' "${ROOT_DIR}" > "${escaped_runner}/.kit-root"
+(cd "${escaped_runner}" && bash -euo pipefail "${temp_dir}/restore-kit.sh")
+[ -z "$(ls -A "${outside_dir}")" ]
+
+env "${layout_env[@]}" RUNNER_PROVISION_SCRIPT_PATH="${provision_stub}" \
+  "${SCRIPT_PATH}" --cli reconcile "failing-runner"
+
+# reconcile-all checks a runner before stopping it, and restarts a runner whose
+# reconcile fails instead of leaving it down; either way it reports the failure.
+: > "${launchctl_log}"
+: > "${launchctl_state}"
+if env "${layout_env[@]}" "${SCRIPT_PATH}" --cli reconcile-all \
+  >"${temp_dir}/reconcile-all.out" 2>"${temp_dir}/reconcile-all.err"; then
+  echo "expected reconcile-all to report the refused and failed runners"
+  exit 1
+fi
+grep -Fq "skipped escaped-runner; it was not stopped" "${temp_dir}/reconcile-all.err"
+grep -Fq "reconcile failed for failing-runner; restarting it" "${temp_dir}/reconcile-all.err"
+grep -Fq "finished with problems: escaped-runner failing-runner" "${temp_dir}/reconcile-all.err"
+if grep -q "escaped-runner" "${launchctl_log}"; then
+  echo "expected the refused runner to be left running"
+  exit 1
+fi
+grep -Fxq "actions.runner.example-org.self-updated-runner" "${launchctl_state}"
+grep -Fxq "actions.runner.example-org.failing-runner" "${launchctl_state}"
+
 bash "${ROOT_DIR}/tests/runner-service-generation-smoke.sh"

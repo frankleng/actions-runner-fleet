@@ -488,7 +488,12 @@ the service. Hook paths and environment settings persist across runner upgrades.
 
 Apply updates to existing runners with `./manage-runners.sh reconcile-all`,
 which stops, updates, and starts each runner in turn. Run this when jobs are
-idle because reconciliation restarts services.
+idle because reconciliation restarts services. A runner is checked before it is
+stopped: one the kit refuses to update is skipped while still running, and one
+whose update fails part-way is started again on the files it has. Either way
+`reconcile-all` lists it and exits non-zero. A persistent runner's own
+self-update leaves `bin` as a link to `bin.<version>` inside the runner; kit
+files go into that directory, and a `bin` link to anywhere else is refused.
 The cleanup owns only `tmp/managed-job`; it does not remove old host `/tmp`
 files, other runner temporary files, or shared caches. Tools that hard-code
 `/tmp` use the host storage configured above. A single job can still exhaust storage

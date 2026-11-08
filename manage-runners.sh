@@ -208,18 +208,58 @@ install_kit_file() {
   cp "$1" "$2"
 }
 
-copy_overlay() {
-  local runner_dir="$1" kit_dir
+# Print the directory that kit files for bin/ go into. A persistent runner's
+# self-update leaves bin as a link to a sibling bin.<version> directory; that
+# is the only link accepted, so kit files never land outside the runner.
+resolve_kit_bin_dir() {
+  local runner_dir="$1" link target_name target_parent physical_runner_dir
+
+  if [ ! -L "${runner_dir}/bin" ]; then
+    printf '%s\n' "${runner_dir}/bin"
+    return 0
+  fi
+
+  link="$(readlink "${runner_dir}/bin")"
+  case "${link}" in
+    /*) ;;
+    *) link="${runner_dir}/${link}" ;;
+  esac
+  target_name="${link##*/}"
+  target_parent="${link%/*}"
+  # Callers may test this in a condition, where errexit is off: fail explicitly.
+  physical_runner_dir="$(cd -P "${runner_dir}" && pwd)" || return 1
+  [ -n "${physical_runner_dir}" ] || return 1
+  if [[ "${target_name}" =~ ^bin\.[0-9]+(\.[0-9]+)*$ ]] &&
+     [ -d "${link}" ] && [ ! -L "${link}" ] &&
+     [ "$(cd -P "${target_parent}" 2>/dev/null && pwd)" = "${physical_runner_dir}" ]; then
+    printf '%s\n' "${runner_dir}/${target_name}"
+    return 0
+  fi
+
+  echo "refusing to install kit files through bin/ in ${runner_dir}: it links to ${link}, not a bin.<version> directory in the runner" >&2
+  return 1
+}
+
+# Everything copy_overlay refuses, checked without changing anything so callers
+# can verify a runner before stopping it.
+check_overlay_destinations() {
+  local runner_dir="$1"
 
   validate_service_path "${runner_dir}"
   require_overlay
-  for kit_dir in bin job-hooks; do
-    if [ -L "${runner_dir}/${kit_dir}" ]; then
-      echo "refusing to install kit files through a symlinked ${kit_dir}/ in ${runner_dir}" >&2
-      exit 1
-    fi
-  done
-  mkdir -p "${runner_dir}/bin" "${runner_dir}/job-hooks"
+  if [ -L "${runner_dir}/job-hooks" ]; then
+    echo "refusing to install kit files through a symlinked job-hooks/ in ${runner_dir}" >&2
+    return 1
+  fi
+  resolve_kit_bin_dir "${runner_dir}" >/dev/null
+}
+
+copy_overlay() {
+  local runner_dir="$1" kit_bin_dir
+
+  check_overlay_destinations "${runner_dir}"
+  kit_bin_dir="$(resolve_kit_bin_dir "${runner_dir}")"
+  mkdir -p "${kit_bin_dir}" "${runner_dir}/job-hooks"
   rm -f "${runner_dir}/.kit-root"
   printf '%s\n' "${ROOT_DIR}" > "${runner_dir}/.kit-root"
   install_kit_file "${OVERLAY_DIR}/env.sh" "${runner_dir}/env.sh"
@@ -228,16 +268,16 @@ copy_overlay() {
   else
     install_kit_file "${OVERLAY_DIR}/svc.sh" "${runner_dir}/svc.sh"
   fi
-  install_kit_file "${OVERLAY_DIR}/runsvc.sh" "${runner_dir}/bin/runsvc.sh"
-  install_kit_file "${OVERLAY_DIR}/autoscale-lock.mjs" "${runner_dir}/bin/autoscale-lock.mjs"
-  install_kit_file "${OVERLAY_DIR}/autoscale-worker.mjs" "${runner_dir}/bin/autoscale-worker.mjs"
+  install_kit_file "${OVERLAY_DIR}/runsvc.sh" "${kit_bin_dir}/runsvc.sh"
+  install_kit_file "${OVERLAY_DIR}/autoscale-lock.mjs" "${kit_bin_dir}/autoscale-lock.mjs"
+  install_kit_file "${OVERLAY_DIR}/autoscale-worker.mjs" "${kit_bin_dir}/autoscale-worker.mjs"
   install_kit_file "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-started.sh"
   install_kit_file "${OVERLAY_DIR}/runner-job-temp.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
   chmod u+x "${runner_dir}/job-hooks/runner-job-started.sh" "${runner_dir}/job-hooks/runner-job-completed.sh"
-  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.plist.template" "${runner_dir}/bin/actions.runner.plist.template"
-  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.agent.plist.template" "${runner_dir}/bin/actions.runner.agent.plist.template"
-  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.service.template" "${runner_dir}/bin/actions.runner.service.template"
-  chmod u+x "${runner_dir}/env.sh" "${runner_dir}/svc.sh" "${runner_dir}/bin/runsvc.sh"
+  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.plist.template" "${kit_bin_dir}/actions.runner.plist.template"
+  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.agent.plist.template" "${kit_bin_dir}/actions.runner.agent.plist.template"
+  install_kit_file "${OVERLAY_DIR}/bin/actions.runner.service.template" "${kit_bin_dir}/actions.runner.service.template"
+  chmod u+x "${runner_dir}/env.sh" "${runner_dir}/svc.sh" "${kit_bin_dir}/runsvc.sh"
 }
 
 ensure_runtime_roots() {
@@ -380,6 +420,7 @@ ensure_runner_stopped() {
 reconcile_all_runners() {
   local runner_name
   local runner_dir
+  local failed_runners=()
 
   if [ "${RUNNER_SERVICE_MANAGER}" = "launchd" ] &&
      [ "${RUNNER_LAUNCHD_TEST_SKIP_ROOT:-0}" != "1" ] &&
@@ -402,6 +443,12 @@ reconcile_all_runners() {
     [ -n "${runner_dir}" ] || continue
 
     echo "rolling reconcile for ${runner_name}"
+    # Refuse before stopping: a runner the kit cannot update keeps running.
+    if ! (check_overlay_destinations "${runner_dir}"); then
+      echo "skipped ${runner_name}; it was not stopped" >&2
+      failed_runners+=("${runner_name}")
+      continue
+    fi
     if [ -x "${runner_dir}/svc.sh" ]; then
       (
         cd "${runner_dir}"
@@ -409,13 +456,23 @@ reconcile_all_runners() {
       )
       ensure_runner_stopped "${runner_dir}"
     fi
-    reconcile_runner_dir "${runner_dir}"
-    (
-      cd "${runner_dir}"
-      ./svc.sh start
-    )
-    wait_for_runner_start "${runner_dir}"
+    # A separate process keeps errexit in force inside the reconcile; a failure
+    # still restarts the runner on whatever files it has rather than leaving it down.
+    if ! "${ROOT_DIR}/manage-runners.sh" reconcile "${runner_name}" </dev/null; then
+      echo "reconcile failed for ${runner_name}; restarting it" >&2
+      failed_runners+=("${runner_name}")
+    fi
+    if ! (cd "${runner_dir}" && ./svc.sh start) ||
+       ! (wait_for_runner_start "${runner_dir}"); then
+      echo "${runner_name} did not start; check ./manage-runners.sh status ${runner_name}" >&2
+      failed_runners+=("${runner_name}")
+    fi
   done < <(tracked_runner_rows)
+
+  if [ "${#failed_runners[@]}" -gt 0 ]; then
+    echo "reconcile-all finished with problems: $(printf '%s\n' "${failed_runners[@]}" | sort -u | tr '\n' ' ')" >&2
+    exit 1
+  fi
 }
 
 # Extract the runner archive once per archive; new runner directories are

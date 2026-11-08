@@ -189,16 +189,41 @@ prepare_macos_cpu_limiter
 start_log_pruner
 
 # A runner self-update replaces bin/ and drops the kit's autoscale scripts.
+# It leaves bin as a link to a sibling bin.<version> directory; write only
+# there, never through a link that leads anywhere else.
+kit_bin_dir() {
+  local link target_name
+
+  if [ ! -L bin ]; then
+    printf '%s\n' bin
+    return 0
+  fi
+  link="$(readlink bin)" || return 1
+  case "${link}" in
+    /*) ;;
+    *) link="${PWD}/${link}" ;;
+  esac
+  target_name="${link##*/}"
+  if [[ "${target_name}" =~ ^bin\.[0-9]+(\.[0-9]+)*$ ]] &&
+     [ -d "${target_name}" ] && [ ! -L "${target_name}" ] &&
+     [ "$(cd -P "${link%/*}" 2>/dev/null && pwd)" = "$(pwd -P)" ]; then
+    printf '%s\n' "${target_name}"
+    return 0
+  fi
+  return 1
+}
+
 restore_kit_bin_files() {
-  local kit_overlay kit_file
+  local kit_overlay kit_file kit_bin
 
   [ -f .kit-root ] || return 0
+  kit_bin="$(kit_bin_dir)" || return 0
   kit_overlay="$(cat .kit-root)/overlay"
   for kit_file in autoscale-lock.mjs autoscale-worker.mjs; do
-    if [ ! -f "bin/${kit_file}" ] && [ -f "${kit_overlay}/${kit_file}" ] && [ ! -L bin ]; then
+    if [ ! -f "${kit_bin}/${kit_file}" ] && [ -f "${kit_overlay}/${kit_file}" ]; then
       # A dangling link fails -f; remove it rather than write through it.
-      rm -f "bin/${kit_file}"
-      cp "${kit_overlay}/${kit_file}" "bin/${kit_file}"
+      rm -f "${kit_bin}/${kit_file}"
+      cp "${kit_overlay}/${kit_file}" "${kit_bin}/${kit_file}"
     fi
   done
 }
