@@ -810,6 +810,32 @@ current quotas and parked services in place. The service restarts after controll
 automatically when their controller or worker exits. Interrupted generations
 remain protected against credential replay.
 
+### Several organizations on one host
+
+One checkout runs one controller for one `target`: the controller unit name,
+lock, token file, health and update state, slot registry, and tool cache are
+all keyed to the kit root. To autoscale a second organization or repository on
+the same host, give it its own checkout instead of a second config here:
+
+```bash
+git clone /path/to/first/checkout /path/to/actions-runner-OTHER   # or gh repo clone
+cd /path/to/actions-runner-OTHER
+./prepare.sh
+# Edit autoscale.json: its own target, repositories, labels, runnerGroupId,
+# and a `runners` list of names unique on this host.
+(umask 077; cp /path/to/first/checkout/.autoscale-token .)   # when the token covers both owners
+./runnerctl autoscale --prepare
+./runnerctl health --install
+```
+
+Each checkout gets its own `runnerctl-autoscale-<hash>` controller, slot
+services named `actions.runner.<owner>.<name>`, and caches. Installing them runs
+only `systemctl --user daemon-reload`; existing runners are not restarted. The
+controllers size and throttle independently, so keep the sum of their maximums
+within what the host can carry. Pools on the same account share an OS user, so
+this separates scheduling and caches, not security: jobs in every pool can read
+the other checkouts and their token files.
+
 API references: [workflow runs](https://docs.github.com/en/rest/actions/workflow-runs),
 [workflow jobs](https://docs.github.com/en/rest/actions/workflow-jobs), and
 [JIT runner configuration](https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-an-organization).
