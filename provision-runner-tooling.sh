@@ -89,6 +89,13 @@ PNPM_STORE_DIR="${RUNNER_PNPM_STORE_DIR:-${SCRIPT_DIR}/.pnpm-store}"
 NPM_CACHE_DIR="${HOST_TOOLS_DIR}/npm-cache"
 PULUMI_HOME="${HOST_TOOLS_DIR}/pulumi-home"
 RUNNER_HOME="${ROOT_DIR}/home"
+# Jobs must not inherit the service user's XDG directories: tools such as
+# wrangler, gh, and pnpm read them before HOME, so an inherited
+# XDG_CONFIG_HOME would hand every job the host account's own logins.
+RUNNER_XDG_CONFIG_HOME="${RUNNER_HOME}/.config"
+RUNNER_XDG_CACHE_HOME="${RUNNER_HOME}/.cache"
+RUNNER_XDG_DATA_HOME="${RUNNER_HOME}/.local/share"
+RUNNER_XDG_STATE_HOME="${RUNNER_HOME}/.local/state"
 RUNNER_TMP="${ROOT_DIR}/tmp"
 RUNNER_TEMP="${ROOT_DIR}/_work/_temp"
 RUNNER_TOOL_CACHE="${RUNNER_SHARED_TOOL_CACHE:-${HOST_TOOLS_DIR}/tool-cache}"
@@ -212,6 +219,10 @@ EOF
 env_file_lines() {
   printf 'LANG=%q\n' "${LANG:-en_US.UTF-8}"
   printf 'HOME=%q\n' "${RUNNER_HOME}"
+  printf 'XDG_CONFIG_HOME=%q\n' "${RUNNER_XDG_CONFIG_HOME}"
+  printf 'XDG_CACHE_HOME=%q\n' "${RUNNER_XDG_CACHE_HOME}"
+  printf 'XDG_DATA_HOME=%q\n' "${RUNNER_XDG_DATA_HOME}"
+  printf 'XDG_STATE_HOME=%q\n' "${RUNNER_XDG_STATE_HOME}"
   printf 'TMPDIR=%q\n' "${RUNNER_TMP}/managed-job"
   printf 'TMP=%q\n' "${RUNNER_TMP}/managed-job"
   printf 'TEMP=%q\n' "${RUNNER_TMP}/managed-job"
@@ -311,6 +322,10 @@ write_env_files() {
 
   mkdir -p \
     "${RUNNER_HOME}/Library/Logs" \
+    "${RUNNER_XDG_CONFIG_HOME}" \
+    "${RUNNER_XDG_CACHE_HOME}" \
+    "${RUNNER_XDG_DATA_HOME}" \
+    "${RUNNER_XDG_STATE_HOME}" \
     "${RUNNER_TMP}" \
     "${RUNNER_TMP}/managed-job" \
     "${RUNNER_TEMP}" \
@@ -760,6 +775,10 @@ if [ "${WRITE_ENV}" -eq 1 ]; then
 fi
 
 ensure_directory "${RUNNER_HOME}/Library/Logs"
+ensure_directory "${RUNNER_XDG_CONFIG_HOME}"
+ensure_directory "${RUNNER_XDG_CACHE_HOME}"
+ensure_directory "${RUNNER_XDG_DATA_HOME}"
+ensure_directory "${RUNNER_XDG_STATE_HOME}"
 ensure_directory "${RUNNER_TMP}"
 ensure_directory "${RUNNER_TEMP}"
 ensure_directory "${RUNNER_TOOL_CACHE}"

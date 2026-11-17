@@ -53,6 +53,10 @@ env_output="$(run_provision --dry-run --print-env)"
 manifest_output="$(run_provision --dry-run --print-manifest)"
 
 printf '%s\n' "${env_output}" | grep -q "HOME=${temp_dir}/home"
+printf '%s\n' "${env_output}" | grep -qx "XDG_CONFIG_HOME=${temp_dir}/home/.config"
+printf '%s\n' "${env_output}" | grep -qx "XDG_CACHE_HOME=${temp_dir}/home/.cache"
+printf '%s\n' "${env_output}" | grep -qx "XDG_DATA_HOME=${temp_dir}/home/.local/share"
+printf '%s\n' "${env_output}" | grep -qx "XDG_STATE_HOME=${temp_dir}/home/.local/state"
 printf '%s\n' "${env_output}" | grep -q "TMPDIR=${temp_dir}/tmp/managed-job"
 printf '%s\n' "${env_output}" | grep -q "RUNNER_TEMP=${temp_dir}/_work/_temp"
 printf '%s\n' "${env_output}" | grep -q "RUNNER_TOOL_CACHE=${tool_cache_dir}"
@@ -74,8 +78,15 @@ if printf '%s\n' "${env_output}" | grep -Fq "${host_home}/setup-pnpm"; then
 fi
 
 unset HOME TMPDIR RUNNER_TEMP RUNNER_TOOL_CACHE PNPM_HOME COREPACK_HOME PULUMI_HOME
+# The service user's XDG directories must be replaced, not inherited.
+export XDG_CONFIG_HOME="${host_home}/.config" XDG_CACHE_HOME="${host_home}/.cache"
+export XDG_DATA_HOME="${host_home}/.local/share" XDG_STATE_HOME="${host_home}/.local/state"
 eval "${env_output}"
 [[ "${HOME}" == "${temp_dir}/home" ]]
+[[ "${XDG_CONFIG_HOME}" == "${temp_dir}/home/.config" ]]
+[[ "${XDG_CACHE_HOME}" == "${temp_dir}/home/.cache" ]]
+[[ "${XDG_DATA_HOME}" == "${temp_dir}/home/.local/share" ]]
+[[ "${XDG_STATE_HOME}" == "${temp_dir}/home/.local/state" ]]
 [[ "${TMPDIR}" == "${temp_dir}/tmp/managed-job" ]]
 [[ "${RUNNER_TEMP}" == "${temp_dir}/_work/_temp" ]]
 [[ "${RUNNER_TOOL_CACHE}" == "${tool_cache_dir}" ]]
@@ -101,6 +112,10 @@ grep -qx 'RUNNER_PREVIOUS_JOB_STARTED_HOOK=/custom/start.sh' "${temp_dir}/.env"
 grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=${temp_dir}/job-hooks/runner-job-started.sh" "${temp_dir}/.env"
 [ -f "${temp_dir}/.env" ]
 [ -f "${temp_dir}/.path" ]
+grep -qx "XDG_CONFIG_HOME=${temp_dir}/home/.config" "${temp_dir}/.env"
+for xdg_dir in .config .cache .local/share .local/state; do
+  [ -d "${temp_dir}/home/${xdg_dir}" ]
+done
 [ -x "${temp_dir}/tools/bin/wrangler" ]
 [ ! -L "${temp_dir}/tools/bin/wrangler" ]
 [ "$("${temp_dir}/tools/bin/wrangler" --version)" = "4.69.0" ]

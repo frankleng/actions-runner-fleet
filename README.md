@@ -471,6 +471,17 @@ Repeated application is safe. Hosts with an explicit `/tmp` entry in
 configuration; the command refuses to change them. It does not rewrite a
 local administrator's `tmp.mount` unit.
 
+### Per-runner home and XDG directories
+
+Each runner's `.env` sets `HOME` to the runner's own `home` directory and
+points `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, and
+`XDG_STATE_HOME` at `home/.config`, `home/.cache`, `home/.local/share`, and
+`home/.local/state`. Tools such as wrangler, gh, and pnpm read XDG directories
+before `HOME`, so a job that inherited the service account's
+`XDG_CONFIG_HOME` would silently use that account's own logins. Run
+`./provision-runner-tooling.sh --root <runner> --write-env` to refresh an
+existing runner's `.env`; the runner applies it when it next starts.
+
 ### Automatic job temporary cleanup
 
 Managed services set `TMPDIR`, `TMP`, and `TEMP` to the runner's
