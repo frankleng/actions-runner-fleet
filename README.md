@@ -816,6 +816,7 @@ hosts can claim queued jobs first.
 | `minCpuQuotaPercent` / `maxCpuQuotaPercent` | `auto` / 800 | Per-runner quota bounds; 100% means one logical CPU. The automatic floor is an eighth of the host, between 100% and 400%, and never above the ceiling |
 | `runnerUpdates` | `auto` | `auto` moves slots to newer verified runner releases; `off` leaves every slot on the runner it has ([Runner updates](#runner-updates)) |
 | `runnerVersion` | none | Pin slots to this exact release (for example `"2.338.2"`) instead of the latest; slots never move backwards |
+| `capacity` | `host` | `host` sizes and throttles from the whole machine; `cgroup` (Linux) from the CPU and memory limits of the container the controller runs in ([Organization containers](#organization-containers-linux)) |
 
 The CPU budget is divided among the runners expected to work: busy ones plus
 those about to take queued jobs. Idle warm listeners use no CPU, so they do not
@@ -902,6 +903,9 @@ controllers size and throttle independently, so keep the sum of their maximums
 within what the host can carry. Pools on the same account share an OS user, so
 this separates scheduling and caches, not security: jobs in every pool can read
 the other checkouts and their token files.
+On Linux, [organization containers](#organization-containers-linux) give
+each organization its own network namespace, Docker daemon, environment,
+files and CPU/memory limits instead.
 
 API references: [workflow runs](https://docs.github.com/en/rest/actions/workflow-runs),
 [workflow jobs](https://docs.github.com/en/rest/actions/workflow-jobs), and
@@ -1006,6 +1010,67 @@ cat .autoscale-runner-update.json   # target, refusal, or error; never a token
 ./runnerctl health --dry-run        # slot-blocked details name deprecated slots
 journalctl --user -u 'runnerctl-autoscale-*' -n 50 --no-pager | grep -i runner
 ```
+
+## Organization containers (Linux)
+
+Opt-in alternative to running an organization's runners directly on the host:
+each organization gets one long-lived container with its own network
+namespace, Docker daemon, systemd, filesystem and CPU/memory limits. Inside
+it, the unchanged kit runs that organization's autoscaler and slots. Jobs'
+`services:` and `container:` bridges stay inside the organization's network,
+so they no longer change the host's addresses under other organizations'
+browser tests. Jobs inherit nothing from the host account: no session
+environment, home, `PATH` or `sudo`. The design, security boundaries,
+prerequisites and migration runbook are in
+[docs/org-containers.md](docs/org-containers.md).
+
+Requirements: Linux with cgroup v2, Docker, and
+[Sysbox](https://github.com/nestybox/sysbox) (`sysbox-runc`), installed once
+by root. Sysbox runs systemd and dockerd in the container without
+`--privileged`, and root in the container is not root on the host. A
+`"runtime": "privileged"` fallback exists for hosts without Sysbox. There,
+container root **is** host root, so it needs `"allowPrivileged": true` and
+gives jobs no `sudo`.
+
+Configure organizations in the ignored, owner-only `org-containers.json`:
+
+```bash
+cp org-containers.example.json org-containers.json && chmod 600 org-containers.json
+# Per org: a unique unused uid (2000-59999), cpus, memory, and a network subnet.
+./runnerctl org check-host                 # what is missing
+./runnerctl org render ORG                 # every command, printed; nothing runs
+./runnerctl org setup-script ORG > setup.sh && sudo bash setup.sh   # root: data directories, kit clone
+./runnerctl org build ORG                  # image from container/
+./runnerctl org network ORG                # the org's bridge, created once
+./runnerctl org create ORG && ./runnerctl org start ORG
+```
+
+Then set up the kit inside, as on a host, with `"capacity": "cgroup"` in its
+`autoscale.json`. That makes the controller size the pool and measure load
+from the container's limits, not the whole host. Pipe the org's own token in
+on stdin:
+
+```bash
+./runnerctl org exec ORG -- ./prepare.sh
+read -rs -p 'Token: ' t && printf '%s\n' "$t" |
+  ./runnerctl org exec ORG -- sh -c 'umask 077 && cat > .autoscale-token'; unset t; echo
+./runnerctl org exec ORG -- ./runnerctl autoscale --prepare
+```
+
+Day to day:
+
+```bash
+./runnerctl org status [ORG]     # container, health, limits, image drift, autoscaler, listeners, jobs
+./runnerctl org stats [ORG]      # runnerctl stats from every container: one row per runner, as ORG/NAME
+./runnerctl org drain ORG        # disable the autoscaler and wait until no job runs
+./runnerctl org stop ORG         # refuses while a job runs (--force overrides)
+./runnerctl org upgrade ORG      # rebuild, drain, recreate on the new image, re-enable
+```
+
+Containers restart at boot through Docker's `unless-stopped` policy. A stopped
+container stays stopped. Every lifecycle command accepts `--dry-run`. Each
+organization's kit, runner home, `/tmp` and Docker data are bind mounts under
+`dataRoot`, so upgrades keep runner state and images.
 
 ## Health alerts
 

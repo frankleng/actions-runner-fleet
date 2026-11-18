@@ -18,3 +18,7 @@ substitute values from documentation, prior conversations, or memory.
 Active runners take about 11 seconds to sample because disk and network rates
 need two intervals. For programmatic analysis, `./runnerctl stats --json`
 returns the same resource data as raw numeric values.
+
+On a host with organization containers (`org-containers.json`), those
+runners live inside the containers: also run `./runnerctl org stats`, which
+returns the same table with one row per runner named `ORG/NAME`.
