@@ -2,6 +2,35 @@
 
 set -euo pipefail
 
+# A service inherits its manager's environment, and a systemd user manager on a
+# desktop also holds the login session's: SSH and GPG agent sockets, the D-Bus
+# session bus, the display, and API keys from environment.d. Every job step
+# would inherit them. Re-exec from an allowlist instead: the account's identity
+# and locale, proxy and CA settings, and the kit's own settings. .env and .path
+# supply the rest.
+is_service_environment_variable() {
+  case "$1" in
+    HOME|USER|LOGNAME|SHELL|PATH|LANG|LANGUAGE|LC_*|TZ|TERM) return 0 ;;
+    INVOCATION_ID|JOURNAL_STREAM|__CF_USER_TEXT_ENCODING) return 0 ;;
+    http_proxy|https_proxy|ftp_proxy|all_proxy|no_proxy) return 0 ;;
+    HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY|NO_PROXY) return 0 ;;
+    SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE) return 0 ;;
+    RUNNER_*|ACTIONS_RUNNER_*|PNPM_HOME|COREPACK_HOME|PULUMI_HOME) return 0 ;;
+  esac
+  return 1
+}
+
+if [ "${1:-}" != "--allowlisted-environment" ]; then
+  kept_environment=()
+  for variable_name in $(compgen -e); do
+    if is_service_environment_variable "${variable_name}"; then
+      kept_environment+=("${variable_name}=${!variable_name}")
+    fi
+  done
+  exec /usr/bin/env -i ${kept_environment[@]+"${kept_environment[@]}"} \
+    "${BASH}" "${BASH_SOURCE[0]}" --allowlisted-environment
+fi
+
 RUNNER_LOG_PRUNE_INTERVAL_SECONDS="${RUNNER_LOG_PRUNE_INTERVAL_SECONDS:-3600}"
 RUNNER_DEFAULT_CPU_QUOTA_PERCENT="${RUNNER_DEFAULT_CPU_QUOTA_PERCENT:-}"
 RUNNER_CPU_QUOTA_PATH="${RUNNER_CPU_QUOTA_PATH:-.cpu-quota}"

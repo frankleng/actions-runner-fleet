@@ -39,11 +39,17 @@ if "${temp_dir}/tools/bin/wrangler" --version >/dev/null 2>&1; then
   exit 1
 fi
 host_home="${temp_dir}/host-home"
-mkdir -p "${host_home}/Library/pnpm" "${host_home}/setup-pnpm"
+mkdir -p "${host_home}/Library/pnpm" "${host_home}/setup-pnpm" "${host_home}/.local/bin"
+# The account's own tools: jobs get only the carried gh, through tools/bin.
+for host_tool in gh gcc make; do
+  printf '#!/bin/sh\necho host %s\n' "${host_tool}" > "${host_home}/.local/bin/${host_tool}"
+  chmod u+x "${host_home}/.local/bin/${host_tool}"
+done
+provision_path="/usr/bin:${host_home}/.local/bin:/bin:${host_home}/Library/pnpm:/usr/sbin:${host_home}/setup-pnpm/:/sbin:relative-bin::/Applications/Little Snitch.app/Contents/Components"
 
 run_provision() {
   HOME="${host_home}" \
-  PATH="/usr/bin:/bin:${host_home}/Library/pnpm:/usr/sbin:${host_home}/setup-pnpm:/sbin:/Applications/Little Snitch.app/Contents/Components" \
+  PATH="${provision_path}" \
   RUNNER_HOST_TOOLS_DIR="${host_tools_dir}" \
   RUNNER_PNPM_STORE_DIR="${pnpm_store_dir}" \
     /bin/bash "${SCRIPT_PATH}" --root "${temp_dir}" "$@"
@@ -74,6 +80,14 @@ if printf '%s\n' "${env_output}" | grep -Fq "${host_home}/Library/pnpm"; then
 fi
 if printf '%s\n' "${env_output}" | grep -Fq "${host_home}/setup-pnpm"; then
   echo "expected runner-local PATH to exclude the host setup-pnpm directory"
+  exit 1
+fi
+if printf '%s\n' "${env_output}" | grep -Fq "${host_home}"; then
+  echo "expected runner-local PATH to exclude every host home directory"
+  exit 1
+fi
+if printf '%s\n' "${env_output}" | grep -q '^PATH=.*relative-bin'; then
+  echo "expected runner-local PATH to exclude relative entries"
   exit 1
 fi
 
@@ -121,6 +135,39 @@ done
 [ "$("${temp_dir}/tools/bin/wrangler" --version)" = "4.69.0" ]
 grep -q "RUNNER_TOOL_CACHE=${tool_cache_dir}" "${temp_dir}/.env"
 grep -q "^${temp_dir}/tools/bin:" "${temp_dir}/.path"
+if grep -Fq "${host_home}" "${temp_dir}/.path"; then
+  echo "expected .path to exclude every host home directory"
+  exit 1
+fi
+system_gh=0
+for system_dir in /usr/bin /bin /usr/sbin /sbin; do
+  if [ -x "${system_dir}/gh" ]; then system_gh=1; fi
+done
+if [ "${system_gh}" -eq 1 ]; then
+  echo "skipping gh carry checks: this host has a system gh"
+  [ ! -e "${temp_dir}/tools/bin/gh" ]
+else
+  [ -L "${temp_dir}/tools/bin/gh" ]
+  [ "$(readlink "${temp_dir}/tools/bin/gh")" = "${host_home}/.local/bin/gh" ]
+  [ ! -e "${temp_dir}/tools/bin/gcc" ] && [ ! -e "${temp_dir}/tools/bin/make" ]
+  # Provisioning from a PATH without the home (the autoscale controller's) keeps
+  # the working link.
+  provision_path="/usr/bin:/bin" run_provision --write-env
+  [ "$(readlink "${temp_dir}/tools/bin/gh")" = "${host_home}/.local/bin/gh" ]
+  # Once the runner PATH provides gh itself, the kit's link goes.
+  mkdir -p "${temp_dir}/system-bin"
+  printf '#!/bin/sh\necho system gh\n' > "${temp_dir}/system-bin/gh"
+  chmod u+x "${temp_dir}/system-bin/gh"
+  provision_path="/usr/bin:${host_home}/.local/bin:${temp_dir}/system-bin:/bin" run_provision --write-env
+  [ ! -e "${temp_dir}/tools/bin/gh" ] && [ ! -L "${temp_dir}/tools/bin/gh" ]
+  # A gh the kit did not link stays.
+  printf '#!/bin/sh\necho own gh\n' > "${temp_dir}/tools/bin/gh"
+  run_provision --write-env
+  [ ! -L "${temp_dir}/tools/bin/gh" ] && grep -q 'own gh' "${temp_dir}/tools/bin/gh"
+  rm -rf "${temp_dir}/tools/bin/gh" "${temp_dir}/system-bin"
+  run_provision --write-env
+  [ -L "${temp_dir}/tools/bin/gh" ]
+fi
 grep -qx "store-dir=${pnpm_store_dir}" "${temp_dir}/home/.npmrc"
 grep -qx "cache=${host_tools_dir}/npm-cache" "${temp_dir}/home/.npmrc"
 

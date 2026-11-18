@@ -482,6 +482,39 @@ before `HOME`, so a job that inherited the service account's
 `./provision-runner-tooling.sh --root <runner> --write-env` to refresh an
 existing runner's `.env`; the runner applies it when it next starts.
 
+### No login-session environment
+
+A systemd user manager on a desktop host also holds the login session's
+environment: `SSH_AUTH_SOCK` and `GPG_AGENT_INFO` (agents that sign in as the
+account), `DBUS_SESSION_BUS_ADDRESS` (its keyring), `DISPLAY` and
+`XAUTHORITY`, and whatever `~/.config/environment.d` adds, such as API keys.
+Every job step would inherit them. `runsvc.sh` therefore starts the listener
+from an allowlist: `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, locale and `TZ`,
+proxy and CA bundle variables, and the kit's `RUNNER_*` and `ACTIONS_RUNNER_*`
+settings. `.env` and `.path` supply the rest. The systemd unit also unsets the
+session variables with `UnsetEnvironment=`. Give jobs anything else through
+workflow `env:` or secrets, not the service manager's environment. This
+applies to macOS launchd services too; Windows scheduled tasks use S4U logons,
+which have no desktop session.
+
+`.path` keeps the provisioning shell's `PATH` minus every entry inside the
+account's home (its `~/.local/bin`, pnpm globals, and the like) and every
+relative entry, so jobs never pick up that account's own compilers or
+wrappers. A kit checkout inside the home stays usable. `gh`, which
+GitHub-hosted images provide, is the one exception: when only a dropped home
+entry has it, `--write-env` links it into the runner's `tools/bin`, and removes
+that link once the remaining `PATH` provides `gh`. Jobs still run as the
+service account, so a job that knows the path to a socket or file under
+that account's home can still reach it; only a separate account isolates
+that.
+
+Both take effect when a runner's service next starts. An autoscaled slot's
+supervisor runs generation after generation without restarting, so to apply
+them, stop the autoscale controller, so it hands out no generation meanwhile,
+then restart only slots that are idle (`.autoscale-state.json` phase `ready`,
+with no `.autoscale-request.json`, `.autoscale-inflight.json`, or `.runner`),
+then start the controller again.
+
 ### Automatic job temporary cleanup
 
 Managed services set `TMPDIR`, `TMP`, and `TEMP` to the runner's

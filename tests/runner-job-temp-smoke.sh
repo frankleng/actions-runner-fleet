@@ -62,6 +62,56 @@ if [ "$(uname -s)" = Linux ]; then
     RUNNER_LOG_PRUNE_INTERVAL_SECONDS=0 bash ./runsvc.sh)
   [ -f "${test_root}/ambient-hook-tested" ]
 
+  # A desktop session's agents, bus, display, and API keys must not reach the
+  # listener, and so any job; the service's own settings must.
+  cat > "${test_root}/externals/node20/bin/node" <<'NODE'
+#!/bin/bash
+env > ./listener-environment
+declare -F > ./listener-functions
+NODE
+  printf 'HOME=%s/home\n' "${test_root}" > "${test_root}/.env"
+  printf '/usr/bin:/bin\n' > "${test_root}/.path"
+  fake_home="${test_root}/fake-home"
+  mkdir -p "${fake_home}/.local/bin"
+  leaked_session_function() { :; }
+  export -f leaked_session_function
+  (cd "${test_root}" && \
+    env 'SESSION.ODD-NAME=leak' \
+    HOME="${fake_home}" PATH="${fake_home}/.local/bin:${PATH}" \
+    SSH_AUTH_SOCK="${fake_home}/agent.sock" SSH_AGENT_PID=1 \
+    GPG_AGENT_INFO="${fake_home}/S.gpg-agent:0:1" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${fake_home}/bus" \
+    DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XAUTHORITY="${fake_home}/.Xauthority" \
+    XDG_RUNTIME_DIR="${fake_home}/run" XDG_SESSION_ID=2 \
+    CLIPROXY_API_KEY=not-a-real-key \
+    https_proxy=http://proxy.invalid:3128 RUNNER_SMOKE_SETTING=kept LANG=C.UTF-8 \
+    RUNNER_LOG_PRUNE_INTERVAL_SECONDS=0 bash ./runsvc.sh)
+  unset -f leaked_session_function
+  for leaked in SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO DBUS_SESSION_BUS_ADDRESS DISPLAY \
+      WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_SESSION_ID CLIPROXY_API_KEY SESSION.ODD-NAME \
+      BASH_FUNC_leaked_session_function; do
+    if grep -q "^${leaked}" "${test_root}/listener-environment"; then
+      echo "session variable ${leaked} reached the listener" >&2
+      exit 1
+    fi
+  done
+  if grep -q leaked_session_function "${test_root}/listener-functions"; then
+    echo 'an exported session function reached the listener' >&2
+    exit 1
+  fi
+  if grep -q "^PATH=.*${fake_home}" "${test_root}/listener-environment"; then
+    echo 'the session PATH reached the listener' >&2
+    exit 1
+  fi
+  grep -qx "HOME=${test_root}/home" "${test_root}/listener-environment"
+  grep -qx 'PATH=/usr/bin:/bin' "${test_root}/listener-environment"
+  grep -qx 'https_proxy=http://proxy.invalid:3128' "${test_root}/listener-environment"
+  grep -qx 'RUNNER_SMOKE_SETTING=kept' "${test_root}/listener-environment"
+  grep -qx 'LANG=C.UTF-8' "${test_root}/listener-environment"
+  grep -qx "TMPDIR=${test_root}/tmp/managed-job" "${test_root}/listener-environment"
+  grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=${test_root}/job-hooks/runner-job-started.sh" "${test_root}/listener-environment"
+  rm -f "${test_root}/.env" "${test_root}/.path"
+
   # Simulate find's EBUSY/permission failure without requiring mount privileges.
   mkdir "${test_root}/stubs"
   printf '#!/bin/sh\nexit 1\n' > "${test_root}/stubs/find"

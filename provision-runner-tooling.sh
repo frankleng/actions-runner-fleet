@@ -123,23 +123,118 @@ else
   AWS_PACKAGE_URL="${RUNNER_AWS_PACKAGE_URL:-https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWS_VERSION}.zip}"
 fi
 MANIFEST_PATH="${TOOLS_DIR}/runner-tooling.env"
+# Commands jobs expect from a GitHub-hosted image that a host may have installed
+# only in the account's home. Each one is linked into the runner's tools/bin, so
+# jobs get that command and not the rest of the directory it came from.
+CARRIED_HOST_COMMANDS="gh"
+
+# The account's home from its passwd entry: provisioning may run with HOME
+# already pointing at a runner home.
+account_home_directory() {
+  local user home
+
+  user="$(id -un 2>/dev/null)" || return 0
+  case "${user}" in
+    ''|*[!A-Za-z0-9._-]*) return 0 ;;
+  esac
+  eval "home=~${user}"
+  case "${home}" in
+    /?*) printf '%s\n' "${home%/}" ;;
+  esac
+}
+
 AMBIENT_HOME="${HOME:-}"
+AMBIENT_HOME="${AMBIENT_HOME%/}"
+ACCOUNT_HOME="$(account_home_directory)"
+
+path_is_within() {
+  case "$1" in
+    "$2"|"$2"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Jobs must not run the host account's personal tools (a ~/.local/bin compiler
+# wrapper, its own gh, node, or pnpm globals) ahead of or instead of the
+# runner's. A kit directory inside the home still counts as the kit's: the
+# default checkout is ~/actions-runner.
+is_host_home_path_entry() {
+  local entry="${1%/}" home owner
+
+  for home in "${AMBIENT_HOME}" "${ACCOUNT_HOME}"; do
+    [ -n "${home}" ] || continue
+    path_is_within "${entry}" "${home}" || continue
+    for owner in "${ROOT_DIR}" "${HOST_TOOLS_DIR}"; do
+      if [ "${#owner}" -gt "${#home}" ] && path_is_within "${entry}" "${owner}"; then
+        continue 2
+      fi
+    done
+    return 0
+  done
+  return 1
+}
 
 is_filtered_path_entry() {
   local entry="$1"
 
-  if [ -z "${entry}" ]; then
-    return 0
-  fi
+  # Empty and relative entries resolve against each step's working directory.
+  case "${entry}" in
+    /*) ;;
+    *) return 0 ;;
+  esac
 
-  if [ -n "${AMBIENT_HOME}" ] && {
-    [ "${entry}" = "${AMBIENT_HOME}/Library/pnpm" ] ||
-    [ "${entry}" = "${AMBIENT_HOME}/setup-pnpm" ]
-  }; then
-    return 0
-  fi
+  is_host_home_path_entry "${entry}"
+}
 
+# Print the first executable regular file named $1 in the colon-separated $2.
+find_command_in_path() {
+  local command_name="$1" entry
+  local -a entries
+
+  IFS=':' read -r -a entries <<< "$2"
+  for entry in "${entries[@]+"${entries[@]}"}"; do
+    [ -n "${entry}" ] || continue
+    if [ -f "${entry}/${command_name}" ] && [ -x "${entry}/${command_name}" ]; then
+      printf '%s\n' "${entry}/${command_name}"
+      return 0
+    fi
+  done
   return 1
+}
+
+# Link each carried command that only a dropped home entry provides into
+# tools/bin. A regular file there is not the kit's and stays untouched; a kit
+# link goes once the runner PATH provides the command itself.
+carry_host_commands() {
+  local current_path="$1" runner_path home_path="" command_name link_path candidate entry
+  local -a entries
+
+  runner_path="$(build_runner_path "${current_path}")"
+  runner_path=":${runner_path}:"
+  runner_path="${runner_path//":${LOCAL_BIN_DIR}:"/:}"
+  IFS=':' read -r -a entries <<< "${current_path}"
+  for entry in "${entries[@]+"${entries[@]}"}"; do
+    case "${entry}" in
+      /*) is_host_home_path_entry "${entry}" && home_path="${home_path}:${entry}" ;;
+    esac
+  done
+
+  for command_name in ${CARRIED_HOST_COMMANDS}; do
+    link_path="${LOCAL_BIN_DIR}/${command_name}"
+    if [ -e "${link_path}" ] && [ ! -L "${link_path}" ]; then
+      continue
+    fi
+    if find_command_in_path "${command_name}" "${runner_path}" >/dev/null; then
+      rm -f "${link_path}"
+      continue
+    fi
+    if candidate="$(find_command_in_path "${command_name}" "${home_path#:}")"; then
+      ln -sfn "${candidate}" "${link_path}"
+    elif [ ! -x "${link_path}" ]; then
+      # Keep a working link from an earlier run whose PATH had the command.
+      rm -f "${link_path}"
+    fi
+  done
 }
 
 append_unique_path_entry() {
@@ -333,6 +428,7 @@ write_env_files() {
     "${PNPM_BIN_DIR}"
 
   ensure_exec_wrapper "${PNPM_TOOLS_BIN_DIR}/wrangler" "${LOCAL_BIN_DIR}/wrangler"
+  carry_host_commands "${current_path}"
   env_file_lines > "${env_path}.tmp"
   build_runner_path "${current_path}" > "${path_path}.tmp"
   mv "${env_path}.tmp" "${env_path}"

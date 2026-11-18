@@ -69,6 +69,10 @@ grep -Fq "WorkingDirectory=${runner_dir}" "${unit_path}"
 grep -Fq "ExecStart=${runner_dir}/runsvc.sh" "${unit_path}"
 grep -Fq "Slice=runners.slice" "${unit_path}"
 grep -Fq "CPUQuota=300%" "${unit_path}"
+# The user manager's login-session variables never reach the listener.
+for session_variable in SSH_AUTH_SOCK GPG_AGENT_INFO DBUS_SESSION_BUS_ADDRESS DISPLAY XAUTHORITY XDG_RUNTIME_DIR; do
+  grep -Eq "^UnsetEnvironment=(.* )?${session_variable}( |$)" "${unit_path}"
+done
 grep -Fxq "300" "${runner_dir}/.cpu-quota"
 grep -Fq "Started:" <<< "${status_output}"
 grep -Fq "CPU limit: 300%" <<< "${status_output}"

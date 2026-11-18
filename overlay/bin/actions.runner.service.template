@@ -8,6 +8,13 @@ Type=simple
 Slice=runners.slice
 WorkingDirectory={{RunnerRoot}}
 ExecStart={{RunnerRoot}}/runsvc.sh
+# A desktop login imports its session into the user manager. runsvc.sh also
+# starts the listener from an allowlist; this keeps the agent sockets, bus, and
+# display out even before it runs.
+UnsetEnvironment=SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO DBUS_SESSION_BUS_ADDRESS
+UnsetEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY XAUTHLOCALHOSTNAME
+UnsetEnvironment=XDG_RUNTIME_DIR XDG_SESSION_ID XDG_SESSION_PATH XDG_SESSION_TYPE XDG_SESSION_CLASS XDG_SESSION_DESKTOP
+UnsetEnvironment=XDG_SEAT XDG_SEAT_PATH XDG_CURRENT_DESKTOP DESKTOP_SESSION
 Restart=always
 RestartSec=5
 KillMode=control-group
