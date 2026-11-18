@@ -6,7 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseRegistry, parseServiceStatusOutput } from '../lib/runnerctl-core.mjs';
-import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerListEndpoint, nextGithubPollAt, localSharing,
+import { AutoscaleError, validateConfig, configHardware, githubClient, snapshot, hostSample, plan, cpuPolicy, effectiveQuota, reservationDecision, runnerListEndpoint, nextGithubPollAt, localSharing,
   githubFailure, trackHealth, healthWriteDue, HEALTH_FILE } from '../lib/runnerctl-autoscale.mjs';
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
@@ -379,7 +379,7 @@ process.on('SIGINT', () => { quitting = true; sleeper?.abort(); updateAbort.abor
 let c;
 try {
   const initialRaw = JSON.parse(await fs.readFile(configPath, 'utf8'));
-  c = validateConfig(initialRaw);
+  c = validateConfig(initialRaw, configHardware(initialRaw));
   if (!prepare && initialRaw.runners === undefined) throw new AutoscaleError('Run --prepare first to persist the generated slot list');
   if ([prepare, enable, disable].filter(Boolean).length > 1 ||
       ((prepare || enable || disable) && (dryRun || onceOnly || args.includes('--watch') || args.includes('--apply'))) ||
@@ -460,7 +460,7 @@ try {
         try {
           const raw = JSON.parse(await fs.readFile(configPath, 'utf8'));
           if (raw.runners === undefined) throw new Error('Unpinned slots');
-          c = validateConfig(raw);
+          c = validateConfig(raw, configHardware(raw));
         }
         catch { console.error('Config reload rejected; retaining previous configuration'); }
         const local = await localRunners(c);
@@ -475,7 +475,7 @@ try {
         }
         let unavailable = [...local.values()].filter(r => r.unavailable).length;
         if (unavailable) console.error(`${unavailable} slot(s) unavailable; healthy slots remain managed`);
-        const host = hostSample();
+        const host = hostSample(c);
         const active = [...local.values()].filter(r => r.active).length;
         const policy = cpuPolicy(c, localSharing(c, state, active, Date.now()), host, state);
         if (apply && !quitting) {

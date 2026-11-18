@@ -330,7 +330,7 @@ test('unused images are pruned; images a runner directory uses, the target and b
 test('controller recovers a deprecation-blocked slot without replaying credentials and leaves other causes blocked', { timeout: 60000 }, async () => {
   const root = await tempDir('runner-update-cli-');
   for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs',
-    'lib/runnerctl-platform.mjs', 'lib/runnerctl-runner-update.mjs']) {
+    'lib/runnerctl-platform.mjs', 'lib/runnerctl-runner-update.mjs', 'lib/runnerctl-cgroup.mjs']) {
     await fs.mkdir(path.join(root, 'runnerctl-app', path.dirname(file)), { recursive: true });
     await fs.copyFile(new URL(`../${file}`, import.meta.url), path.join(root, 'runnerctl-app', file));
   }
