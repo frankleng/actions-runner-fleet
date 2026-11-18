@@ -61,6 +61,13 @@ while IFS= read -r source_file; do
   mkdir -p "${package_root}/$(dirname "${source_file}")"
   cp "${ROOT_DIR}/${source_file}" "${package_root}/${source_file}"
 done <<'PUBLIC_FILES'
+container/Dockerfile
+container/daemon.json
+container/journald.conf
+container/runner-org-status
+container/user-delegate.conf
+docs/org-containers.md
+org-containers.example.json
 overlay/autoscale-lock.mjs
 overlay/autoscale-worker.mjs
 overlay/bin/actions.runner.agent.plist.template
@@ -74,12 +81,15 @@ overlay/svc.sh
 runnerctl-app/bin/runnerctl-autoscale.mjs
 runnerctl-app/bin/runnerctl-dashboard.mjs
 runnerctl-app/bin/runnerctl-health.mjs
+runnerctl-app/bin/runnerctl-org.mjs
 runnerctl-app/bin/runnerctl-stats.mjs
 runnerctl-app/lib/runnerctl-autoscale-service.mjs
 runnerctl-app/lib/runnerctl-autoscale.mjs
+runnerctl-app/lib/runnerctl-cgroup.mjs
 runnerctl-app/lib/runnerctl-core.mjs
 runnerctl-app/lib/runnerctl-health.mjs
 runnerctl-app/lib/runnerctl-metrics.mjs
+runnerctl-app/lib/runnerctl-org-container.mjs
 runnerctl-app/lib/runnerctl-platform.mjs
 runnerctl-app/lib/runnerctl-runner-update.mjs
 runnerctl-app/lib/runnerctl-stats.mjs

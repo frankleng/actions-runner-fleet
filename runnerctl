@@ -52,6 +52,11 @@ if [ "${1:-}" = "health" ]; then
   exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-health.mjs" "$@"
 fi
 
+if [ "${1:-}" = "org" ]; then
+  shift
+  exec "${NODE_BIN}" "${SCRIPT_DIR}/runnerctl-app/bin/runnerctl-org.mjs" "$@"
+fi
+
 METRICS_SOURCE="${SCRIPT_DIR}/runnerctl-app/native/runnerctl-procstats.c"
 METRICS_BIN="${RUNNER_PROCSTATS_BIN:-${SCRIPT_DIR}/host-tools/runnerctl-procstats}"
 

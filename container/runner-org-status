@@ -1,0 +1,51 @@
+#!/bin/bash
+# Report the organization container's own view of itself as one JSON object:
+# systemd, the inner Docker daemon, the runner's user manager and autoscaler,
+# runner processes, the kit mount, and the cgroup limits the slots run under.
+# `runnerctl org status` reads it through `docker exec`; `--health` is the
+# image's HEALTHCHECK and exits non-zero when the container cannot run jobs.
+set -uo pipefail
+
+KIT_DIR=/runner/kit
+uid="$(cat /etc/runner-org/uid 2>/dev/null || echo 0)"
+
+as_runner() {
+  if [ "$(id -u)" = "${uid}" ]; then
+    XDG_RUNTIME_DIR="/run/user/${uid}" "$@"
+  else
+    runuser -u runner -- env XDG_RUNTIME_DIR="/run/user/${uid}" "$@"
+  fi
+}
+
+count() {
+  local n
+  n="$(pgrep -c -u "${uid}" -f "$1" 2>/dev/null)" || n=0
+  printf '%s' "${n:-0}"
+}
+
+system_state="$(systemctl is-system-running 2>/dev/null)" || true
+docker_state="$(systemctl is-active docker.service 2>/dev/null)" || true
+user_state="$(systemctl is-active "user@${uid}.service" 2>/dev/null)" || true
+controller_state=missing
+if [ "${user_state}" = active ]; then
+  units="$(as_runner systemctl --user list-units --type=service --all --no-legend --plain 'runnerctl-autoscale-*' 2>/dev/null)" || units=""
+  if [ -n "${units}" ]; then
+    controller_state="$(awk 'NR == 1 { print $3 }' <<< "${units}")"
+  fi
+fi
+kit_mounted=false
+kit_owner=false
+if mountpoint -q "${KIT_DIR}" 2>/dev/null; then kit_mounted=true; fi
+if [ "$(stat -c %u "${KIT_DIR}" 2>/dev/null)" = "${uid}" ]; then kit_owner=true; fi
+
+if [ "${1:-}" = --health ]; then
+  case "${system_state}" in running|degraded) ;; *) exit 1 ;; esac
+  [ "${docker_state}" = active ] && [ "${user_state}" = active ] && [ "${kit_mounted}" = true ] && [ "${kit_owner}" = true ]
+  exit
+fi
+
+printf '{"system":"%s","docker":"%s","userManager":"%s","controller":"%s","listeners":%s,"jobs":%s,"kitMounted":%s,"kitOwnedByRunner":%s,"uid":%s,"cpuMax":"%s","memoryMax":"%s"}\n' \
+  "${system_state:-unknown}" "${docker_state:-unknown}" "${user_state:-unknown}" "${controller_state:-unknown}" \
+  "$(count '/bin/Runner\.Listener( |$)')" "$(count '/bin/Runner\.Worker( |$)')" \
+  "${kit_mounted}" "${kit_owner}" "${uid}" \
+  "$(tr -d '\n' < /sys/fs/cgroup/cpu.max 2>/dev/null)" "$(tr -d '\n' < /sys/fs/cgroup/memory.max 2>/dev/null)"
