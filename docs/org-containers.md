@@ -55,11 +55,14 @@ Confirmed incidents (2026-11-16/17), and what inspection for this plan added:
    for titledock and also hosts founderationhq's runners. Any job on the host
    can read every kit's token file, since all kits belong to the same account.
 
-Incidents 2, 3 and 6 are reachable today from any job of any organization.
-Fixing them in host mode needs `UnsetEnvironment=` (or an allowlist in
-`runsvc.sh`), `PATH` filtering of the account's home, and separate accounts.
-That is worth doing for hosts that stay in host mode; it is a separate change
-from this opt-in feature (see [Out of scope](#out-of-scope)).
+Release 1.3.1 closes incidents 2 and 3 in host mode too. `runsvc.sh` starts
+the listener from an environment allowlist, the unit adds
+`UnsetEnvironment=` for the session variables, and `.path` drops every entry
+inside the account's home. Jobs still run as the owner's account, though, so
+a job that knows a path under that home can still reach the files and sockets
+there. Incident 6 needs separate accounts. Incidents 4 and 5 need a separate
+network namespace, Docker daemon and CPU cap per organization. That is what
+this opt-in feature adds (see [Out of scope](#out-of-scope)).
 
 ## Design
 
@@ -83,7 +86,18 @@ host (systemd, dockerd, Sysbox)
   `runnerctl health`. That is why Sysbox is the runtime. It runs systemd and
   dockerd in an unprivileged container without `--privileged`. A
   non-systemd supervisor would have meant rewriting the service layer for one
-  platform.
+  platform. The slot units' protections work inside unchanged:
+  - the environment allowlist in `runsvc.sh`;
+  - `UnsetEnvironment=`;
+  - `Delegate=yes`, with the `runner-job` child cgroup that each slot empties
+    after every job (SIGTERM, 5 s, then `cgroup.kill`).
+
+  They rely only on the runner's user manager owning a delegated cgroup v2
+  subtree. The image's `user@.service` drop-in (`container/user-delegate.conf`)
+  provides that, under the private cgroup namespace Sysbox gives the
+  container. The image copies no kit file. Every slot gets `runsvc.sh`, the
+  worker, the unit template and the job hooks from the kit on the bind mount,
+  so the kit's commit decides slot behaviour.
 - **The kit lives on a bind mount** at `/runner/kit`. It's a separate clone of
   this repository per organization. `.runners/`, `host-tools/`, the pnpm store,
   the tool cache and `_work` are therefore on `/srv/data` at native disk speed,
@@ -105,7 +119,11 @@ host (systemd, dockerd, Sysbox)
   CPU (the host's load ÷ 2). That would have put the pool in permanent
   pressure and sized it for memory it cannot use. The new `"capacity":
   "cgroup"` setting in `autoscale.json` reads the cgroup v2 limits on the
-  controller's chain (`cpu.max`, `memory.max`). It measures load as the busy
+  controller's chain (`cpu.max`, `memory.max`). It reads only the controller's
+  own cgroup and its ancestors. The slots' `CPUQuota` cgroups and their
+  `runner-job` children sit beside the controller, so they never count as the
+  org's limit. Their usage is already included in the hierarchical counters
+  of the cgroup that sets the limit, so it is never added twice. It measures load as the busy
   fraction of the CPU quota plus time spent waiting for a CPU
   (`cpu.pressure`), so other tenants don't count and `lowLoad`/`highLoad`
   keep their meaning. Free memory is measured under the limit, with
@@ -302,10 +320,26 @@ container. The container's journal is volatile and capped at 64 MiB.
   as "lost communication". Drain at quiet times.
 - **Upgrade.** State lives on the bind mounts, so recreating the container is
   safe. `upgrade` does nothing when the image and settings hash already match.
-  Kit updates are a `git pull` in the org's kit, followed by
-  `runnerctl org exec ORG -- ./runnerctl autoscale --enable`, which rewrites
-  and restarts the controller. Slots pick up worker changes at their next
-  supervisor restart, as on a host.
+  The image never carries kit files, so recreating the container doesn't
+  update them. Kit updates are a `git pull` in the org's kit, which updates
+  the kit only. Each slot keeps its own copies of `runsvc.sh`, the worker,
+  the unit, and the job hooks. A slot's service also keeps running the
+  supervisor it started with, because the supervisor never restarts between
+  generations. Apply an update as on a host:
+  1. `runnerctl org exec ORG -- ./runnerctl autoscale --disable`.
+  2. For each idle slot, run
+     `runnerctl org exec ORG -- ./manage-runners.sh reconcile SLOT`. It copies
+     the kit files into the slot, reinstalls its unit, and restarts it. A slot
+     is idle when `.autoscale-state.json` has phase `ready` and the slot has no
+     `.autoscale-request.json`, `.autoscale-inflight.json`, or `.runner`. Never
+     use `reconcile-all` here. It doesn't check slot state, and restarting a
+     slot that holds a one-use registration parks the slot as blocked.
+  3. `runnerctl org exec ORG -- ./runnerctl autoscale --enable`, which
+     rewrites and restarts the controller.
+
+  Slots created after the pull (`--prepare`) get the current files directly.
+  The setup script clones the kit only when none exists, and says so when it
+  keeps one.
 - **Status and health.** The image's `HEALTHCHECK` runs `runner-org-status
   --health` every minute. `runnerctl org status` adds the image and settings
   drift and, from inside, the autoscaler state, listener count and job count.
@@ -511,7 +545,13 @@ or GitHub and needs the owner's approval at that time.
   `./runnerctl org exec edgefleetinc -- ./runnerctl autoscale --prepare`.
   Container slots now serve only jobs that ask for `org-container`. Run the
   benchmark. Run edgefleet's e2e on the canary pool during a titledock
-  service-job burst and confirm there's no `ERR_NETWORK_CHANGED`.
+  service-job burst and confirm there's no `ERR_NETWORK_CHANGED`. Also run a
+  canary job that leaves a `setsid sleep 600 &` behind. Then check that the
+  slot's journal (`journalctl --user -u 'actions.runner.*'` inside) logs
+  `Job process cleanup: stopped 1 leftover process(es)`. It must not log
+  `Job process cleanup unavailable`. Check that `/proc/<listener>/environ`
+  holds no `XDG_RUNTIME_DIR` or `DBUS_SESSION_BUS_ADDRESS`; list the names,
+  never the values.
 - **E8 (live, cutover)** while both pools are idle:
   1. In the host kit, run `./runnerctl autoscale --disable` and wait until
      its slots show no job.
@@ -566,6 +606,11 @@ can still see its own service-job bridges (residual risk above).
   - systemd booting in the container, and dockerd running inside it;
   - linger starting the user manager;
   - cgroup delegation of per-slot `CPUQuota` inside;
+  - each slot's `Delegate=yes` `runner-job` cgroup and its cleanup
+    (`cgroup.kill`) inside, and the 1.3.1 environment allowlist there (E7);
+  - the cgroup capacity readings under `sysbox-runc` rather than `runc`. The
+    org's `cpu.max`/`memory.max` must be visible at or below the container's
+    cgroup namespace root;
   - ID-mapped ownership of the bind mounts;
   - `docker create --runtime sysbox-runc` with these flags;
   - Sysbox on Ubuntu 26.04 / kernel 7.0 with the containerd image store
@@ -576,9 +621,9 @@ can still see its own service-job bridges (residual risk above).
 
 ## Out of scope
 
-- Host-mode hardening of incidents 2, 3 and 6 for orgs that stay on the host:
-  scrubbing the service environment and `PATH`, and per-org accounts. It's
-  recommended as a separate change.
+- Per-org accounts for orgs that stay on the host (incident 6). Release 1.3.1
+  already scrubs the service environment and `PATH` in host mode
+  (incidents 2 and 3).
 - Per-job isolation inside one org: per-job network namespaces or VMs (for
   example Firecracker or ARC), and container hooks that avoid job bridges.
 - Running the controller under a different account from the jobs, and GitHub

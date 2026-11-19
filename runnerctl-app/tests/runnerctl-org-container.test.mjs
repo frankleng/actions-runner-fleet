@@ -155,6 +155,30 @@ test('exec runs as the runner in the kit with only its user-manager variables', 
     'runner-org-edgefleetinc', './runnerctl', 'stats', '--json']);
 });
 
+// Slots must run the kit's current runsvc.sh (environment allowlist), worker
+// (runner-job cleanup), unit template (UnsetEnvironment=, Delegate=yes), and
+// tooling (PATH filtering). The image therefore carries no copy of any kit file:
+// they all come from the bind-mounted kit, and the image only provides the
+// cgroup delegation and binaries they rely on.
+test('the image carries no kit files and provides what the slot units rely on', () => {
+  const dir = new URL('../../container/', import.meta.url);
+  const dockerfile = readFileSync(new URL('Dockerfile', dir), 'utf8');
+  const copied = [...dockerfile.matchAll(/^(?:COPY|ADD)\s+(?:--\S+\s+)*(\S+)/gm)].map(m => m[1]);
+  assert.ok(copied.length > 0);
+  for (const source of copied) assert.ok(IMAGE_FILES.includes(source), `${source} is not one of the image files`);
+  for (const kitFile of ['runsvc.sh', 'autoscale-worker.mjs', 'actions.runner.service.template', 'runner-job-temp.sh', 'provision-runner-tooling.sh']) {
+    assert.doesNotMatch(dockerfile, new RegExp(kitFile.replaceAll('.', '\\.')));
+  }
+  // ENV would reach every process in the container ahead of runsvc.sh's allowlist.
+  assert.doesNotMatch(dockerfile, /^ENV\s/m);
+  // The user manager must own a delegated subtree with cpu (per-slot CPUQuota=);
+  // each slot's Delegate=yes and runner-job child cgroup build on it.
+  const delegate = readFileSync(new URL('user-delegate.conf', dir), 'utf8');
+  const controllers = /^Delegate=(.*)$/m.exec(delegate)?.[1].split(/\s+/) ?? [];
+  for (const controller of ['cpu', 'memory', 'pids']) assert.ok(controllers.includes(controller), controller);
+  assert.match(dockerfile, /COPY user-delegate\.conf \/etc\/systemd\/system\/user@\.service\.d\//);
+});
+
 test('the setup script only creates the org data directories, root-only at the top', () => {
   const config = validateOrgConfig(base());
   const script = setupScript(config, selectOrg(config, 'edgefleetinc'), { source: "/src/it's kit", originUrl: 'https://github.com/example/actions-runner-fleet' });
@@ -163,6 +187,8 @@ test('the setup script only creates the org data directories, root-only at the t
   assert.match(script, /install -d -o root -g root -m 0700 '\/srv\/data\/runner-orgs\/edgefleetinc\/docker'/);
   assert.match(script, /clone --quiet --no-local '\/src\/it'\\''s kit' '\/srv\/data\/runner-orgs\/edgefleetinc\/kit'/);
   assert.match(script, /chown -R 2101:2101 '\/srv\/data\/runner-orgs\/edgefleetinc\/kit'/);
+  // An existing kit is never overwritten, and says so.
+  assert.match(script, /^else\n {2}echo '\/srv\/data\/runner-orgs\/edgefleetinc\/kit already exists and was left unchanged; .*'\nfi$/m);
   assert.match(script, /getent passwd 2101/);
   for (const forbidden of [/systemctl/, /docker /, /loginctl/, /\.runners/, /network/]) assert.doesNotMatch(script, forbidden);
 });

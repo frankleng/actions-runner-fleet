@@ -102,6 +102,32 @@ test('container load is the quota busy fraction plus CPU waiting, and other tena
   assert.equal(hostSample(c, { sampler: { sample: () => ({ cpus: 4, load: 0.25, freeMemoryPercent: 60 }) } }).load, 0.25);
 });
 
+test('slot and runner-job cgroups never set the capacity and are not counted twice', () => {
+  // Inside an org container the slots are delegated user services (Delegate=yes)
+  // with their own CPUQuota, and each listener runs in a runner-job child that
+  // the slot empties after the job. Both sit beside the controller, not above
+  // it: only the container's own counters, which already include them, count.
+  const slot = '/cg/user.slice/user-2101.slice/user@2101.service/runners.slice/actions.runner.example-org.c1.service';
+  const reads = [];
+  const files = {
+    '/cg/cpu.max': '800000 100000', '/cg/memory.max': String(16 * GiB),
+    '/cg/cpu.stat': 'usage_usec 0\n', '/cg/memory.current': String(4 * GiB), '/cg/memory.stat': 'inactive_file 0\n',
+    '/proc/meminfo': `MemAvailable: ${60 * 1024 * 1024} kB\n`,
+    [`${slot}/cpu.max`]: '50000 100000', [`${slot}/memory.max`]: String(GiB), [`${slot}/cpu.stat`]: 'usage_usec 999999999\n',
+    [`${slot}/runner-job/cpu.max`]: '10000 100000', [`${slot}/runner-job/memory.max`]: String(GiB / 2),
+    [`${slot}/runner-job/memory.current`]: String(3 * GiB), [`${slot}/runner-job/cpu.stat`]: 'usage_usec 999999999\n'
+  };
+  const base = tree(files);
+  const read = file => { reads.push(file); return base(file); };
+  assert.deepEqual(cgroupLimits({ root: '/cg', read }), { cpu: { cpus: 8, dir: '/cg' }, memory: { bytes: 16 * GiB, dir: '/cg' } });
+  assert.deepEqual(cgroupHardware({ root: '/cg', read, hostCpus: 32, hostMemory: 89 * GiB }), { cpus: 8, memoryBytes: 16 * GiB });
+  let now = 0;
+  const sample = new CgroupSampler({ root: '/cg', read, now: () => now, sleep: ms => { now += ms; }, hostCpus: 32, hostMemory: 89 * GiB }).sample();
+  // (16 - 4) / 16 GiB free: the job's 3 GiB is inside the container's 4, not added to it.
+  assert.deepEqual(sample, { cpus: 8, load: 0, freeMemoryPercent: 75 });
+  assert.deepEqual(reads.filter(file => file.includes('runners.slice')), []);
+});
+
 test('container memory is bounded by what the host still has', () => {
   const read = tree({
     '/cg/memory.max': String(24 * GiB), '/cg/memory.current': String(4 * GiB), '/cg/memory.stat': 'inactive_file 0\n',

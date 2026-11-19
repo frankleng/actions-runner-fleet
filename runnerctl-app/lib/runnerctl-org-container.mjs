@@ -250,6 +250,10 @@ export function setupScript(config, o, { source, originUrl }) {
     `  git -c safe.directory=${sh(source)} -c safe.directory=${sh(path.join(source, '.git'))} clone --quiet --no-local ${sh(source)} ${sh(o.paths.kit)}`,
     ...(originUrl ? [`  git -C ${sh(o.paths.kit)} remote set-url origin ${sh(originUrl)}`] : []),
     `  chown -R ${o.uid}:${o.uid} ${sh(o.paths.kit)}`,
+    'else',
+    // An existing kit keeps its own commit: slots get the kit's runsvc.sh,
+    // worker, unit, and job hooks, so an old kit means old slot behaviour.
+    `  echo ${sh(`${o.paths.kit} already exists and was left unchanged; to update it, see Upgrade in docs/org-containers.md`)}`,
     'fi',
     `echo 'Data directories for ${o.org} are ready under ${o.paths.root}'`
   ];
