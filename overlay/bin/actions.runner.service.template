@@ -17,6 +17,9 @@ UnsetEnvironment=XDG_RUNTIME_DIR XDG_SESSION_ID XDG_SESSION_PATH XDG_SESSION_TYP
 UnsetEnvironment=XDG_SEAT XDG_SEAT_PATH XDG_CURRENT_DESKTOP DESKTOP_SESSION
 Restart=always
 RestartSec=5
+# Jobs run in a runner-job child cgroup that the slot empties after each job
+# (autoscale-worker.mjs, job-hooks); stopping the unit still kills it all.
+Delegate=yes
 KillMode=control-group
 TimeoutStopSec=30
 CPUQuota={{CPUQuotaPercent}}%

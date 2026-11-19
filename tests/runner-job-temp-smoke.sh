@@ -118,5 +118,70 @@ NODE
   chmod +x "${test_root}/stubs/find"
   PATH="${test_root}/stubs:${PATH}" bash "${test_root}/job-hooks/runner-job-started.sh" 2> "${test_root}/warning"
   grep -q 'Warning: some runner scratch files' "${test_root}/warning"
+  rm -rf "${test_root}/stubs"
+
+  # Persistent runners: the hooks contain each job in the service's runner-job
+  # cgroup and stop what the job left behind, setsid and double-forked
+  # processes included, but never the worker or the service's own processes.
+  # Needs a cgroup v2 directory this account owns, as a systemd user manager
+  # delegates; elsewhere (hosted CI) this part is skipped.
+  own_cgroup="$(sed -n 's/^0:://p' /proc/self/cgroup)"
+  service_cgroup="/sys/fs/cgroup${own_cgroup}/job-hook-test-$$.service"
+  if [ -n "${own_cgroup}" ] && [ "${own_cgroup}" != / ] && mkdir "${service_cgroup}" 2>/dev/null; then
+    remove_test_cgroup() {
+      echo 1 > "${service_cgroup}/cgroup.kill" 2>/dev/null || true
+      for _ in $(seq 50); do grep -qx 'populated 0' "${service_cgroup}/cgroup.events" && break; sleep 0.1; done
+      rmdir "${service_cgroup}/runner-job" "${service_cgroup}" 2>/dev/null || true
+      rm -rf "${test_root}"
+    }
+    trap remove_test_cgroup EXIT
+    job_cgroup="${service_cgroup}/runner-job"
+    in_cgroup() { [ "$(cat "/proc/$2/cgroup" 2>/dev/null)" = "0::${1#/sys/fs/cgroup}" ]; }
+    mkdir -p "${test_root}/worker-bin" "${test_root}/_diag"
+    cat > "${test_root}/worker-bin/Runner.Worker" <<'WORKER'
+#!/bin/bash
+# One job: the started hook, a step that leaves processes behind, the
+# completed hook, then a straggler forked after it.
+set -euo pipefail
+bash ./job-hooks/runner-job-started.sh
+setsid bash -c '(exec -a hook-grandchild sleep 300 &); exec -a hook-leader sleep 300' < /dev/null > /dev/null 2>&1 &
+( trap '' TERM; exec -a hook-stubborn sleep 300 ) < /dev/null > /dev/null 2>&1 &
+sleep 0.3
+pgrep -f -x 'hook-(grandchild|leader|stubborn) 300' > job-leftovers
+bash ./job-hooks/runner-job-completed.sh
+echo "$$" > worker-survived-hook
+( exec -a hook-straggler sleep 300 ) < /dev/null > /dev/null 2>&1 &
+echo "$!" > straggler
+WORKER
+    chmod +x "${test_root}/worker-bin/Runner.Worker"
+    # Stand-in for the launcher's log pruner, in the service cgroup itself.
+    /bin/sh -c 'echo 0 > "$0/cgroup.procs" && exec sleep 300' "${service_cgroup}" &
+    bystander=$!
+    (cd "${test_root}" && /bin/sh -c 'echo 0 > "$0/cgroup.procs" && exec ./worker-bin/Runner.Worker' "${service_cgroup}")
+    [ "$(wc -l < "${test_root}/job-leftovers")" -eq 3 ]
+    for pid in $(cat "${test_root}/job-leftovers"); do
+      if kill -0 "${pid}" 2>/dev/null; then echo "leftover job process ${pid} survived the completed hook" >&2; exit 1; fi
+    done
+    [ -s "${test_root}/worker-survived-hook" ]
+    grep -q 'stopped 3 leftover process(es): sleep x3; 1 needed SIGKILL' "${test_root}/_diag/runner-job-cleanup.log"
+    straggler="$(cat "${test_root}/straggler")"
+    in_cgroup "${job_cgroup}" "${straggler}"
+    kill -0 "${bystander}"
+    # The next job's started hook removes what the previous one forked late.
+    : > "${test_root}/_diag/runner-job-cleanup.log"
+    (cd "${test_root}" && /bin/sh -c 'echo 0 > "$0/cgroup.procs" && exec ./worker-bin/Runner.Worker' "${service_cgroup}")
+    if kill -0 "${straggler}" 2>/dev/null; then echo 'the next job did not remove a late straggler' >&2; exit 1; fi
+    grep -q 'stopped 1 leftover process(es): sleep x1$' "${test_root}/_diag/runner-job-cleanup.log"
+    kill -0 "${bystander}"
+    # Autoscale slots leave this to their worker.
+    touch "${test_root}/.autoscale-slot.json"
+    : > "${test_root}/_diag/runner-job-cleanup.log"
+    (cd "${test_root}" && /bin/sh -c 'echo 0 > "$0/cgroup.procs" && exec ./worker-bin/Runner.Worker' "${service_cgroup}")
+    [ ! -s "${test_root}/_diag/runner-job-cleanup.log" ]
+    for pid in $(cat "${test_root}/job-leftovers"); do in_cgroup "${service_cgroup}" "${pid}"; done
+    kill "${bystander}"
+  else
+    echo 'Skipping job process containment: no writable cgroup v2 directory'
+  fi
 fi
 echo 'Runner job temporary cleanup smoke test passed'

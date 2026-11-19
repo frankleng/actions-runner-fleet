@@ -543,6 +543,29 @@ files, other runner temporary files, or shared caches. Tools that hard-code
 `/tmp` use the host storage configured above. A single job can still exhaust storage
 before it finishes; this prevents accumulation across jobs.
 
+### Leftover job processes (Linux)
+
+Jobs can leave processes running, such as dev servers and build daemons that
+detach with `setsid` or a double fork. GitHub's runner kills only the tracked
+processes it sees in one snapshot at the end of the job, so a process forked
+later survives until the service restarts. On Linux, every job's processes
+run in the service's `runner-job` child cgroup (units set `Delegate=yes`),
+which a process cannot leave by detaching. After each job, the kit sends
+SIGTERM to everything still in it, waits 5 seconds, then kills the rest:
+
+- Autoscale slots run each listener generation in that cgroup and empty it
+  after the listener exits, before the next one starts. The unit's journal
+  logs `Job process cleanup:` with process names and counts.
+- Persistent runners' job hooks move each job's `Runner.Worker` into the
+  cgroup. The completed hook stops everything but the worker; the next job's
+  started hook removes anything forked after that. Lines go to the job log
+  and `_diag/runner-job-cleanup.log`.
+
+The supervisor, launcher, log pruner, and other runners are never in that
+cgroup. Arguments and environments are never logged. Setting
+`RUNNER_TRACKING_ID` empty does not keep a process past its job. macOS and
+Windows have no equivalent yet; there, the runner's own cleanup applies.
+
 ### Compiler cache (macOS)
 
 macOS runners get ccache on `PATH` and share one cache under

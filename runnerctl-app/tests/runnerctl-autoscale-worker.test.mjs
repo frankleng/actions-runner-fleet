@@ -8,8 +8,8 @@ import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { plan, validateConfig } from '../lib/runnerctl-autoscale.mjs';
 
-async function until(check) {
-  for (let i = 0; i < 200; i++) {
+async function until(check, ms = 5000) {
+  for (let i = 0; i < ms / 25; i++) {
     if (await check()) return;
     await sleep(25);
   }
@@ -180,6 +180,87 @@ test('a parked supervisor recovers after SIGKILL without stale-lock repair', { t
     await until(() => f.exists('accepted'));
     assert.equal(await fs.readFile(f.file('starts'), 'utf8'), 'started\n');
   } finally { await f.cleanup(); }
+});
+
+// A cgroup v2 directory this account may create children in, as the user
+// manager delegates to runner units, or null where there is none (macOS,
+// Windows, or a hosted CI runner whose test process sits in a root-owned cgroup).
+async function writableTestCgroup() {
+  if (process.platform !== 'linux') return null;
+  try {
+    const own = (await fs.readFile('/proc/self/cgroup', 'utf8')).split('\n').find(line => line.startsWith('0::'))?.slice(3);
+    if (!own || own === '/') return null;
+    // Named like a unit: the worker contains jobs only inside a service's cgroup.
+    const dir = path.join('/sys/fs/cgroup', own, `worker-test-${process.pid}-${Date.now()}.service`);
+    await fs.mkdir(dir);
+    return dir;
+  } catch { return null; }
+}
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const cgroupOf = async pid => (await fs.readFile(`/proc/${pid}/cgroup`, 'utf8')).trim();
+
+test('leftover job processes, setsid and double-forked ones included, are stopped before the next generation', { timeout: 30000 }, async t => {
+  const parent = await writableTestCgroup();
+  if (!parent) { t.skip('needs a writable cgroup v2 directory (Linux with a delegated user cgroup)'); return; }
+  const f = await setup();
+  let bystander;
+  try {
+    // The fake listener leaves a session leader with a double-forked child, and
+    // a process that ignores SIGTERM, then completes its generation.
+    await fs.writeFile(f.file('bin/Runner.Listener'), `#!/bin/bash
+echo started >> starts
+echo yes > accepted
+setsid bash -c '(exec -a leftover-grandchild sleep 300 &); exec -a leftover-leader sleep 300' < /dev/null > /dev/null 2>&1 &
+( trap '' TERM; exec -a leftover-stubborn sleep 300 ) < /dev/null > /dev/null 2>&1 &
+sleep 0.3
+for name in leftover-grandchild leftover-leader leftover-stubborn; do pgrep -f -x "\${name} 300" >> leftovers; done
+until [ -f finish ]; do sleep 0.05; done
+rm -f .runner .credentials .credentials_rsaparams finish accepted
+exit 0
+`, { mode: 0o700 });
+    // The worker starts in its own cgroup, as it would in its systemd unit.
+    const worker = spawn('/bin/sh', ['-c', 'echo 0 > "$0/cgroup.procs" && exec "$@"', parent, process.execPath, 'bin/autoscale-worker.mjs'],
+      { cwd: f.root, stdio: ['ignore', 'pipe', 'pipe'] });
+    worker.output = '';
+    worker.stdout.on('data', d => { worker.output += d; });
+    worker.stderr.on('data', d => { worker.output += d; });
+    // Stand-in for the launcher's log pruner: in the slot's cgroup, never in a job's.
+    bystander = spawn('/bin/sh', ['-c', 'echo 0 > "$0/cgroup.procs" && exec sleep 300', parent], { stdio: 'ignore' });
+    await until(() => f.phase('ready'));
+    await f.request();
+    await until(async () => (await fs.readFile(f.file('leftovers'), 'utf8').catch(() => '')).trim().split('\n').length === 3);
+    const leftovers = (await fs.readFile(f.file('leftovers'), 'utf8')).trim().split('\n').map(Number);
+    const jobCgroup = path.join(parent, 'runner-job');
+    for (const pid of leftovers) {
+      assert.equal(await cgroupOf(pid), `0::/${path.relative('/sys/fs/cgroup', jobCgroup)}`);
+    }
+    await fs.writeFile(f.file('finish'), 'yes');
+    await until(async () => worker.output.includes('Job process cleanup: stopped'), 15000);
+    await until(() => f.phase('ready'));
+    for (const pid of leftovers) assert.equal(alive(pid), false, `leftover ${pid} survived`);
+    assert.match(worker.output, /stopped 3 leftover process\(es\): sleep x3; 1 needed SIGKILL/);
+    assert.equal(worker.exitCode, null);
+    assert.equal(alive(worker.pid), true);
+    assert.equal(alive(bystander.pid), true);
+    assert.equal((await fs.readFile(path.join(jobCgroup, 'cgroup.procs'), 'utf8')).trim(), '');
+    // The next generation starts normally in a clean job cgroup.
+    await fs.rm(f.file('leftovers'));
+    await f.request(2);
+    await until(() => f.exists('accepted'));
+    assert.equal(await fs.readFile(f.file('starts'), 'utf8'), 'started\nstarted\n');
+    await fs.writeFile(f.file('finish'), 'yes');
+    await until(async () => (worker.output.match(/Job process cleanup: stopped/g) ?? []).length === 2, 15000);
+    const done = once(worker, 'exit');
+    worker.kill('SIGTERM');
+    await done;
+  } finally {
+    bystander?.kill('SIGKILL');
+    await fs.writeFile(path.join(parent, 'cgroup.kill'), '1').catch(() => {});
+    for (let i = 0; i < 50 && /populated 1/.test(await fs.readFile(path.join(parent, 'cgroup.events'), 'utf8').catch(() => '')); i++) await sleep(50);
+    await fs.rmdir(path.join(parent, 'runner-job')).catch(() => {});
+    await fs.rmdir(parent).catch(() => {});
+    await f.cleanup();
+  }
 });
 
 test('macOS limiter reloads quota without restarting or signaling its listener', { timeout: 10000 }, async () => {
