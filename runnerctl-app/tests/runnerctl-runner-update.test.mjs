@@ -10,7 +10,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { validateConfig } from '../lib/runnerctl-autoscale.mjs';
 import { findProblems } from '../lib/runnerctl-health.mjs';
 import { releaseCandidate, checkDue, checkForUpdate, rollSlot, diagnoseBlockedSlot, orphanDecision, pruneImages, compareVersions, runnerFilesVersion,
-  readyTarget, buildImage, imageValid, clearRecoveredGeneration, finishRecovery, CHECK_INTERVAL_MS, FORCED_CHECK_INTERVAL_MS, UpdateRefusal } from '../lib/runnerctl-runner-update.mjs';
+  readyTarget, buildImage, imageValid, clearRecoveredGeneration, finishRecovery, CHECK_INTERVAL_MS, FORCED_CHECK_INTERVAL_MS, UpdateRefusal,
+  runnerPlatform, archiveName, imageName } from '../lib/runnerctl-runner-update.mjs';
 
 const exec = promisify(execFile);
 const linux = { name: 'linux-x64', ext: 'tar.gz' };
@@ -40,10 +41,13 @@ async function archive(version, marker = version, extra = async () => {}) {
   const bytes = await fs.readFile(file);
   return { bytes, sha256: createHash('sha256').update(bytes).digest('hex') };
 }
-function release(version, notesSha, digestSha, extra = {}) {
+// A release whose notes and asset carry the checksum for platform p; every
+// other platform's marker holds a checksum that matches nothing.
+function release(version, notesSha, digestSha, extra = {}, p = linux) {
+  const marker = name => `<!-- BEGIN SHA ${name} -->${name === p.name ? notesSha : '0'.repeat(64)}<!-- END SHA ${name} -->`;
   return { tag_name: `v${version}`, draft: false, prerelease: false,
-    body: `notes\n<!-- BEGIN SHA linux-x64 -->${notesSha}<!-- END SHA linux-x64 -->\n<!-- BEGIN SHA osx-arm64 -->${'0'.repeat(64)}<!-- END SHA osx-arm64 -->`,
-    assets: [{ name: `actions-runner-linux-x64-${version}.tar.gz`, digest: digestSha ? `sha256:${digestSha}` : null }], ...extra };
+    body: `notes\n${['linux-x64', 'osx-arm64'].map(marker).join('\n')}`,
+    assets: [{ name: archiveName(p, version), digest: digestSha ? `sha256:${digestSha}` : null }], ...extra };
 }
 // A GitHub stand-in: the release API (with ETags) and the release download.
 function mockGithub(releaseBody, bytes) {
@@ -351,8 +355,12 @@ esac
     await fs.chmod(path.join(directory, 'svc.sh'), 0o700);
   }
   await fs.writeFile(path.join(root, 'runners.tsv'), [recoverable, manual, idle].map(d => `${path.basename(d)}\t${d}`).join('\n'));
+  // The controller fetches the release asset for the host it runs on, so the
+  // stand-in release publishes that platform's archive (osx-arm64 on macOS).
+  const host = runnerPlatform();
+  assert.ok(host?.ext === 'tar.gz', 'the controller rolls runners only on Linux x64 and Apple-silicon macOS');
   // An image nothing uses any more.
-  await fs.mkdir(path.join(root, 'actions-runner-linux-x64-2.330.0.image'));
+  await fs.mkdir(path.join(root, imageName(host, '2.330.0')));
   const { bytes, sha256 } = await archive(NEW);
   await fs.writeFile(path.join(root, 'release.bin'), bytes);
   await fs.writeFile(path.join(root, 'mock-api.mjs'), `
@@ -364,7 +372,7 @@ esac
         return new Response(await readFile(${JSON.stringify(path.join(root, 'release.bin'))}));
       }
       if (options.headers?.Authorization !== 'Bearer private-test-value') throw new Error('auth missing');
-      if (url.includes('/repos/actions/runner/releases/')) return new Response(JSON.stringify(${JSON.stringify(release(NEW, sha256, sha256))}), { headers: { etag: '"v1"' } });
+      if (url.includes('/repos/actions/runner/releases/')) return new Response(JSON.stringify(${JSON.stringify(release(NEW, sha256, sha256, {}, host))}), { headers: { etag: '"v1"' } });
       if (options.method === 'DELETE') { await log('delete ' + url.split('/').pop()); return new Response(null, { status: 204 }); }
       if (options.method === 'POST') { await log('register ' + JSON.parse(options.body).name); return new Response('{}', { status: 422 }); }
       const runners = [{ id: 11, name: 'runner-1', status: 'offline', busy: false, labels: [{ name: 'self-hosted' }] },
@@ -411,8 +419,8 @@ esac
   assert.equal(JSON.parse(await fs.readFile(path.join(manual, '.autoscale-state.json'), 'utf8')).phase, 'blocked');
   for (const leaf of ['.runner', '.credentials', '.autoscale-inflight.json']) assert.equal(await exists(path.join(manual, leaf)), true, leaf);
   // runner-2 still uses the old image directory name if one existed; the unused one is gone.
-  assert.equal(await exists(path.join(root, 'actions-runner-linux-x64-2.330.0.image')), false);
-  assert.equal(await exists(path.join(root, `actions-runner-linux-x64-${NEW}.image`)), true);
+  assert.equal(await exists(path.join(root, imageName(host, '2.330.0'))), false);
+  assert.equal(await exists(path.join(root, imageName(host, NEW))), true);
   // A fresh registration follows on current files only, never a replay of the consumed one.
   assert.ok(ops.some(op => op.startsWith('register ')));
   assert.ok(!second.stdout.includes('private-test-value') && !second.stderr.includes('private-test-value'));
