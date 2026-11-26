@@ -295,6 +295,58 @@ test('only a listener refused for a deprecated version before any job counts as 
   assert.deepEqual(await diagnoseBlockedSlot(deprecated), { cause: 'unknown' });
 });
 
+// Replace a blocked slot's logs with a job that ran before a boot at `ms`, as a
+// host restart leaves it. ctime cannot be set, so callers put the boot after now.
+async function predate(directory, ms) {
+  const diag = path.join(directory, '_diag');
+  for (const leaf of await fs.readdir(diag)) await fs.rm(path.join(diag, leaf));
+  await fs.writeFile(path.join(diag, `Runner_${stamp(ms - 600000)}`), 'Session created.\nRunning job: build\n');
+  await fs.writeFile(path.join(diag, `Worker_${stamp(ms - 590000)}`), 'job');
+}
+
+test('a generation cut off by a host restart counts as reboot-blocked, job or not', async () => {
+  const root = await tempDir('runner-reboot-');
+  const bootMs = Date.now() + 3600000;
+  const rebooted = await blockedSlot(root, 'runner-1', OLD, { log: 'job' });
+  await predate(rebooted, bootMs);
+  assert.deepEqual(await diagnoseBlockedSlot(rebooted, { bootMs }), { cause: 'host-reboot', agentId: 11 });
+  // Anything that ran since the restart keeps it manual.
+  for (const leaf of [`Runner_${stamp(bootMs + 1000)}`, `Worker_${stamp(bootMs + 1000)}`, 'Runner_unparsable.log']) {
+    await fs.writeFile(path.join(rebooted, '_diag', leaf), 'Session created.\n');
+    assert.deepEqual(await diagnoseBlockedSlot(rebooted, { bootMs }), { cause: 'unknown' }, leaf);
+    await fs.rm(path.join(rebooted, '_diag', leaf));
+  }
+  // A handoff from this boot, or one within the clock margin of it, is not a restart's.
+  const current = await blockedSlot(root, 'runner-2', OLD, { log: 'other' });
+  assert.deepEqual(await diagnoseBlockedSlot(current, { bootMs: Date.now() - 3600000 }), { cause: 'unknown' });
+  const near = await blockedSlot(root, 'runner-3', OLD, { log: 'other' });
+  const nearBoot = Date.now() + 30000;
+  await predate(near, nearBoot);
+  assert.deepEqual(await diagnoseBlockedSlot(near, { bootMs: nearBoot }), { cause: 'unknown' });
+  // A request written before the boot but consumed after it keeps its old mtime;
+  // its ctime is the consumption, so it is not a restart's.
+  const consumed = await blockedSlot(root, 'runner-4', OLD, { log: 'other' });
+  const earlierBoot = Date.now() - 600000;
+  await predate(consumed, earlierBoot);
+  const old = new Date(earlierBoot - 3600000);
+  await fs.utimes(path.join(consumed, '.autoscale-inflight.json'), old, old);
+  assert.deepEqual(await diagnoseBlockedSlot(consumed, { bootMs: earlierBoot }), { cause: 'unknown' });
+  // Deprecation evidence wins over a restart, and a refusal it cannot prove stays manual.
+  const refused = await blockedSlot(root, 'runner-5', OLD);
+  assert.equal((await diagnoseBlockedSlot(refused, { bootMs })).cause, 'deprecated-runner');
+  const refusedTwice = await blockedSlot(root, 'runner-6', OLD, { extraLog: true });
+  assert.deepEqual(await diagnoseBlockedSlot(refusedTwice, { bootMs }), { cause: 'unknown' });
+  // A restart before the slot's first listener ever ran leaves no _diag at all.
+  const fresh = await blockedSlot(root, 'runner-7', OLD, { log: 'other' });
+  await fs.rm(path.join(fresh, '_diag'), { recursive: true });
+  assert.deepEqual(await diagnoseBlockedSlot(fresh, { bootMs }), { cause: 'host-reboot', agentId: 11 });
+  // Without a restart, a missing _diag proves nothing.
+  assert.deepEqual(await diagnoseBlockedSlot(fresh, { bootMs: Date.now() - 3600000 }), { cause: 'unknown' });
+  // The shared proof still applies: a pending request keeps it manual.
+  await fs.writeFile(path.join(rebooted, '.autoscale-request.json'), '{}');
+  assert.deepEqual(await diagnoseBlockedSlot(rebooted, { bootMs }), { cause: 'unknown' });
+});
+
 test('orphan registrations are removed only when offline, idle, and the same registration', () => {
   assert.deepEqual(orphanDecision('runner-1', 11, []), { action: 'gone' });
   assert.deepEqual(orphanDecision('runner-1', 11, [{ id: 11, name: 'runner-1', status: 'offline', busy: false }]), { action: 'delete', id: 11 });
@@ -424,6 +476,86 @@ esac
   // A fresh registration follows on current files only, never a replay of the consumed one.
   assert.ok(ops.some(op => op.startsWith('register ')));
   assert.ok(!second.stdout.includes('private-test-value') && !second.stderr.includes('private-test-value'));
+});
+
+test('controller recovers reboot-blocked slots once GitHub lists them offline and idle, without replaying credentials', { timeout: 60000 }, async () => {
+  const root = await tempDir('runner-reboot-cli-');
+  for (const file of ['bin/runnerctl-autoscale.mjs', 'lib/runnerctl-core.mjs', 'lib/runnerctl-autoscale.mjs', 'lib/runnerctl-autoscale-service.mjs',
+    'lib/runnerctl-platform.mjs', 'lib/runnerctl-runner-update.mjs']) {
+    await fs.mkdir(path.join(root, 'runnerctl-app', path.dirname(file)), { recursive: true });
+    await fs.copyFile(new URL(`../${file}`, import.meta.url), path.join(root, 'runnerctl-app', file));
+  }
+  await fs.cp(new URL('../../overlay', import.meta.url), path.join(root, 'overlay'), { recursive: true });
+  await fs.copyFile(new URL('../../platform.sh', import.meta.url), path.join(root, 'platform.sh'));
+  const c = config({ lowLoad: 1000, highLoad: 2000, minFreeMemoryPercent: 1, minRunners: 2, maxRunners: 4, runnerUpdates: 'off',
+    runners: ['runner-1', 'runner-2', 'runner-3', 'runner-4'] });
+  await fs.writeFile(path.join(root, 'autoscale.json'), JSON.stringify(c));
+  // The stand-in moves the boot an hour ahead, so files written now predate it.
+  const bootMs = Date.now() + 3600000;
+  const idleAtGitHub = await blockedSlot(root, 'runner-1', NEW, { agentId: 11, log: 'job' });
+  const busyAtGitHub = await blockedSlot(root, 'runner-2', NEW, { agentId: 12, log: 'job' });
+  const manual = await blockedSlot(root, 'runner-3', NEW, { agentId: 13, log: 'other' });
+  // runner-4 looks rebooted, but a later generation was recorded for it.
+  const mismatched = await blockedSlot(root, 'runner-4', NEW, { agentId: 14, log: 'job' });
+  await fs.writeFile(path.join(mismatched, '.autoscale-generation.json'), JSON.stringify({ id: 15 }));
+  for (const directory of [idleAtGitHub, busyAtGitHub, mismatched]) await predate(directory, bootMs);
+  // runner-3's listener ran after the boot.
+  await fs.writeFile(path.join(manual, '_diag', `Runner_${stamp(bootMs + 60000)}`), 'Session created.\n');
+  for (const directory of [idleAtGitHub, busyAtGitHub, manual, mismatched]) {
+    await fs.writeFile(path.join(directory, '.service'), 'installed');
+    await fs.writeFile(path.join(directory, '.cpu-quota'), '100');
+    await fs.writeFile(path.join(directory, 'svc.sh'), `#!/bin/sh
+case "$1" in
+  status) if [ -f stopped ]; then echo Stopped; else echo 'Started:'; fi ;;
+  stop) touch stopped; echo "stop $(basename "$PWD")" >> ../operations ;;
+  start) rm -f stopped; echo "start $(basename "$PWD")" >> ../operations ;;
+  *) echo "$1" >> ../operations ;;
+esac
+`);
+    await fs.chmod(path.join(directory, 'svc.sh'), 0o700);
+  }
+  await fs.writeFile(path.join(root, 'runners.tsv'), [idleAtGitHub, busyAtGitHub, manual, mismatched].map(d => `${path.basename(d)}\t${d}`).join('\n'));
+  await fs.writeFile(path.join(root, 'mock-api.mjs'), `
+    import { appendFile } from 'node:fs/promises';
+    import os from 'node:os';
+    os.uptime = () => -3600;
+    const log = line => appendFile(${JSON.stringify(path.join(root, 'operations'))}, line + '\\n');
+    globalThis.fetch = async (url, options = {}) => {
+      if (options.headers?.Authorization !== 'Bearer private-test-value') throw new Error('auth missing');
+      if (options.method === 'DELETE') { await log('delete ' + url.split('/').pop()); return new Response(null, { status: 204 }); }
+      if (options.method === 'POST') { await log('register ' + JSON.parse(options.body).name); return new Response('{}', { status: 422 }); }
+      const runners = [{ id: 11, name: 'runner-1', status: 'offline', busy: false, labels: [{ name: 'self-hosted' }] },
+        { id: 12, name: 'runner-2', status: 'offline', busy: true, labels: [{ name: 'self-hosted' }] },
+        { id: 13, name: 'runner-3', status: 'offline', busy: false, labels: [{ name: 'self-hosted' }] },
+        { id: 14, name: 'runner-4', status: 'offline', busy: false, labels: [{ name: 'self-hosted' }] }];
+      const data = url.includes('/runners?') ? { runners, total_count: runners.length } : { workflow_runs: [], total_count: 0 };
+      return new Response(JSON.stringify(data));
+    };
+  `);
+  await fs.mkdir(path.join(root, 'test-bin'));
+  await fs.writeFile(path.join(root, 'test-bin/systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  const env = { ...process.env, PATH: path.join(root, 'test-bin') + ':' + process.env.PATH, RUNNER_AUTOSCALE_TOKEN: 'private-test-value' };
+  const args = ['--import', path.join(root, 'mock-api.mjs'), path.join(root, 'runnerctl-app/bin/runnerctl-autoscale.mjs'), '--apply', '--once'];
+  // The stand-in rejects the registration that follows, so the poll may exit non-zero.
+  const run = await exec(process.execPath, args, { env }).catch(error => error);
+  assert.ok(run.stderr.includes('1 slot(s) recovered after a host restart'), run.stderr);
+  assert.ok(run.stderr.includes('1 slot(s) cut off by a host restart wait for GitHub'), run.stderr);
+  assert.ok(run.stderr.includes('1 slot(s) cut off by a host restart could not be recovered'), run.stderr);
+  const ops = (await fs.readFile(path.join(root, 'operations'), 'utf8')).trim().split('\n');
+  // Only the idle orphan is removed; the busy one and the unproven slot are untouched.
+  assert.ok(ops.includes('delete 11'));
+  // A generation that fails the ownership checks never changes GitHub.
+  assert.ok(!ops.includes('delete 12') && !ops.includes('delete 13') && !ops.includes('delete 14'));
+  // GitHub changes only after the supervisor is stopped and the evidence rechecked.
+  assert.ok(ops.indexOf('stop runner-1') >= 0 && ops.indexOf('stop runner-1') < ops.indexOf('delete 11'));
+  assert.ok(!ops.some(op => op === 'stop runner-2' || op === 'stop runner-3'));
+  for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams', '.autoscale-inflight.json']) assert.equal(await exists(path.join(idleAtGitHub, leaf)), false, leaf);
+  assert.equal(JSON.parse(await fs.readFile(path.join(idleAtGitHub, '.autoscale-state.json'), 'utf8')).phase, 'ready');
+  for (const directory of [busyAtGitHub, manual, mismatched]) {
+    assert.equal(JSON.parse(await fs.readFile(path.join(directory, '.autoscale-state.json'), 'utf8')).phase, 'blocked');
+    for (const leaf of ['.runner', '.credentials', '.autoscale-inflight.json']) assert.equal(await exists(path.join(directory, leaf)), true, leaf);
+  }
+  assert.ok(!run.stdout.includes('private-test-value') && !run.stderr.includes('private-test-value'));
 });
 
 test('a target whose image disappeared is rebuilt even when the release answers 304', async () => {

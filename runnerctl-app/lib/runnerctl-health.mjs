@@ -71,7 +71,7 @@ export function autoscalerHealthProblems(health, { now, thresholdMs = DEFAULT_AU
  * autoscaler: { configured, active, org, health?, runnerUpdate? } — health is the controller's
  *   parsed report, or null when missing; omit it to skip those checks.
  *   runnerUpdate is the controller's .autoscale-runner-update.json, when present.
- * Ephemeral facts may carry blockedCause ('deprecated-runner') and updateInterrupted.
+ * Ephemeral facts may carry blockedCause ('deprecated-runner' or 'host-reboot') and updateInterrupted.
  * options: { now, autoscaleThresholdMs, thresholdMs } for the controller report.
  */
 export function findProblems(facts, autoscaler, options = {}) {
@@ -84,7 +84,9 @@ export function findProblems(facts, autoscaler, options = {}) {
       if (f.phase === 'blocked') {
         add('slot-blocked', f.name, f.org, f.blockedCause === 'deprecated-runner'
           ? 'GitHub refused this slot\'s listener for a deprecated runner version before any job; the controller recovers it once a verified newer runner is ready'
-          : 'autoscale slot is parked as blocked and will not receive work');
+          : f.blockedCause === 'host-reboot'
+            ? 'a host restart cut off this slot\'s generation; the controller recovers it once GitHub lists the registration offline and idle'
+            : 'autoscale slot is parked as blocked and will not receive work');
       }
       if (f.updateInterrupted) add('slot-update-interrupted', f.name, f.org, 'a runner file update was interrupted; the slot stays out of service until the controller completes it');
       if (f.reservedSince != null) add('slot-reserved', f.name, f.org, 'ambiguous registration reservation has not been resolved', new Date(f.reservedSince).toISOString());

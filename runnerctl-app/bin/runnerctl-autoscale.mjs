@@ -11,7 +11,7 @@ import { AutoscaleError, validateConfig, githubClient, snapshot, hostSample, pla
 
 import { acquireControllerLock, configureController, boundControllerLog } from '../lib/runnerctl-autoscale-service.mjs';
 import { filePrivate, restrictToOwner, scriptCommand, WINDOWS_SERVICE_ENV_KEYS } from '../lib/runnerctl-platform.mjs';
-import { checkDue, checkForUpdate, readUpdateState, writeUpdateState, readyTarget, rollSlot, diagnoseBlockedSlot, orphanDecision, pruneImages,
+import { checkDue, checkForUpdate, readUpdateState, writeUpdateState, readyTarget, rollSlot, diagnoseBlockedSlot, orphanDecision, pruneImages, checkRecoverable,
   bootstrapVersion, runnerPlatform, rollSupported, compareVersions, runnerFilesVersion, clearRecoveredGeneration, finishRecovery,
   SLOT_UPDATE_JOURNAL, SLOT_RECOVERY_JOURNAL } from '../lib/runnerctl-runner-update.mjs';
 import { acquireLock } from '../../overlay/autoscale-lock.mjs';
@@ -133,9 +133,14 @@ async function localRunners(c) {
       continue;
     }
     if (phase === 'blocked') {
-      // Only a listener GitHub refused for a deprecated runner, proven from the
-      // slot's own diagnostics, is a candidate for automatic recovery.
+      // Only a listener GitHub refused for a deprecated runner, or a generation a
+      // host restart cut off, proven from the slot's own diagnostics, is a
+      // candidate for automatic recovery.
       const diagnosis = await diagnoseBlockedSlot(directory);
+      if (diagnosis.cause === 'host-reboot') {
+        result.set(name, { directory, running: status === 'running', quota, active: true, phase, unavailable: true, runnerVersion, rebooted: diagnosis });
+        continue;
+      }
       if (diagnosis.cause !== 'deprecated-runner') throw new AutoscaleError('Slot blocked; inspect its local lifecycle files');
       result.set(name, { directory, running: status === 'running', quota, active: true, phase, unavailable: true, runnerVersion, deprecated: diagnosis });
       continue;
@@ -251,20 +256,24 @@ async function rollToTarget(slot, target) {
     throw error;
   }
 }
-// A deprecation-blocked slot ran no job, and its one-use credentials are dead.
-// It never replays them: its orphan registration is removed, its parked
-// supervisor stopped, and the consumed generation cleared so the slot can take
-// a fresh JIT registration once its runner files are current.
-async function recoverDeprecated(c, api, name, slot, remote) {
-  const decision = orphanDecision(name, slot.deprecated.agentId, remote);
+// A deprecation-blocked slot ran no job, and a reboot-blocked slot's job died
+// with the host; either way its one-use credentials are dead. It never replays
+// them: its orphan registration is removed once GitHub lists it offline and
+// idle, its parked supervisor stopped, and the consumed generation cleared so
+// the slot can take a fresh JIT registration once its runner files are current.
+async function recoverBlocked(c, api, name, slot, remote) {
+  const evidence = slot.deprecated ?? slot.rebooted;
+  const decision = orphanDecision(name, evidence.agentId, remote);
   if (decision.action === 'keep') return false;
-  if (decision.action === 'delete') await api.remove(c, decision.id);
+  // Every local check passes before GitHub is changed: no worker, same evidence.
   await withStoppedWorker(slot, async () => {
     const again = await diagnoseBlockedSlot(slot.directory);
-    if (again.cause !== 'deprecated-runner' || again.agentId !== slot.deprecated.agentId) throw new AutoscaleError('Slot evidence changed');
+    if (again.cause !== evidence.cause || again.agentId !== evidence.agentId) throw new AutoscaleError('Slot evidence changed');
+    await checkRecoverable(slot.directory, again.agentId);
+    if (decision.action === 'delete') await api.remove(c, decision.id);
     await clearRecoveredGeneration(slot.directory, again.agentId);
   });
-  Object.assign(slot, { active: false, phase: 'ready', unavailable: false, running: false, id: undefined, deprecated: undefined });
+  Object.assign(slot, { active: false, phase: 'ready', unavailable: false, running: false, id: undefined, deprecated: undefined, rebooted: undefined });
   return true;
 }
 // Stop the slot's supervisor and hold its lock: the worker holds it while it
@@ -286,8 +295,24 @@ async function maintainRunnerFiles(c, api, local, target) {
     try {
       await withStoppedWorker(slot, () => finishRecovery(slot.directory));
       Object.assign(slot, { active: false, phase: 'ready', unavailable: false, running: false, id: undefined, recoveryPending: false });
-      console.error('Finished an interrupted deprecated-runner recovery without replaying credentials');
-    } catch { console.error('An interrupted deprecated-runner recovery could not be finished; inspect .autoscale-recovery.json'); }
+      console.error('Finished an interrupted blocked-slot recovery without replaying credentials');
+    } catch { console.error('An interrupted blocked-slot recovery could not be finished; inspect .autoscale-recovery.json'); }
+  }
+  // Reboot-blocked slots need no runner update, only their dead generation cleared.
+  const rebooted = [...local.entries()].filter(([, s]) => s.rebooted);
+  if (rebooted.length && !quitting) {
+    const remote = await api(runnerListEndpoint(c), 'runners');
+    let recovered = 0;
+    let waiting = 0;
+    let failed = 0;
+    for (const [name, slot] of rebooted) {
+      if (quitting) break;
+      try { if (await recoverBlocked(c, api, name, slot, remote)) recovered++; else waiting++; }
+      catch { failed++; }
+    }
+    if (recovered) console.error(`${recovered} slot(s) recovered after a host restart without replaying credentials`);
+    if (waiting) console.error(`${waiting} slot(s) cut off by a host restart wait for GitHub to list their registration offline and idle`);
+    if (failed) console.error(`${failed} slot(s) cut off by a host restart could not be recovered; inspect their lifecycle files`);
   }
   for (const slot of local.values()) {
     if (!slot.updatePending || quitting) continue;
@@ -302,7 +327,7 @@ async function maintainRunnerFiles(c, api, local, target) {
       let recovered = 0;
       for (const [name, slot] of deprecated) {
         if (quitting || budget <= 0) break;
-        try { if (await recoverDeprecated(c, api, name, slot, remote)) recovered++; }
+        try { if (await recoverBlocked(c, api, name, slot, remote)) recovered++; }
         catch { continue; }
         budget--;
         try { await rollToTarget(slot, target); } catch { console.error('Runner update failed for a recovered slot; it updates before its next registration'); }

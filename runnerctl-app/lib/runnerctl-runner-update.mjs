@@ -8,6 +8,7 @@
 // or job runs, and never touching their per-generation state.
 import { promises as fs, createWriteStream, constants as fsConstants } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -599,19 +600,28 @@ const logTime = name => {
   return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : NaN;
 };
 
+// Wall-clock slack between a file's mtime and the boot time derived from uptime.
+const REBOOT_MARGIN_MS = 60 * 1000;
+export const hostBootMs = () => Date.now() - os.uptime() * 1000;
+
 /**
  * Why a blocked slot is blocked, from its own files only. Returns
  * { cause: 'deprecated-runner', version, agentId } when the evidence proves the
  * generation's listener was refused for a deprecated runner version before it
- * was offered any job; otherwise { cause: 'unknown' }. Credentials are never
- * read beyond the registration id, and nothing read here is logged.
+ * was offered any job, { cause: 'host-reboot', agentId } when it proves the
+ * generation was cut off by a host restart, and otherwise { cause: 'unknown' }.
+ * Credentials are never read beyond the registration id, and nothing read here
+ * is logged.
  *
- * Proof: the slot is parked blocked with its consumed handoff and nothing
- * newer (no request, reservation, or roll in progress); exactly one listener
- * log and no job worker log started after the handoff; that log reports the
- * deprecation and shows no job message.
+ * Proof for both: the slot is parked blocked with its consumed handoff and
+ * nothing newer (no request, reservation, or roll in progress).
+ * Deprecation: exactly one listener log and no job worker log started after
+ * the handoff; that log reports the deprecation and shows no job message.
+ * Reboot: the handoff predates this boot and no listener or job worker log
+ * started since, so nothing of the generation outlived the restart. A job it
+ * was running died with the host; its one-use credentials are dead either way.
  */
-export async function diagnoseBlockedSlot(directory) {
+export async function diagnoseBlockedSlot(directory, { bootMs = hostBootMs() } = {}) {
   const unknown = { cause: 'unknown' };
   const at = leaf => path.join(directory, leaf);
   try {
@@ -625,23 +635,35 @@ export async function diagnoseBlockedSlot(directory) {
     const metadata = JSON.parse(handoff['.runner']);
     const slot = await readJsonRegular(at('.autoscale-slot.json'));
     if (metadata.ephemeral !== true || metadata.agentName !== slot.agentName || !Number.isSafeInteger(metadata.agentId) || metadata.agentId < 1) return unknown;
+    // A slot whose first listener never started has no _diag yet.
+    const diag = await fs.readdir(at('_diag')).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
     // Log names carry whole seconds; the handoff predates its listener.
     const since = Math.floor(inflightStat.mtimeMs / 1000) * 1000;
-    const logs = (await fs.readdir(at('_diag'))).filter(n => logTime(n) >= since);
+    const logs = diag.filter(n => logTime(n) >= since);
     const runners = logs.filter(n => n.startsWith('Runner_'));
-    if (runners.length !== 1 || logs.some(n => n.startsWith('Worker_'))) return unknown;
-    const log = path.join(at('_diag'), runners[0]);
-    const text = await readRegular(log, MAX_DIAG_BYTES);
-    const deprecated = DEPRECATED.exec(text);
-    if (!deprecated || JOB_EVIDENCE.test(text)) return unknown;
-    // The refused version must be the one these files run.
-    if (await runnerFilesVersion(directory) !== deprecated[1]) return unknown;
-    return { cause: 'deprecated-runner', version: deprecated[1], agentId: metadata.agentId };
+    const texts = await Promise.all(runners.map(n => readRegular(path.join(at('_diag'), n), MAX_DIAG_BYTES)));
+    if (runners.length === 1 && !logs.some(n => n.startsWith('Worker_'))) {
+      const deprecated = DEPRECATED.exec(texts[0]);
+      // The refused version must be the one these files run.
+      if (deprecated && !JOB_EVIDENCE.test(texts[0]) && await runnerFilesVersion(directory) === deprecated[1]) {
+        return { cause: 'deprecated-runner', version: deprecated[1], agentId: metadata.agentId };
+      }
+    }
+    // A refusal for a deprecated version keeps its own (manual or update-gated)
+    // path, so a restart never spends a registration on a refused binary.
+    if (texts.some(text => DEPRECATED.test(text))) return unknown;
+    // The rename that consumes a handoff keeps the request's mtime but sets its
+    // ctime, so both must predate the boot.
+    const cutoff = bootMs - REBOOT_MARGIN_MS;
+    if (Math.max(inflightStat.mtimeMs, inflightStat.ctimeMs) >= cutoff) return unknown;
+    // A log name that does not parse counts as recent, so it fails closed.
+    if (diag.some(n => /^(?:Runner|Worker)_/.test(n) && !(logTime(n) < cutoff))) return unknown;
+    return { cause: 'host-reboot', agentId: metadata.agentId };
   } catch { return unknown; }
 }
 
 /**
- * Clear a proven deprecation-blocked generation. The caller has removed its
+ * Clear a proven deprecation- or reboot-blocked generation. The caller has removed its
  * registration, stopped the slot's supervisor, and holds the worker lock. The
  * journal goes first and names the generation (its registration id) and its
  * handoff (a SHA-256 of the in-flight file, never its content), so an
@@ -649,12 +671,22 @@ export async function diagnoseBlockedSlot(directory) {
  * only. The consumed credentials are only ever deleted, never reused.
  */
 export async function clearRecoveredGeneration(directory, agentId) {
+  const handoffSha256 = await checkRecoverable(directory, agentId);
+  await writePrivateJson(path.join(directory, SLOT_RECOVERY_JOURNAL), { version: 2, agentId, handoffSha256 });
+  return finishRecovery(directory);
+}
+/**
+ * Read-only: prove every file of the slot's blocked generation belongs to
+ * registration agentId, the same checks finishRecovery() applies, so a caller
+ * can run them before changing GitHub. Returns the handoff's SHA-256.
+ */
+export async function checkRecoverable(directory, agentId) {
   if (!Number.isSafeInteger(agentId) || agentId < 1) throw new Error('Invalid registration id');
   const inflight = Buffer.from(await readRegular(path.join(directory, '.autoscale-inflight.json')), 'utf8');
   if (handoffAgentId(inflight) !== agentId) throw new Error('Handoff belongs to another generation');
-  await writePrivateJson(path.join(directory, SLOT_RECOVERY_JOURNAL),
-    { version: 2, agentId, handoffSha256: createHash('sha256').update(inflight).digest('hex') });
-  return finishRecovery(directory);
+  const handoffSha256 = createHash('sha256').update(inflight).digest('hex');
+  await assertGenerationOwned(directory, agentId, handoffSha256);
+  return handoffSha256;
 }
 function handoffAgentId(bytes) {
   try { return JSON.parse(JSON.parse(bytes.toString('utf8'))['.runner']).agentId; } catch { return null; }
@@ -668,13 +700,25 @@ function handoffAgentId(bytes) {
  */
 export async function finishRecovery(directory) {
   const at = leaf => path.join(directory, leaf);
-  const read = leaf => readRegular(at(leaf)).then(text => Buffer.from(text, 'utf8'), error => { if (error.code === 'ENOENT') return null; throw error; });
   let journal;
   try { journal = await readJsonRegular(at(SLOT_RECOVERY_JOURNAL)); }
   catch { throw new Error('Unreadable recovery journal'); }
   if (journal?.version !== 2 || !Number.isSafeInteger(journal.agentId) || !/^[0-9a-f]{64}$/.test(journal.handoffSha256 ?? '')) {
     throw new Error('Invalid recovery journal');
   }
+  await assertGenerationOwned(directory, journal.agentId, journal.handoffSha256);
+  for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams']) await fs.rm(at(leaf), { force: true });
+  await fs.rm(at('.autoscale-inflight.json'), { force: true });
+  await writePrivateJson(at('.autoscale-state.json'), { phase: 'ready' });
+  await fs.unlink(at(SLOT_RECOVERY_JOURNAL));
+  return journal.agentId;
+}
+// Throws unless every lifecycle file in the slot belongs to registration
+// agentId and its handoff (by SHA-256): no newer handoff, registration,
+// credentials, roll, or a running phase.
+async function assertGenerationOwned(directory, agentId, handoffSha256) {
+  const at = leaf => path.join(directory, leaf);
+  const read = leaf => readRegular(at(leaf)).then(text => Buffer.from(text, 'utf8'), error => { if (error.code === 'ENOENT') return null; throw error; });
   const newer = () => new Error('Recovery journal beside newer slot state');
   for (const leaf of ['.autoscale-request.json', '.autoscale-request.tmp', '.autoscale-reservation.json', SLOT_UPDATE_JOURNAL]) {
     if (await exists(at(leaf))) throw newer();
@@ -683,17 +727,16 @@ export async function finishRecovery(directory) {
   if (phase !== 'blocked' && phase !== 'ready') throw newer();
   // The controller records each generation it hands off; a later one is not ours.
   const generation = await read('.autoscale-generation.json');
-  if (generation && JSON.parse(generation.toString('utf8')).id !== journal.agentId) throw newer();
+  if (generation && JSON.parse(generation.toString('utf8')).id !== agentId) throw newer();
   const inflight = await read('.autoscale-inflight.json');
   let handoff = null;
   if (inflight) {
-    if (createHash('sha256').update(inflight).digest('hex') !== journal.handoffSha256) throw newer();
+    if (createHash('sha256').update(inflight).digest('hex') !== handoffSha256) throw newer();
     handoff = JSON.parse(inflight.toString('utf8'));
   }
   // Credential files must match the journaled handoff byte for byte. They are
   // deleted before the handoff, so with no handoff left none may remain.
-  const credentials = ['.runner', '.credentials', '.credentials_rsaparams'];
-  for (const leaf of credentials) {
+  for (const leaf of ['.runner', '.credentials', '.credentials_rsaparams']) {
     const content = await read(leaf);
     if (content === null) continue;
     if (!handoff) throw newer();
@@ -701,15 +744,10 @@ export async function finishRecovery(directory) {
     if (leaf === '.credentials_rsaparams' && process.platform === 'win32') continue;
     if (content.toString('utf8') !== handoff[leaf]) throw newer();
   }
-  for (const leaf of credentials) await fs.rm(at(leaf), { force: true });
-  await fs.rm(at('.autoscale-inflight.json'), { force: true });
-  await writePrivateJson(at('.autoscale-state.json'), { phase: 'ready' });
-  await fs.unlink(at(SLOT_RECOVERY_JOURNAL));
-  return journal.agentId;
 }
 
 /**
- * Whether the orphan registration of a deprecation-blocked generation may be
+ * Whether the orphan registration of a recoverable blocked generation may be
  * removed: 'delete' it, treat it as already 'gone', or 'keep' the slot
  * blocked because something else holds the name or it is not idle and offline.
  */
